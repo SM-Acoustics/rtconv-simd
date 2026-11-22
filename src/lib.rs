@@ -1,0 +1,230 @@
+//! `rtconv_simd`: Hard real-time, `#![no_std]`, allocation-free FIR convolution engine
+//! with `fearless_simd 1.2.0` acceleration and `microfft 0.6.0` primary FFT backend.
+//!
+//! ## Core Guarantees
+//! - `#![no_std]` and `#![forbid(unsafe_code)]` in the DSP core.
+//! - Zero dependency on `std` or `alloc` in the core crate (`std` feature only enables
+//!   runtime x86 CPUID detection via `fearless_simd::Level::new()`).
+//! - All working buffers are caller-supplied (`&mut [f32]`) with checked size calculation.
+//! - Phase-agnostic: accepts any finite real causal FIR impulse response `&[f32]` and
+//!   preserves its exact temporal order, gain, phase, and group delay.
+//!
+//! ## Engines
+//! - [`DirectConvolver`]: Time-domain circular-buffer FIR convolution (sample and block API).
+//! - [`PartitionedConvolver`]: Uniform Frequency-Domain Delay Line (FDL) with 50% overlap-save.
+//! - [`HybridConvolver`]: Zero-latency combination of direct FIR head + partitioned FFT tail.
+
+#![no_std]
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+#[cfg(test)]
+extern crate std;
+
+pub mod direct;
+pub mod error;
+pub mod fft;
+pub mod hybrid;
+pub mod partitioned;
+pub mod simd_kernels;
+
+pub use direct::{DirectConfig, DirectConvolver, DirectMemoryRequirements};
+pub use error::ConvError;
+pub use fft::{FftBackend, FftSize, MicroFftBackend};
+pub use fearless_simd::Level;
+pub use hybrid::{HybridConfig, HybridConvolver, HybridMemoryRequirements};
+pub use partitioned::{
+    PartitionedConfig, PartitionedConvolver, PartitionedMemoryRequirements,
+};
+
+/// Convolution engine variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineKind {
+    /// Time-domain direct FIR convolver.
+    Direct,
+    /// Uniform partitioned FFT overlap-save FDL convolver.
+    Partitioned,
+    /// Zero-latency hybrid direct head + FFT tail convolver.
+    Hybrid,
+}
+
+/// Runtime metadata describing the active engine configuration and backends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Capabilities {
+    /// Active engine architecture.
+    pub engine: EngineKind,
+    /// Selected SIMD backend label.
+    pub simd_backend: &'static str,
+    /// Active FFT backend label (or `"none"` for `DirectConvolver`).
+    pub fft_backend: &'static str,
+    /// Whether the FFT/IFFT transform itself is SIMD-vectorized.
+    pub fft_is_simd: bool,
+    /// Processing or tail partition block size, if applicable.
+    pub block_size: Option<usize>,
+    /// FFT length in samples, if applicable.
+    pub fft_size: Option<usize>,
+    /// Maximum configured impulse response length.
+    pub max_ir_len: usize,
+    /// Active impulse response length.
+    pub active_ir_len: usize,
+    /// Algorithmic latency in samples.
+    pub latency_samples: usize,
+}
+
+/// Pre-validated SIMD backend selection passed during `prepare()`.
+///
+/// Selection happens strictly at initialization time — never inside the audio callback.
+#[derive(Clone, Copy, Debug)]
+pub struct SimdBackend {
+    level: Level,
+    scalar_override: bool,
+}
+
+impl SimdBackend {
+    /// Forces the pure scalar reference kernel (no SIMD dispatch).
+    #[inline]
+    pub const fn scalar() -> Self {
+        Self {
+            level: Level::fallback(),
+            scalar_override: true,
+        }
+    }
+
+    /// Uses the compile-time target baseline (`Level::baseline()`), always available in `no_std`.
+    #[inline]
+    pub const fn baseline() -> Self {
+        Self {
+            level: Level::baseline(),
+            scalar_override: false,
+        }
+    }
+
+    /// Uses a caller-supplied `fearless_simd::Level` (e.g. detected externally on `no_std`).
+    #[inline]
+    pub const fn from_level(level: Level) -> Self {
+        Self {
+            level,
+            scalar_override: false,
+        }
+    }
+
+    /// Performs one-time runtime CPU feature detection via `fearless_simd::Level::new()`.
+    ///
+    /// Available when the `std` feature is enabled (or on `wasm32`). Call once at setup,
+    /// never inside the real-time audio callback.
+    #[cfg(any(feature = "std", target_arch = "wasm32"))]
+    #[inline]
+    pub fn detect() -> Self {
+        Self {
+            level: Level::new(),
+            scalar_override: false,
+        }
+    }
+
+    /// Attempts runtime detection, falling back to [`Self::baseline()`] on `no_std` targets.
+    #[inline]
+    pub fn detect_or_baseline() -> Self {
+        match Level::try_detect() {
+            Some(level) => Self {
+                level,
+                scalar_override: false,
+            },
+            None => Self::baseline(),
+        }
+    }
+
+    /// Selects SSE2 explicitly on x86/x86-64 if available in the detected `Level`.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[inline]
+    pub fn try_sse2() -> Result<Self, ConvError> {
+        let lvl = Self::detect_or_baseline().level;
+        match lvl.as_sse2() {
+            Some(tok) => Ok(Self::from_level(Level::Sse2(tok))),
+            None => Err(ConvError::BackendUnavailable),
+        }
+    }
+
+    /// Selects SSE4.2 (x86-64-v2) explicitly if supported by the current host.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[inline]
+    pub fn try_sse4_2() -> Result<Self, ConvError> {
+        let lvl = Self::detect_or_baseline().level;
+        match lvl.as_sse4_2() {
+            Some(tok) => Ok(Self::from_level(Level::Sse4_2(tok))),
+            None => Err(ConvError::BackendUnavailable),
+        }
+    }
+
+    /// Selects AVX2 + FMA (x86-64-v3) explicitly if supported by the current host.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[inline]
+    pub fn try_avx2() -> Result<Self, ConvError> {
+        let lvl = Self::detect_or_baseline().level;
+        match lvl.as_avx2() {
+            Some(tok) => Ok(Self::from_level(Level::Avx2(tok))),
+            None => Err(ConvError::BackendUnavailable),
+        }
+    }
+
+    /// Selects AVX-512 (Ice Lake+) explicitly if supported by the current host.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[inline]
+    pub fn try_avx512() -> Result<Self, ConvError> {
+        let lvl = Self::detect_or_baseline().level;
+        match lvl.as_avx512() {
+            Some(tok) => Ok(Self::from_level(Level::Avx512(tok))),
+            None => Err(ConvError::BackendUnavailable),
+        }
+    }
+
+    /// Returns `true` if this backend executes the pure scalar reference path.
+    #[inline]
+    pub const fn is_scalar(&self) -> bool {
+        self.scalar_override
+    }
+
+    /// Returns the underlying `fearless_simd::Level`.
+    #[inline]
+    pub const fn level(&self) -> Level {
+        self.level
+    }
+
+    /// Human-readable backend name.
+    #[inline]
+    pub fn name(&self) -> &'static str {
+        if self.scalar_override {
+            return "scalar-reference";
+        }
+        if self.level.is_fallback() {
+            return "fearless_simd::Fallback";
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if self.level.as_avx512().is_some() {
+                return "fearless_simd::Avx512";
+            }
+            if self.level.as_avx2().is_some() {
+                return "fearless_simd::Avx2+FMA";
+            }
+            if self.level.as_sse4_2().is_some() {
+                return "fearless_simd::Sse4_2";
+            }
+            if self.level.as_sse2().is_some() {
+                return "fearless_simd::Sse2";
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            if self.level.as_neon().is_some() {
+                return "fearless_simd::Neon";
+            }
+        }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        {
+            if self.level.as_wasm_simd128().is_some() {
+                return "fearless_simd::WasmSimd128";
+            }
+        }
+        "fearless_simd::Fallback"
+    }
+}

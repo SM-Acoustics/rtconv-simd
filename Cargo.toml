@@ -1,0 +1,37 @@
+[package]
+name = "rtconv_simd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+description = "Hard real-time, no_std, allocation-free FIR convolution engine (direct, partitioned FFT FDL, hybrid) with fearless_simd acceleration"
+keywords = ["dsp", "audio", "convolution", "simd", "no_std"]
+categories = ["multimedia::audio", "no-std", "algorithms"]
+
+[features]
+default = ["std"]
+# Enables runtime CPU feature detection (`Level::new()`) via `fearless_simd/std`.
+# Core DSP processing never uses `std` or `alloc`.
+std = ["fearless_simd/std"]
+# Optional desktop FFT backend using PhastFT (adds `std` only when explicitly enabled).
+phastft = ["std", "dep:phastft"]
+
+[dependencies]
+fearless_simd = { version = "1.2.0", default-features = false, features = ["force_support_fallback", "libm"] }
+fearless_simd_macros = "0.1.0"
+microfft = { version = "0.6.0", default-features = false, features = ["size-256"] }
+phastft = { version = "0.4.1", default-features = false, optional = true }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[[bench]]
+name = "rtconv_bench"
+harness = false
