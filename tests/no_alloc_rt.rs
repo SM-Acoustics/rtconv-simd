@@ -1,8 +1,8 @@
-//! Allocation-free real-time contract verification using a serialized `GlobalAlloc`.
+//! Allocation-free real-time contract verification using a re-entrancy-safe `GlobalAlloc`.
 //!
-//! Uses a static `Mutex<()>` to serialize guarded sections so parallel test threads
-//! cannot contaminate the global allocation counters. For maximum determinism in CI,
-//! this integration binary can also be executed with `--test-threads=1`.
+//! All engine/backend scenarios run sequentially inside a single test entry point so no
+//! sibling test threads can allocate while `GUARD_ACTIVE` is armed, and `GlobalAlloc`
+//! touches only lock-free atomics (no TLS initialization inside `alloc`/`dealloc`).
 
 #[cfg(feature = "phastft")]
 use rtconv_simd::PhastFftBackend;
@@ -11,30 +11,24 @@ use rtconv_simd::{
     PartitionedConfig, PartitionedConvolver, SimdBackend, SimdFixedFftBackend,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 struct CountingAllocator;
 
-static TEST_LOCK: Mutex<()> = Mutex::new(());
+static GUARD_ACTIVE: AtomicBool = AtomicBool::new(false);
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 static DEALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-thread_local! {
-    static IN_GUARD: Cell<bool> = const { Cell::new(false) };
-}
-
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if IN_GUARD.try_with(Cell::get).unwrap_or(false) {
+        if GUARD_ACTIVE.load(Ordering::SeqCst) {
             ALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
         }
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if IN_GUARD.try_with(Cell::get).unwrap_or(false) {
+        if GUARD_ACTIVE.load(Ordering::SeqCst) {
             DEALLOC_COUNT.fetch_add(1, Ordering::SeqCst);
         }
         unsafe { System.dealloc(ptr, layout) }
@@ -45,12 +39,11 @@ unsafe impl GlobalAlloc for CountingAllocator {
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 fn assert_zero_alloc<F: FnOnce()>(label: &str, f: F) {
-    let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     ALLOC_COUNT.store(0, Ordering::SeqCst);
     DEALLOC_COUNT.store(0, Ordering::SeqCst);
-    IN_GUARD.with(|flag| flag.set(true));
+    GUARD_ACTIVE.store(true, Ordering::SeqCst);
     f();
-    IN_GUARD.with(|flag| flag.set(false));
+    GUARD_ACTIVE.store(false, Ordering::SeqCst);
     let allocs = ALLOC_COUNT.load(Ordering::SeqCst);
     let deallocs = DEALLOC_COUNT.load(Ordering::SeqCst);
     assert_eq!(allocs, 0, "{label}: detected {allocs} heap allocations");
@@ -60,8 +53,7 @@ fn assert_zero_alloc<F: FnOnce()>(label: &str, f: F) {
     );
 }
 
-#[test]
-fn test_zero_heap_allocations_in_prepare_and_audio_callback() {
+fn verify_microfft_engines() {
     let ir = [0.25f32; 512];
     let input = [0.5f32; 128];
     let mut output = [0.0f32; 128];
@@ -133,8 +125,7 @@ fn test_zero_heap_allocations_in_prepare_and_audio_callback() {
     });
 }
 
-#[test]
-fn test_zero_heap_allocations_simd_fixed_and_tail_spreading() {
+fn verify_simd_fixed_and_tail_spreading() {
     let ir = [0.25f32; 1024];
     let input = [0.5f32; 128];
     let mut output = [0.0f32; 128];
@@ -189,8 +180,7 @@ fn test_zero_heap_allocations_simd_fixed_and_tail_spreading() {
 }
 
 #[cfg(feature = "phastft")]
-#[test]
-fn test_zero_heap_allocations_phastft_audio_callback() {
+fn verify_phastft_audio_callback() {
     let ir = [0.25f32; 1024];
     let input = [0.5f32; 128];
     let mut output = [0.0f32; 128];
@@ -222,4 +212,12 @@ fn test_zero_heap_allocations_phastft_audio_callback() {
         }
         hconv.reset();
     });
+}
+
+#[test]
+fn test_zero_heap_allocations_all_engines_and_backends() {
+    verify_microfft_engines();
+    verify_simd_fixed_and_tail_spreading();
+    #[cfg(feature = "phastft")]
+    verify_phastft_audio_callback();
 }

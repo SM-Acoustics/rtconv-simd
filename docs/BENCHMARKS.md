@@ -6,7 +6,7 @@
 
 - **CPU**: AMD Ryzen 3 PRO 2300U w/ Radeon Vega Mobile Gfx (4C/4T, x86-64 Zen 1; SSE2, SSE4.2, AVX2, FMA)
 - **OS**: Microsoft Windows 11 Pro `10.0.26300` (64-bit)
-- **Toolchain**: `rustc 1.100.0 (0ef1bc386 2026-11-09)`, `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`
+- **Toolchain**: `rustc 1.100.0 (0ef1bc386 2026-11-09)`, host `x86_64-pc-windows-gnu` (`rustup` default `stable-x86_64-pc-windows-gnu`), `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`
 - **Nominal Audio Budget**: `48,000 Hz`, `32` samples/block → **`666.67 µs` deadline**
 - **Commands**:
   - `cargo bench --bench rtconv_bench --all-features`

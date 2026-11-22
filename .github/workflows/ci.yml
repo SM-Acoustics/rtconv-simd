@@ -21,21 +21,35 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
+      - run: cargo clippy --lib --no-default-features -- -D warnings
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+  msrv:
+    name: MSRV (Rust 1.89.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - run: rustc -vV
+      - run: cargo check --lib --no-default-features
+      - run: cargo check --all-features
+      - run: cargo test --no-default-features
+      - run: cargo test --all-features
 
   test-matrix:
     name: Build & Test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - run: rustc -vV
       - run: cargo check --lib --no-default-features
       - run: cargo check --all-features
       - run: cargo test --release --no-default-features

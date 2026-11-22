@@ -7,6 +7,18 @@ permissions:
   contents: read
 
 jobs:
+  msrv-check:
+    name: MSRV Verification (Rust 1.89.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - run: rustc -vV
+      - run: cargo check --lib --no-default-features
+      - run: cargo check --all-features
+      - run: cargo test --no-default-features
+      - run: cargo test --all-features
+
   release-check:
     name: Package & Dry-Run Publish Check
     runs-on: ubuntu-latest
@@ -20,6 +32,7 @@ jobs:
       - name: Format & Clippy
         run: |
           cargo fmt --all -- --check
+          cargo clippy --lib --no-default-features -- -D warnings
           cargo clippy --all-targets --all-features -- -D warnings
       - name: Full Test Suite
         run: |
