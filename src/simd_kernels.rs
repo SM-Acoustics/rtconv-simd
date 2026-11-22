@@ -409,12 +409,129 @@ pub fn cmac_fdl_scalar(
     bins: usize,
     fdl_head: usize,
 ) {
-    if num_partitions == 0 || bins == 0 {
+    cmac_fdl_range_scalar(
+        acc_re,
+        acc_im,
+        fdl_re,
+        fdl_im,
+        ir_re,
+        ir_im,
+        num_partitions,
+        bins,
+        fdl_head,
+        0,
+        num_partitions,
+    );
+}
+
+#[simd]
+#[allow(clippy::too_many_arguments)]
+fn cmac_fdl_range_impl<S: Simd>(
+    simd: S,
+    acc_re: &mut [f32],
+    acc_im: &mut [f32],
+    fdl_re: &[f32],
+    fdl_im: &[f32],
+    ir_re: &[f32],
+    ir_im: &[f32],
+    num_partitions: usize,
+    bins: usize,
+    ring_start_idx: usize,
+    start_p: usize,
+    end_p: usize,
+) {
+    if num_partitions == 0 || bins == 0 || start_p >= end_p {
         return;
     }
-    let mut p = 0;
-    let mut ring_idx = fdl_head;
-    while p < num_partitions {
+    let limit = end_p.min(num_partitions);
+    let mut p = start_p;
+    let mut ring_idx = ring_start_idx % num_partitions;
+    while p < limit {
+        let x_off = ring_idx * bins;
+        let h_off = p * bins;
+        if x_off + bins <= fdl_re.len()
+            && x_off + bins <= fdl_im.len()
+            && h_off + bins <= ir_re.len()
+            && h_off + bins <= ir_im.len()
+        {
+            cmac_vec(
+                simd,
+                acc_re,
+                acc_im,
+                &fdl_re[x_off..x_off + bins],
+                &fdl_im[x_off..x_off + bins],
+                &ir_re[h_off..h_off + bins],
+                &ir_im[h_off..h_off + bins],
+            );
+        }
+        ring_idx = if ring_idx == 0 {
+            num_partitions - 1
+        } else {
+            ring_idx - 1
+        };
+        p += 1;
+    }
+}
+
+/// Accumulates a partition sub-range `[start_p, end_p)` in a single `dispatch!` call.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn cmac_fdl_range_simd(
+    level: Level,
+    acc_re: &mut [f32],
+    acc_im: &mut [f32],
+    fdl_re: &[f32],
+    fdl_im: &[f32],
+    ir_re: &[f32],
+    ir_im: &[f32],
+    num_partitions: usize,
+    bins: usize,
+    ring_start_idx: usize,
+    start_p: usize,
+    end_p: usize,
+) {
+    dispatch!(
+        level,
+        simd => cmac_fdl_range_impl(
+            simd,
+            acc_re,
+            acc_im,
+            fdl_re,
+            fdl_im,
+            ir_re,
+            ir_im,
+            num_partitions,
+            bins,
+            ring_start_idx,
+            start_p,
+            end_p
+        )
+    );
+}
+
+/// Scalar reference FDL accumulation over a partition sub-range `[start_p, end_p)`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn cmac_fdl_range_scalar(
+    acc_re: &mut [f32],
+    acc_im: &mut [f32],
+    fdl_re: &[f32],
+    fdl_im: &[f32],
+    ir_re: &[f32],
+    ir_im: &[f32],
+    num_partitions: usize,
+    bins: usize,
+    ring_start_idx: usize,
+    start_p: usize,
+    end_p: usize,
+) {
+    if num_partitions == 0 || bins == 0 || start_p >= end_p {
+        return;
+    }
+    let limit = end_p.min(num_partitions);
+    let mut p = start_p;
+    let mut ring_idx = ring_start_idx % num_partitions;
+    while p < limit {
         let x_off = ring_idx * bins;
         let h_off = p * bins;
         if x_off + bins <= fdl_re.len()

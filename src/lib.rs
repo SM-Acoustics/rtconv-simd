@@ -26,6 +26,10 @@ pub mod error;
 pub mod fft;
 pub mod hybrid;
 pub mod partitioned;
+#[cfg(feature = "phastft")]
+pub mod phastft_backend;
+pub mod simd_fft;
+mod simd_fft_tables;
 pub mod simd_kernels;
 
 pub use direct::{DirectConfig, DirectConvolver, DirectMemoryRequirements};
@@ -36,6 +40,9 @@ pub use hybrid::{HybridConfig, HybridConvolver, HybridMemoryRequirements};
 pub use partitioned::{
     PartitionedConfig, PartitionedConvolver, PartitionedMemoryRequirements,
 };
+#[cfg(feature = "phastft")]
+pub use phastft_backend::PhastFftBackend;
+pub use simd_fft::SimdFixedFftBackend;
 
 /// Convolution engine variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

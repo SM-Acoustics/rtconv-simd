@@ -16,7 +16,9 @@
 
 use crate::error::ConvError;
 use crate::fft::{FftBackend, FftSize, MicroFftBackend};
-use crate::simd_kernels::{cmac_fdl_scalar, cmac_fdl_simd};
+use crate::simd_kernels::{
+    cmac_fdl_range_scalar, cmac_fdl_range_simd, cmac_fdl_scalar, cmac_fdl_simd,
+};
 use crate::{Capabilities, EngineKind, SimdBackend};
 
 /// Configuration for [`PartitionedConvolver`].
@@ -316,6 +318,143 @@ impl<'a, F: FftBackend> PartitionedConvolver<'a, F> {
         }
 
         // 4. Inverse FFT (normalized by 1/N) and extract valid second half [B..2B].
+        self.fft.rfft_inverse(
+            self.fft_size,
+            self.acc_re,
+            self.acc_im,
+            self.time_buf,
+            self.fft_scratch,
+        )?;
+        output.copy_from_slice(&self.time_buf[b..2 * b]);
+
+        Ok(())
+    }
+
+    /// Resets only the spectral accumulator prior to time-distributed FDL steps.
+    #[inline]
+    pub fn reset_accumulator(&mut self) {
+        self.acc_re.fill(0.0);
+        self.acc_im.fill(0.0);
+    }
+
+    /// Accumulates past partitions `p in [start_p, end_p)` (`start_p >= 1`)
+    /// using spectra already resident in the FDL ring buffer before the next
+    /// input block arrives. Enables zero-latency work spreading in [`crate::HybridConvolver`].
+    pub fn accumulate_past_partitions(&mut self, start_p: usize, end_p: usize) {
+        let p_total = self.num_partitions;
+        let lo = start_p.max(1);
+        let hi = end_p.min(p_total);
+        if lo >= hi || p_total <= 1 {
+            return;
+        }
+        // Before `fdl_head` advances for the incoming block, `fdl_head` holds X[m-1] (p=1).
+        let back = (lo - 1) % p_total;
+        let ring_start = (self.fdl_head + p_total - back) % p_total;
+
+        if self.backend.is_scalar() {
+            cmac_fdl_range_scalar(
+                self.acc_re,
+                self.acc_im,
+                self.fdl_re,
+                self.fdl_im,
+                self.ir_re,
+                self.ir_im,
+                p_total,
+                self.bins,
+                ring_start,
+                lo,
+                hi,
+            );
+        } else {
+            cmac_fdl_range_simd(
+                self.backend.level(),
+                self.acc_re,
+                self.acc_im,
+                self.fdl_re,
+                self.fdl_im,
+                self.ir_re,
+                self.ir_im,
+                p_total,
+                self.bins,
+                ring_start,
+                lo,
+                hi,
+            );
+        }
+    }
+
+    /// Completes a time-distributed FDL cycle once the new `block_size` input
+    /// samples are ready: runs forward RFFT, accumulates partition `p = 0` onto
+    /// the pre-accumulated past partitions, and runs inverse FFT into `output`.
+    pub fn finish_distributed_block(
+        &mut self,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> Result<(), ConvError> {
+        let b = self.block_size;
+        if input.len() != b {
+            return Err(ConvError::MismatchedBufferLength {
+                expected: b,
+                actual: input.len(),
+            });
+        }
+        if output.len() != b {
+            return Err(ConvError::MismatchedBufferLength {
+                expected: b,
+                actual: output.len(),
+            });
+        }
+
+        self.time_buf[..b].copy_from_slice(self.prev_input);
+        self.time_buf[b..2 * b].copy_from_slice(input);
+        self.prev_input.copy_from_slice(input);
+
+        self.fdl_head = if self.fdl_head + 1 == self.num_partitions {
+            0
+        } else {
+            self.fdl_head + 1
+        };
+        let head_off = self.fdl_head * self.bins;
+        self.fft.rfft_forward(
+            self.fft_size,
+            self.time_buf,
+            &mut self.fdl_re[head_off..head_off + self.bins],
+            &mut self.fdl_im[head_off..head_off + self.bins],
+            self.fft_scratch,
+        )?;
+
+        // Accumulate partition p = 0 onto pre-accumulated p = 1..P.
+        if self.backend.is_scalar() {
+            cmac_fdl_range_scalar(
+                self.acc_re,
+                self.acc_im,
+                self.fdl_re,
+                self.fdl_im,
+                self.ir_re,
+                self.ir_im,
+                self.num_partitions,
+                self.bins,
+                self.fdl_head,
+                0,
+                1,
+            );
+        } else {
+            cmac_fdl_range_simd(
+                self.backend.level(),
+                self.acc_re,
+                self.acc_im,
+                self.fdl_re,
+                self.fdl_im,
+                self.ir_re,
+                self.ir_im,
+                self.num_partitions,
+                self.bins,
+                self.fdl_head,
+                0,
+                1,
+            );
+        }
+
         self.fft.rfft_inverse(
             self.fft_size,
             self.acc_re,

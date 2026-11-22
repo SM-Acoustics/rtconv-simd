@@ -65,6 +65,9 @@ pub struct HybridConvolver<'a, F: FftBackend = MicroFftBackend> {
     tail_out_buf: &'a mut [f32],
     tail_pos: usize,
     tail_block_size: usize,
+    tail_spreading: bool,
+    spread_p: usize,
+    acc_primed: bool,
     max_ir_len: usize,
     active_ir_len: usize,
     fft_name: &'static str,
@@ -212,12 +215,36 @@ impl<'a, F: FftBackend> HybridConvolver<'a, F> {
             tail_out_buf,
             tail_pos: 0,
             tail_block_size: config.tail_block_size,
+            tail_spreading: false,
+            spread_p: 1,
+            acc_primed: false,
             max_ir_len: config.max_ir_len,
             active_ir_len: ir.len(),
             fft_name,
             fft_is_simd,
             fft_size,
         })
+    }
+
+    /// Enables or disables zero-latency time-distributed FDL tail spreading.
+    ///
+    /// When enabled, past FDL partitions (`p = 1..P`) are pre-accumulated across
+    /// the host sub-blocks preceding tail completion (e.g., callbacks 0, 1, 2 in a
+    /// 4-callback `Hybrid(H128/T128)` @ `B_host = 32` cycle), leaving only
+    /// `RFFT + CMAC(p=0) + IFFT` for the final callback. Preserves exact temporal
+    /// alignment and `0`-sample algorithmic latency. Call before streaming or after
+    /// [`Self::reset()`].
+    #[inline]
+    pub fn set_tail_spreading(&mut self, enabled: bool) {
+        self.tail_spreading = enabled;
+        self.spread_p = 1;
+        self.acc_primed = false;
+    }
+
+    /// Returns whether time-distributed FDL tail spreading is enabled.
+    #[inline]
+    pub const fn tail_spreading(&self) -> bool {
+        self.tail_spreading
     }
 
     /// Processes an arbitrary-length host block (`input.len() == output.len()`).
@@ -255,9 +282,40 @@ impl<'a, F: FftBackend> HybridConvolver<'a, F> {
                 self.tail_pos += chunk;
                 processed += chunk;
 
-                if self.tail_pos == b_tail {
-                    tail_conv.process_block(self.tail_in_buf, self.tail_out_buf)?;
-                    self.tail_pos = 0;
+                if !self.tail_spreading {
+                    if self.tail_pos == b_tail {
+                        tail_conv.process_block(self.tail_in_buf, self.tail_out_buf)?;
+                        self.tail_pos = 0;
+                    }
+                } else {
+                    let p_total = tail_conv.num_partitions();
+                    if !self.acc_primed {
+                        tail_conv.reset_accumulator();
+                        self.spread_p = 1;
+                        self.acc_primed = true;
+                    }
+
+                    if self.tail_pos < b_tail {
+                        // Distribute p = 1..P evenly across the pre-completion sub-blocks.
+                        if p_total > 1 {
+                            let past = p_total - 1;
+                            let denom = b_tail.saturating_sub(chunk).max(1);
+                            let target_p = (1 + (past * self.tail_pos) / denom).min(p_total);
+                            if target_p > self.spread_p {
+                                tail_conv.accumulate_past_partitions(self.spread_p, target_p);
+                                self.spread_p = target_p;
+                            }
+                        }
+                    } else {
+                        // Complete any remaining past partitions, then RFFT + CMAC(p=0) + IFFT.
+                        if self.spread_p < p_total {
+                            tail_conv.accumulate_past_partitions(self.spread_p, p_total);
+                        }
+                        tail_conv.finish_distributed_block(self.tail_in_buf, self.tail_out_buf)?;
+                        self.tail_pos = 0;
+                        self.spread_p = 1;
+                        self.acc_primed = false;
+                    }
                 }
             }
         }
@@ -275,6 +333,8 @@ impl<'a, F: FftBackend> HybridConvolver<'a, F> {
         self.tail_in_buf.fill(0.0);
         self.tail_out_buf.fill(0.0);
         self.tail_pos = 0;
+        self.spread_p = 1;
+        self.acc_primed = false;
     }
 
     /// Algorithmic latency in samples (always `0` because `head_len == tail_block_size`).

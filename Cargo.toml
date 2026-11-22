@@ -35,3 +35,7 @@ codegen-units = 1
 [[bench]]
 name = "rtconv_bench"
 harness = false
+
+[[bench]]
+name = "fft_backends_bench"
+harness = false

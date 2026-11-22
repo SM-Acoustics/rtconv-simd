@@ -6,8 +6,10 @@
 
 use rtconv_simd::{
     DirectConfig, DirectConvolver, HybridConfig, HybridConvolver, MicroFftBackend,
-    PartitionedConfig, PartitionedConvolver, SimdBackend,
+    PartitionedConfig, PartitionedConvolver, SimdBackend, SimdFixedFftBackend,
 };
+#[cfg(feature = "phastft")]
+use rtconv_simd::PhastFftBackend;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -119,5 +121,109 @@ fn test_zero_heap_allocations_in_prepare_and_audio_callback() {
     assert_eq!(
         deallocs, 0,
         "detected {deallocs} heap deallocations in RT path"
+    );
+}
+
+#[test]
+fn test_zero_heap_allocations_simd_fixed_and_tail_spreading() {
+    let ir = [0.25f32; 1024];
+    let input = [0.5f32; 128];
+    let mut output = [0.0f32; 128];
+
+    let backend = SimdBackend::detect();
+    let fft = SimdFixedFftBackend::new(backend);
+
+    let p_cfg = PartitionedConfig {
+        block_size: 128,
+        max_ir_len: 1024,
+    };
+    let mut p_ws = vec![
+        0.0f32;
+        PartitionedConvolver::memory_requirements(p_cfg, &fft)
+            .unwrap()
+            .total_f32
+    ];
+    let h_cfg = HybridConfig {
+        head_len: 128,
+        tail_block_size: 128,
+        max_ir_len: 1024,
+    };
+    let mut h_ws = vec![
+        0.0f32;
+        HybridConvolver::memory_requirements(h_cfg, &fft)
+            .unwrap()
+            .total_f32
+    ];
+
+    ALLOC_COUNT.store(0, Ordering::SeqCst);
+    DEALLOC_COUNT.store(0, Ordering::SeqCst);
+    GUARD_ACTIVE.store(true, Ordering::SeqCst);
+
+    {
+        let mut pconv = PartitionedConvolver::prepare(&ir, p_cfg, &mut p_ws, backend, fft).unwrap();
+        for _ in 0..8 {
+            pconv.process_block(&input, &mut output).unwrap();
+        }
+        pconv.reset();
+    }
+    {
+        let mut hconv = HybridConvolver::prepare(&ir, h_cfg, &mut h_ws, backend, fft).unwrap();
+        hconv.set_tail_spreading(true);
+        for _ in 0..32 {
+            hconv.process_block(&input[..32], &mut output[..32]).unwrap();
+        }
+        hconv.reset();
+    }
+
+    GUARD_ACTIVE.store(false, Ordering::SeqCst);
+    assert_eq!(ALLOC_COUNT.load(Ordering::SeqCst), 0);
+    assert_eq!(DEALLOC_COUNT.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "phastft")]
+#[test]
+fn test_zero_heap_allocations_phastft_audio_callback() {
+    let ir = [0.25f32; 1024];
+    let input = [0.5f32; 128];
+    let mut output = [0.0f32; 128];
+
+    let backend = SimdBackend::detect();
+    // Planner is constructed ONCE outside the RT audio callback.
+    let fft = PhastFftBackend::new();
+
+    let h_cfg = HybridConfig {
+        head_len: 128,
+        tail_block_size: 128,
+        max_ir_len: 1024,
+    };
+    let mut h_ws = vec![
+        0.0f32;
+        HybridConvolver::memory_requirements(h_cfg, &fft)
+            .unwrap()
+            .total_f32
+    ];
+    let mut hconv = HybridConvolver::prepare(&ir, h_cfg, &mut h_ws, backend, fft).unwrap();
+    hconv.set_tail_spreading(true);
+
+    // Strictly verify ZERO allocations/deallocations in the audio callback!
+    ALLOC_COUNT.store(0, Ordering::SeqCst);
+    DEALLOC_COUNT.store(0, Ordering::SeqCst);
+    GUARD_ACTIVE.store(true, Ordering::SeqCst);
+
+    for _ in 0..32 {
+        hconv.process_block(&input[..32], &mut output[..32]).unwrap();
+    }
+    hconv.reset();
+
+    GUARD_ACTIVE.store(false, Ordering::SeqCst);
+    assert_eq!(
+        ALLOC_COUNT.load(Ordering::SeqCst),
+        0,
+        "PhastFftBackend allocated in audio callback!"
+    );
+    assert_eq!(
+        DEALLOC_COUNT.load(Ordering::SeqCst),
+        0,
+        "PhastFftBackend deallocated in audio callback!"
     );
 }
