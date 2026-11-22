@@ -1,15 +1,30 @@
 [package]
-name = "rtconv_simd"
+name = "rtconv-simd"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
-description = "Hard real-time, no_std, allocation-free FIR convolution engine (direct, partitioned FFT FDL, hybrid) with fearless_simd acceleration"
-keywords = ["dsp", "audio", "convolution", "simd", "no_std"]
+readme = "README.md"
+repository = "https://github.com/SM-Acoustics/rtconv-simd"
+documentation = "https://docs.rs/rtconv-simd"
+description = "Pure Rust, no_std FIR convolution with SIMD FFT, caller-managed memory, and predictable real-time DSP workloads."
+keywords = ["dsp", "convolution", "simd", "audio", "no-std"]
 categories = ["multimedia::audio", "no-std", "algorithms"]
+exclude = [
+    ".github/*",
+    ".gitignore",
+    ".gitattributes",
+    "rustfmt.toml",
+    "VALIDATION.md",
+    "RT_AUDIT.md",
+]
+
+[lib]
+name = "rtconv_simd"
+path = "src/lib.rs"
 
 [features]
-default = ["std"]
+default = []
 # Enables runtime CPU feature detection (`Level::new()`) via `fearless_simd/std`.
 # Core DSP processing never uses `std` or `alloc`.
 std = ["fearless_simd/std"]

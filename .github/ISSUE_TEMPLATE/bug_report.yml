@@ -1,0 +1,26 @@
+name: Bug Report
+description: Report a numerical, real-time contract, or compilation bug
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Clear description of the unexpected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal Reproduction
+      description: IR length, block size, engine, FFT backend, SIMD backend, and exact commands.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Rust version, target triple, CPU/MCU, OS, and crate features enabled.
+    validations:
+      required: true

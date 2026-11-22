@@ -54,6 +54,12 @@ impl FftSize {
         self as usize
     }
 
+    /// Always `false` since all supported FFT sizes are strictly positive.
+    #[inline]
+    pub const fn is_empty(self) -> bool {
+        false
+    }
+
     /// Half FFT length `N / 2` (equals the 50% overlap-save block size `B`).
     #[inline]
     pub const fn half_len(self) -> usize {

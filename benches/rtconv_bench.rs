@@ -8,7 +8,9 @@
 //! NOT formal WCET proofs.
 
 use rtconv_simd::fft::{FftBackend, FftSize, MicroFftBackend};
-use rtconv_simd::simd_kernels::{cmac_fdl_scalar, cmac_fdl_simd, dot_product_scalar, dot_product_simd};
+use rtconv_simd::simd_kernels::{
+    cmac_fdl_scalar, cmac_fdl_simd, dot_product_scalar, dot_product_simd,
+};
 use rtconv_simd::{
     DirectConfig, DirectConvolver, HybridConfig, HybridConvolver, PartitionedConfig,
     PartitionedConvolver, SimdBackend,
@@ -61,7 +63,7 @@ fn make_signal(len: usize, seed: u64) -> Vec<f32> {
 }
 
 fn main() {
-    let best = SimdBackend::detect();
+    let best = SimdBackend::detect_or_baseline();
     let scalar = SimdBackend::scalar();
     println!("=== RTConv SIMD Benchmark Suite ===");
     println!("Detected best SIMD backend: {}", best.name());
@@ -78,7 +80,9 @@ fn main() {
     println!();
 
     // 1. Microbenchmark: dot_product (Scalar vs SSE2 vs AVX2)
-    println!("--- 1. Kernel Microbenchmark: dot_product (ns/call, 2000 iters, 64 reps batched) ---");
+    println!(
+        "--- 1. Kernel Microbenchmark: dot_product (ns/call, 2000 iters, 64 reps batched) ---"
+    );
     println!(
         "{:<8} {:<12} {:<12} {:<12} {:<12}",
         "Taps", "Scalar(ns)", "SSE2(ns)", "AVX2(ns)", "AVX2/Scalar"
@@ -101,6 +105,7 @@ fn main() {
         );
         let sc_ns = s_sc.median_us * 1000.0 / reps as f64;
 
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         let sse2_ns = if let Ok(sse2) = SimdBackend::try_sse2() {
             let st = measure_us(
                 || {
@@ -117,7 +122,10 @@ fn main() {
         } else {
             f64::NAN
         };
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        let sse2_ns = f64::NAN;
 
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         let avx2_ns = if let Ok(avx2) = SimdBackend::try_avx2() {
             let st = measure_us(
                 || {
@@ -134,6 +142,8 @@ fn main() {
         } else {
             f64::NAN
         };
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        let avx2_ns = f64::NAN;
 
         println!(
             "{:<8} {:<12.1} {:<12.1} {:<12.1} {:<12.2}x",
@@ -182,6 +192,7 @@ fn main() {
             SAMPLES,
         );
 
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         let sse2_us = if let Ok(sse2) = SimdBackend::try_sse2() {
             measure_us(
                 || {
@@ -207,7 +218,10 @@ fn main() {
         } else {
             f64::NAN
         };
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        let sse2_us = f64::NAN;
 
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         let avx2_us = if let Ok(avx2) = SimdBackend::try_avx2() {
             measure_us(
                 || {
@@ -233,6 +247,8 @@ fn main() {
         } else {
             f64::NAN
         };
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        let avx2_us = f64::NAN;
 
         println!(
             "{:<10} {:<12.2} {:<12.2} {:<12.2} {:<12.2}x",
@@ -246,7 +262,9 @@ fn main() {
     println!();
 
     // 3. FFT 64 vs 128 vs 256 full path (RFFT -> CMAC -> IFFT)
-    println!("--- 3. FFT Comparison: RFFT -> CMAC(1 part) -> IFFT (microfft 0.6.0, scalar FFT + AVX2 CMAC) ---");
+    println!(
+        "--- 3. FFT Comparison: RFFT -> CMAC(1 part) -> IFFT (microfft 0.6.0, scalar FFT + AVX2 CMAC) ---"
+    );
     println!(
         "{:<8} {:<10} {:<10} {:<10} {:<10} {:<14} {:<12}",
         "FFT N", "Med(us)", "p95(us)", "p99(us)", "Max(us)", "MaxAbsErr", "SNR(dB)"
@@ -265,7 +283,8 @@ fn main() {
         let mut acc_re = vec![0.0f32; bins];
         let mut acc_im = vec![0.0f32; bins];
         let mut out = vec![0.0f32; n];
-        fft.rfft_forward(size, &h, &mut h_re, &mut h_im, &mut []).unwrap();
+        fft.rfft_forward(size, &h, &mut h_re, &mut h_im, &mut [])
+            .unwrap();
 
         let st = measure_us(
             || {
@@ -341,7 +360,9 @@ fn main() {
         let mut conv_sc = DirectConvolver::prepare(&ir, cfg, &mut ws_sc, scalar).unwrap();
         let st_sc = measure_us(
             || {
-                conv_sc.process_block(black_box(&input), black_box(&mut out)).unwrap();
+                conv_sc
+                    .process_block(black_box(&input), black_box(&mut out))
+                    .unwrap();
             },
             WARMUP,
             SAMPLES,
@@ -351,7 +372,9 @@ fn main() {
         let mut conv_sm = DirectConvolver::prepare(&ir, cfg, &mut ws_sm, best).unwrap();
         let st_sm = measure_us(
             || {
-                conv_sm.process_block(black_box(&input), black_box(&mut out)).unwrap();
+                conv_sm
+                    .process_block(black_box(&input), black_box(&mut out))
+                    .unwrap();
             },
             WARMUP,
             SAMPLES,
@@ -397,11 +420,12 @@ fn main() {
         let req = PartitionedConvolver::memory_requirements(cfg, &fft).unwrap();
 
         let mut ws_sc = vec![0.0f32; req.total_f32];
-        let mut conv_sc =
-            PartitionedConvolver::prepare(&ir, cfg, &mut ws_sc, scalar, fft).unwrap();
+        let mut conv_sc = PartitionedConvolver::prepare(&ir, cfg, &mut ws_sc, scalar, fft).unwrap();
         let st_sc = measure_us(
             || {
-                conv_sc.process_block(black_box(&input), black_box(&mut out)).unwrap();
+                conv_sc
+                    .process_block(black_box(&input), black_box(&mut out))
+                    .unwrap();
             },
             WARMUP,
             SAMPLES,
@@ -411,7 +435,9 @@ fn main() {
         let mut conv_sm = PartitionedConvolver::prepare(&ir, cfg, &mut ws_sm, best, fft).unwrap();
         let st_sm = measure_us(
             || {
-                conv_sm.process_block(black_box(&input), black_box(&mut out)).unwrap();
+                conv_sm
+                    .process_block(black_box(&input), black_box(&mut out))
+                    .unwrap();
             },
             WARMUP,
             SAMPLES,
@@ -453,7 +479,9 @@ fn main() {
         let mut conv_sc = HybridConvolver::prepare(&ir, cfg, &mut ws_sc, scalar, fft).unwrap();
         let st_sc = measure_us(
             || {
-                conv_sc.process_block(black_box(&input), black_box(&mut out)).unwrap();
+                conv_sc
+                    .process_block(black_box(&input), black_box(&mut out))
+                    .unwrap();
             },
             WARMUP,
             SAMPLES,
@@ -463,7 +491,9 @@ fn main() {
         let mut conv_sm = HybridConvolver::prepare(&ir, cfg, &mut ws_sm, best, fft).unwrap();
         let st_sm = measure_us(
             || {
-                conv_sm.process_block(black_box(&input), black_box(&mut out)).unwrap();
+                conv_sm
+                    .process_block(black_box(&input), black_box(&mut out))
+                    .unwrap();
             },
             WARMUP,
             SAMPLES,

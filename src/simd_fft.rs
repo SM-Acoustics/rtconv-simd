@@ -15,13 +15,13 @@
 //! - Falls back cleanly to scalar butterflies when `SimdBackend::scalar()` is
 //!   selected or when the target has no SIMD support (e.g. RISC-V).
 
+use crate::SimdBackend;
 use crate::error::ConvError;
 use crate::fft::{FftBackend, FftSize};
 use crate::simd_fft_tables::{
     BITREV_32, BITREV_64, BITREV_128, R2C_COS_256, R2C_SIN_256, TW_COS_4, TW_COS_8, TW_COS_16,
     TW_COS_32, TW_COS_64, TW_SIN_4, TW_SIN_8, TW_SIN_16, TW_SIN_32, TW_SIN_64,
 };
-use crate::SimdBackend;
 use fearless_simd::{Simd, dispatch, f32x4, prelude::*};
 use fearless_simd_macros::simd;
 
@@ -180,13 +180,7 @@ fn stage_scalar(
 
 /// 4-wide SIMD butterfly stage (`half == 4`), works cleanly on SSE2, AVX2, NEON, WASM.
 #[inline(always)]
-fn stage_half4_simd<S: Simd>(
-    simd: S,
-    re: &mut [f32],
-    im: &mut [f32],
-    m: usize,
-    inverse: bool,
-) {
+fn stage_half4_simd<S: Simd>(simd: S, re: &mut [f32], im: &mut [f32], m: usize, inverse: bool) {
     let wr = f32x4::from_slice(simd, &TW_COS_4);
     let wi = f32x4::from_slice(simd, &TW_SIN_4);
     let mut base = 0;
@@ -227,6 +221,7 @@ fn stage_half4_simd<S: Simd>(
 
 /// Native-width SIMD butterfly stage for `half >= 8` (exact multiple of `S::f32s::LEN` on SSE2/AVX2/NEON/WASM).
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn stage_native_simd<S: Simd>(
     simd: S,
     re: &mut [f32],
@@ -238,7 +233,7 @@ fn stage_native_simd<S: Simd>(
     inverse: bool,
 ) {
     let lanes = S::f32s::LEN;
-    if half < lanes || half % lanes != 0 {
+    if half < lanes || !half.is_multiple_of(lanes) {
         stage_scalar(re, im, m, half, tw_cos, tw_sin, inverse);
         return;
     }
@@ -373,6 +368,7 @@ fn r2c_untangle(
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn c2r_preprocess_bitrev(
     spec_re: &[f32],
     spec_im: &[f32],

@@ -1,0 +1,19 @@
+name: Performance / Hardware Evidence Report
+description: Share reproducible benchmarks, SIMD disassembly, or target hardware measurements
+title: "[Perf]: "
+labels: ["performance"]
+body:
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Target Hardware & Toolchain
+      description: CPU/MCU, clock, OS/RTOS, rustc version, target triple, and RUSTFLAGS.
+    validations:
+      required: true
+  - type: textarea
+    id: measurements
+    attributes:
+      label: Measurements & Commands
+      description: Exact benchmark command, median/p95/p99/max observed, memory/stack, and provenance label (HOST_ONLY / DEVICE_VERIFIED).
+    validations:
+      required: true

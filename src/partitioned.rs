@@ -509,6 +509,7 @@ impl<'a, F: FftBackend> PartitionedConvolver<'a, F> {
         Capabilities {
             engine: EngineKind::Partitioned,
             simd_backend: self.backend.name(),
+            simd_active: self.backend.is_simd_active(),
             fft_backend: self.fft.name(),
             fft_is_simd: self.fft.is_simd_accelerated(),
             block_size: Some(self.block_size),

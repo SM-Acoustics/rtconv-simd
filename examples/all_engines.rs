@@ -30,17 +30,14 @@ fn main() {
         max_ir_len: 64,
     };
     let mut part_ws = [0.0f32; 512];
-    let mut part = PartitionedConvolver::prepare(
-        &ir,
-        p_cfg,
-        &mut part_ws,
-        SimdBackend::baseline(),
-        fft,
-    )
-    .expect("partitioned prepare");
+    let mut part =
+        PartitionedConvolver::prepare(&ir, p_cfg, &mut part_ws, SimdBackend::baseline(), fft)
+            .expect("partitioned prepare");
     let mut out_part = [0.0f32; 64];
-    part.process_block(&input[..32], &mut out_part[..32]).unwrap();
-    part.process_block(&input[32..], &mut out_part[32..]).unwrap();
+    part.process_block(&input[..32], &mut out_part[..32])
+        .unwrap();
+    part.process_block(&input[32..], &mut out_part[32..])
+        .unwrap();
 
     // 3. HybridConvolver with static workspace (head=64, tail=64, host block=32)
     let h_cfg = HybridConfig {
@@ -49,14 +46,8 @@ fn main() {
         max_ir_len: 128,
     };
     let mut hyb_ws = [0.0f32; 1024];
-    let mut hyb = HybridConvolver::prepare(
-        &ir,
-        h_cfg,
-        &mut hyb_ws,
-        SimdBackend::baseline(),
-        fft,
-    )
-    .expect("hybrid prepare");
+    let mut hyb = HybridConvolver::prepare(&ir, h_cfg, &mut hyb_ws, SimdBackend::baseline(), fft)
+        .expect("hybrid prepare");
     let mut out_hyb = [0.0f32; 64];
     hyb.process_block(&input[..32], &mut out_hyb[..32]).unwrap();
     hyb.process_block(&input[32..], &mut out_hyb[32..]).unwrap();

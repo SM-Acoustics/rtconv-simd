@@ -1,15 +1,15 @@
-//! Allocation-free real-time contract verification using a custom `GlobalAlloc`.
+//! Allocation-free real-time contract verification using a re-entrancy-safe `GlobalAlloc`.
 //!
-//! Confirms zero heap allocations and zero deallocations during `prepare()`,
-//! `process_sample()`, `process_block()`, `reset()`, `latency_samples()`, and
-//! `capabilities()` across all three engines.
+//! All engine/backend scenarios run sequentially inside a single test entry point so no
+//! sibling test threads can allocate while `GUARD_ACTIVE` is armed, and `GlobalAlloc`
+//! touches only lock-free atomics (no TLS initialization inside `alloc`/`dealloc`).
 
+#[cfg(feature = "phastft")]
+use rtconv_simd::PhastFftBackend;
 use rtconv_simd::{
     DirectConfig, DirectConvolver, HybridConfig, HybridConvolver, MicroFftBackend,
     PartitionedConfig, PartitionedConvolver, SimdBackend, SimdFixedFftBackend,
 };
-#[cfg(feature = "phastft")]
-use rtconv_simd::PhastFftBackend;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -38,18 +38,36 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-#[test]
-fn test_zero_heap_allocations_in_prepare_and_audio_callback() {
+fn assert_zero_alloc<F: FnOnce()>(label: &str, f: F) {
+    ALLOC_COUNT.store(0, Ordering::SeqCst);
+    DEALLOC_COUNT.store(0, Ordering::SeqCst);
+    GUARD_ACTIVE.store(true, Ordering::SeqCst);
+    f();
+    GUARD_ACTIVE.store(false, Ordering::SeqCst);
+    let allocs = ALLOC_COUNT.load(Ordering::SeqCst);
+    let deallocs = DEALLOC_COUNT.load(Ordering::SeqCst);
+    assert_eq!(allocs, 0, "{label}: detected {allocs} heap allocations");
+    assert_eq!(
+        deallocs, 0,
+        "{label}: detected {deallocs} heap deallocations"
+    );
+}
+
+fn verify_microfft_engines() {
     let ir = [0.25f32; 512];
     let input = [0.5f32; 128];
     let mut output = [0.0f32; 128];
 
-    // Pre-allocate caller-owned workspaces outside the RT region.
     let fft = MicroFftBackend::new();
-    let backend = SimdBackend::detect();
+    let backend = SimdBackend::detect_or_baseline();
 
     let d_cfg = DirectConfig { max_ir_len: 512 };
-    let mut d_ws = vec![0.0f32; DirectConvolver::memory_requirements(d_cfg).unwrap().total_f32];
+    let mut d_ws = vec![
+        0.0f32;
+        DirectConvolver::memory_requirements(d_cfg)
+            .unwrap()
+            .total_f32
+    ];
 
     let p_cfg = PartitionedConfig {
         block_size: 64,
@@ -74,63 +92,45 @@ fn test_zero_heap_allocations_in_prepare_and_audio_callback() {
             .total_f32
     ];
 
-    // Activate strict allocation guard.
-    ALLOC_COUNT.store(0, Ordering::SeqCst);
-    DEALLOC_COUNT.store(0, Ordering::SeqCst);
-    GUARD_ACTIVE.store(true, Ordering::SeqCst);
-
-    // 1. DirectConvolver
-    {
-        let mut conv = DirectConvolver::prepare(&ir, d_cfg, &mut d_ws, backend).unwrap();
-        let _ = conv.process_sample(0.1);
-        for _ in 0..16 {
-            conv.process_block(&input[..32], &mut output[..32]).unwrap();
+    assert_zero_alloc("MicroFft + Direct/Partitioned/Hybrid", || {
+        {
+            let mut conv = DirectConvolver::prepare(&ir, d_cfg, &mut d_ws, backend).unwrap();
+            let _ = conv.process_sample(0.1);
+            for _ in 0..16 {
+                conv.process_block(&input[..32], &mut output[..32]).unwrap();
+            }
+            conv.reset();
+            let _ = conv.latency_samples();
+            let _ = conv.capabilities();
         }
-        conv.reset();
-        let _ = conv.latency_samples();
-        let _ = conv.capabilities();
-    }
-
-    // 2. PartitionedConvolver
-    {
-        let mut conv = PartitionedConvolver::prepare(&ir, p_cfg, &mut p_ws, backend, fft).unwrap();
-        for _ in 0..16 {
-            conv.process_block(&input[..64], &mut output[..64]).unwrap();
+        {
+            let mut conv =
+                PartitionedConvolver::prepare(&ir, p_cfg, &mut p_ws, backend, fft).unwrap();
+            for _ in 0..16 {
+                conv.process_block(&input[..64], &mut output[..64]).unwrap();
+            }
+            conv.reset();
+            let _ = conv.latency_samples();
+            let _ = conv.capabilities();
         }
-        conv.reset();
-        let _ = conv.latency_samples();
-        let _ = conv.capabilities();
-    }
-
-    // 3. HybridConvolver
-    {
-        let mut conv = HybridConvolver::prepare(&ir, h_cfg, &mut h_ws, backend, fft).unwrap();
-        for _ in 0..32 {
-            conv.process_block(&input[..32], &mut output[..32]).unwrap();
+        {
+            let mut conv = HybridConvolver::prepare(&ir, h_cfg, &mut h_ws, backend, fft).unwrap();
+            for _ in 0..32 {
+                conv.process_block(&input[..32], &mut output[..32]).unwrap();
+            }
+            conv.reset();
+            let _ = conv.latency_samples();
+            let _ = conv.capabilities();
         }
-        conv.reset();
-        let _ = conv.latency_samples();
-        let _ = conv.capabilities();
-    }
-
-    GUARD_ACTIVE.store(false, Ordering::SeqCst);
-    let allocs = ALLOC_COUNT.load(Ordering::SeqCst);
-    let deallocs = DEALLOC_COUNT.load(Ordering::SeqCst);
-
-    assert_eq!(allocs, 0, "detected {allocs} heap allocations in RT path");
-    assert_eq!(
-        deallocs, 0,
-        "detected {deallocs} heap deallocations in RT path"
-    );
+    });
 }
 
-#[test]
-fn test_zero_heap_allocations_simd_fixed_and_tail_spreading() {
+fn verify_simd_fixed_and_tail_spreading() {
     let ir = [0.25f32; 1024];
     let input = [0.5f32; 128];
     let mut output = [0.0f32; 128];
 
-    let backend = SimdBackend::detect();
+    let backend = SimdBackend::detect_or_baseline();
     let fft = SimdFixedFftBackend::new(backend);
 
     let p_cfg = PartitionedConfig {
@@ -155,39 +155,37 @@ fn test_zero_heap_allocations_simd_fixed_and_tail_spreading() {
             .total_f32
     ];
 
-    ALLOC_COUNT.store(0, Ordering::SeqCst);
-    DEALLOC_COUNT.store(0, Ordering::SeqCst);
-    GUARD_ACTIVE.store(true, Ordering::SeqCst);
-
-    {
-        let mut pconv = PartitionedConvolver::prepare(&ir, p_cfg, &mut p_ws, backend, fft).unwrap();
-        for _ in 0..8 {
-            pconv.process_block(&input, &mut output).unwrap();
+    assert_zero_alloc("SimdFixedFft + Hybrid(SPREAD)", || {
+        {
+            let mut pconv =
+                PartitionedConvolver::prepare(&ir, p_cfg, &mut p_ws, backend, fft).unwrap();
+            for _ in 0..8 {
+                pconv.process_block(&input, &mut output).unwrap();
+            }
+            pconv.reset();
         }
-        pconv.reset();
-    }
-    {
-        let mut hconv = HybridConvolver::prepare(&ir, h_cfg, &mut h_ws, backend, fft).unwrap();
-        hconv.set_tail_spreading(true);
-        for _ in 0..32 {
-            hconv.process_block(&input[..32], &mut output[..32]).unwrap();
+        {
+            let mut hconv = HybridConvolver::prepare_with_tail_spreading(
+                &ir, h_cfg, &mut h_ws, backend, fft, true,
+            )
+            .unwrap();
+            for _ in 0..32 {
+                hconv
+                    .process_block(&input[..32], &mut output[..32])
+                    .unwrap();
+            }
+            hconv.reset();
         }
-        hconv.reset();
-    }
-
-    GUARD_ACTIVE.store(false, Ordering::SeqCst);
-    assert_eq!(ALLOC_COUNT.load(Ordering::SeqCst), 0);
-    assert_eq!(DEALLOC_COUNT.load(Ordering::SeqCst), 0);
+    });
 }
 
 #[cfg(feature = "phastft")]
-#[test]
-fn test_zero_heap_allocations_phastft_audio_callback() {
+fn verify_phastft_audio_callback() {
     let ir = [0.25f32; 1024];
     let input = [0.5f32; 128];
     let mut output = [0.0f32; 128];
 
-    let backend = SimdBackend::detect();
+    let backend = SimdBackend::detect_or_baseline();
     // Planner is constructed ONCE outside the RT audio callback.
     let fft = PhastFftBackend::new();
 
@@ -202,28 +200,24 @@ fn test_zero_heap_allocations_phastft_audio_callback() {
             .unwrap()
             .total_f32
     ];
-    let mut hconv = HybridConvolver::prepare(&ir, h_cfg, &mut h_ws, backend, fft).unwrap();
-    hconv.set_tail_spreading(true);
+    let mut hconv =
+        HybridConvolver::prepare_with_tail_spreading(&ir, h_cfg, &mut h_ws, backend, fft, true)
+            .unwrap();
 
-    // Strictly verify ZERO allocations/deallocations in the audio callback!
-    ALLOC_COUNT.store(0, Ordering::SeqCst);
-    DEALLOC_COUNT.store(0, Ordering::SeqCst);
-    GUARD_ACTIVE.store(true, Ordering::SeqCst);
+    assert_zero_alloc("PhastFftBackend audio callback", || {
+        for _ in 0..32 {
+            hconv
+                .process_block(&input[..32], &mut output[..32])
+                .unwrap();
+        }
+        hconv.reset();
+    });
+}
 
-    for _ in 0..32 {
-        hconv.process_block(&input[..32], &mut output[..32]).unwrap();
-    }
-    hconv.reset();
-
-    GUARD_ACTIVE.store(false, Ordering::SeqCst);
-    assert_eq!(
-        ALLOC_COUNT.load(Ordering::SeqCst),
-        0,
-        "PhastFftBackend allocated in audio callback!"
-    );
-    assert_eq!(
-        DEALLOC_COUNT.load(Ordering::SeqCst),
-        0,
-        "PhastFftBackend deallocated in audio callback!"
-    );
+#[test]
+fn test_zero_heap_allocations_all_engines_and_backends() {
+    verify_microfft_engines();
+    verify_simd_fixed_and_tail_spreading();
+    #[cfg(feature = "phastft")]
+    verify_phastft_audio_callback();
 }

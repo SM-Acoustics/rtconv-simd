@@ -226,19 +226,39 @@ impl<'a, F: FftBackend> HybridConvolver<'a, F> {
         })
     }
 
+    /// Convenience constructor equivalent to [`Self::prepare`] followed by
+    /// [`Self::set_tail_spreading`].
+    pub fn prepare_with_tail_spreading(
+        ir: &[f32],
+        config: HybridConfig,
+        workspace: &'a mut [f32],
+        backend: SimdBackend,
+        fft: F,
+        tail_spreading: bool,
+    ) -> Result<Self, ConvError> {
+        let mut conv = Self::prepare(ir, config, workspace, backend, fft)?;
+        conv.set_tail_spreading(tail_spreading)?;
+        Ok(conv)
+    }
+
     /// Enables or disables zero-latency time-distributed FDL tail spreading.
     ///
-    /// When enabled, past FDL partitions (`p = 1..P`) are pre-accumulated across
-    /// the host sub-blocks preceding tail completion (e.g., callbacks 0, 1, 2 in a
-    /// 4-callback `Hybrid(H128/T128)` @ `B_host = 32` cycle), leaving only
-    /// `RFFT + CMAC(p=0) + IFFT` for the final callback. Preserves exact temporal
-    /// alignment and `0`-sample algorithmic latency. Call before streaming or after
-    /// [`Self::reset()`].
+    /// To prevent lost or duplicated partition contributions, mode changes are
+    /// only permitted when no partial tail cycle is in progress (`tail_pos == 0`
+    /// and `!acc_primed`, i.e., before streaming or immediately after [`Self::reset`]).
+    /// Returns [`ConvError::InvalidStateTransition`] if called mid-cycle.
     #[inline]
-    pub fn set_tail_spreading(&mut self, enabled: bool) {
+    pub fn set_tail_spreading(&mut self, enabled: bool) -> Result<(), ConvError> {
+        if self.tail_spreading == enabled {
+            return Ok(());
+        }
+        if self.tail_pos != 0 || self.acc_primed {
+            return Err(ConvError::InvalidStateTransition);
+        }
         self.tail_spreading = enabled;
         self.spread_p = 1;
         self.acc_primed = false;
+        Ok(())
     }
 
     /// Returns whether time-distributed FDL tail spreading is enabled.
@@ -350,6 +370,7 @@ impl<'a, F: FftBackend> HybridConvolver<'a, F> {
         Capabilities {
             engine: EngineKind::Hybrid,
             simd_backend: direct_caps.simd_backend,
+            simd_active: direct_caps.simd_active,
             fft_backend: self.fft_name,
             fft_is_simd: self.fft_is_simd,
             block_size: Some(self.tail_block_size),

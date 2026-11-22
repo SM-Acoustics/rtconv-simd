@@ -1,0 +1,46 @@
+name: Release Candidate Verification (Dry-Run Only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  msrv-check:
+    name: MSRV Verification (Rust 1.89.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - run: rustc -vV
+      - run: cargo check --lib --no-default-features
+      - run: cargo check --all-features
+      - run: cargo test --no-default-features
+      - run: cargo test --all-features
+
+  release-check:
+    name: Package & Dry-Run Publish Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Dependency & license tree (no_std core)
+        run: cargo tree --no-default-features -e normal -f "{p} ({l})"
+      - name: Format & Clippy
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --lib --no-default-features -- -D warnings
+          cargo clippy --all-targets --all-features -- -D warnings
+      - name: Full Test Suite
+        run: |
+          cargo test --release --no-default-features
+          cargo test --release --all-features
+          cargo test --release --all-features --test no_alloc_rt -- --test-threads=1
+      - name: Package Verification (no actual publish)
+        run: |
+          cargo package --list
+          cargo package
+          cargo publish --dry-run
