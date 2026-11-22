@@ -129,7 +129,10 @@ fn validate_fft_backend<F: FftBackend>(label: &str, fft: &F) {
         );
         // DC and Nyquist imaginary parts must be ~0
         assert!(spec_im[0].abs() < 1e-6, "{label} N={n} DC imag != 0");
-        assert!(spec_im[bins - 1].abs() < 1e-6, "{label} N={n} Nyq imag != 0");
+        assert!(
+            spec_im[bins - 1].abs() < 1e-6,
+            "{label} N={n} Nyq imag != 0"
+        );
 
         // 2. Parseval energy theorem: sum |x[n]|^2 == (1/N) * (|X[0]|^2 + |X[N/2]|^2 + 2*sum_{1..N/2-1} |X[k]|^2)
         let time_energy: f64 = x.iter().map(|&v| (v as f64) * (v as f64)).sum();
@@ -158,7 +161,7 @@ fn validate_fft_backend<F: FftBackend>(label: &str, fft: &F) {
 
 fn validate_convolver_with_backend<F: FftBackend + Clone>(label: &str, fft: F) {
     let mut rng = Rng::new(0xFEED_FACE_9999);
-    let backend = SimdBackend::detect();
+    let backend = SimdBackend::detect_or_baseline();
 
     // Asymmetric mixed-phase IR of non-multiple length (517 taps)
     let ir: Vec<f32> = (0..517)
@@ -206,12 +209,16 @@ fn validate_convolver_with_backend<F: FftBackend + Clone>(label: &str, fft: F) {
         };
         let req = HybridConvolver::memory_requirements(cfg, &fft).unwrap();
         let mut ws = vec![0.0f32; req.total_f32];
-        let mut conv =
-            HybridConvolver::prepare(&ir, cfg, &mut ws, backend, fft.clone()).unwrap();
-        conv.set_tail_spreading(spread);
+        let mut conv = HybridConvolver::prepare(&ir, cfg, &mut ws, backend, fft.clone()).unwrap();
+        conv.set_tail_spreading(spread).unwrap();
         assert_eq!(conv.latency_samples(), 0);
         let mut out = vec![0.0f32; input.len()];
-        for (ib, ob) in input.chunks_exact(32).zip(out.chunks_exact_mut(32)) {
+        for (ib, ob) in input
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .zip(out.as_chunks_mut::<32>().0.iter_mut())
+        {
             conv.process_block(ib, ob).unwrap();
         }
         let err = max_abs_diff(&reference, &out);
@@ -224,7 +231,12 @@ fn validate_convolver_with_backend<F: FftBackend + Clone>(label: &str, fft: F) {
         // Verify reset() bit-for-bit reproducibility
         conv.reset();
         let mut out2 = vec![0.0f32; input.len()];
-        for (ib, ob) in input.chunks_exact(32).zip(out2.chunks_exact_mut(32)) {
+        for (ib, ob) in input
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .zip(out2.as_chunks_mut::<32>().0.iter_mut())
+        {
             conv.process_block(ib, ob).unwrap();
         }
         assert_eq!(out, out2, "{label} Hybrid(spread={spread}) reset mismatch");
@@ -276,8 +288,8 @@ fn test_phastft_backend_full_validation() {
 fn test_hybrid_tail_spreading_impulse_and_long_ir_boundaries() {
     let mut rng = Rng::new(2026_0002);
     let ir = rng.vec_f32(2051, 0.15); // 128 head + 1923 tail -> 16 tail partitions
-    let fft = SimdFixedFftBackend::new(SimdBackend::detect());
-    let backend = SimdBackend::detect();
+    let fft = SimdFixedFftBackend::new(SimdBackend::detect_or_baseline());
+    let backend = SimdBackend::detect_or_baseline();
 
     // Test delayed impulses hitting every callback phase (0, 1, 2, 3) and boundary
     for &delay in &[0usize, 31, 32, 63, 64, 95, 96, 127, 128, 129, 255, 256] {
@@ -297,14 +309,17 @@ fn test_hybrid_tail_spreading_impulse_and_long_ir_boundaries() {
         let mut c_burst = HybridConvolver::prepare(&ir, cfg, &mut ws_burst, backend, fft).unwrap();
         let mut c_spread =
             HybridConvolver::prepare(&ir, cfg, &mut ws_spread, backend, fft).unwrap();
-        c_spread.set_tail_spreading(true);
+        c_spread.set_tail_spreading(true).unwrap();
 
         let mut y_burst = vec![0.0f32; input.len()];
         let mut y_spread = vec![0.0f32; input.len()];
-        for (i, (ob, os)) in input
-            .chunks_exact(32)
-            .zip(y_burst.chunks_exact_mut(32).zip(y_spread.chunks_exact_mut(32)))
-        {
+        for (i, (ob, os)) in input.as_chunks::<32>().0.iter().zip(
+            y_burst
+                .as_chunks_mut::<32>()
+                .0
+                .iter_mut()
+                .zip(y_spread.as_chunks_mut::<32>().0.iter_mut()),
+        ) {
             c_burst.process_block(i, ob).unwrap();
             c_spread.process_block(i, os).unwrap();
         }

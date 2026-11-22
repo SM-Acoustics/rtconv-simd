@@ -1,9 +1,7 @@
 //! Pure `#![no_std]`-style static buffer usage example using `SimdFixedFftBackend`
 //! and `HybridConvolver` with zero heap allocation.
 
-use rtconv_simd::{
-    HybridConfig, HybridConvolver, SimdBackend, SimdFixedFftBackend,
-};
+use rtconv_simd::{HybridConfig, HybridConvolver, SimdBackend, SimdFixedFftBackend};
 
 const MAX_IR: usize = 256;
 const BLOCK: usize = 32;
@@ -25,9 +23,10 @@ fn main() {
     assert!(req.total_f32 <= 2048);
 
     let mut workspace = [0.0f32; 2048];
-    let mut conv = HybridConvolver::prepare(&ir, cfg, &mut workspace[..req.total_f32], backend, fft)
-        .expect("prepare");
-    conv.set_tail_spreading(true);
+    let mut conv =
+        HybridConvolver::prepare(&ir, cfg, &mut workspace[..req.total_f32], backend, fft)
+            .expect("prepare");
+    conv.set_tail_spreading(true).expect("tail spreading");
     conv.process_block(&input, &mut output).expect("process");
 
     assert!((output[0] - 0.5).abs() < 1e-6);

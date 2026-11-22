@@ -104,7 +104,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rtconv_simd"
+name = "rtconv-simd"
 version = "0.1.0"
 dependencies = [
  "fearless_simd 1.2.0",

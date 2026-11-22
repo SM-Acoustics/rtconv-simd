@@ -34,12 +34,10 @@ pub mod simd_kernels;
 
 pub use direct::{DirectConfig, DirectConvolver, DirectMemoryRequirements};
 pub use error::ConvError;
-pub use fft::{FftBackend, FftSize, MicroFftBackend};
 pub use fearless_simd::Level;
+pub use fft::{FftBackend, FftSize, MicroFftBackend};
 pub use hybrid::{HybridConfig, HybridConvolver, HybridMemoryRequirements};
-pub use partitioned::{
-    PartitionedConfig, PartitionedConvolver, PartitionedMemoryRequirements,
-};
+pub use partitioned::{PartitionedConfig, PartitionedConvolver, PartitionedMemoryRequirements};
 #[cfg(feature = "phastft")]
 pub use phastft_backend::PhastFftBackend;
 pub use simd_fft::SimdFixedFftBackend;
@@ -62,6 +60,9 @@ pub struct Capabilities {
     pub engine: EngineKind,
     /// Selected SIMD backend label.
     pub simd_backend: &'static str,
+    /// Whether vector SIMD instructions are actually executed for FIR/CMAC kernels
+    /// (`false` when scalar override or `fearless_simd::Fallback` is active).
+    pub simd_active: bool,
     /// Active FFT backend label (or `"none"` for `DirectConvolver`).
     pub fft_backend: &'static str,
     /// Whether the FFT/IFFT transform itself is SIMD-vectorized.
@@ -188,6 +189,13 @@ impl SimdBackend {
     #[inline]
     pub const fn is_scalar(&self) -> bool {
         self.scalar_override
+    }
+
+    /// Returns `true` if vector SIMD instructions are actually active
+    /// (neither explicit scalar override nor `fearless_simd::Fallback`).
+    #[inline]
+    pub fn is_simd_active(&self) -> bool {
+        !self.scalar_override && !self.level.is_fallback()
     }
 
     /// Returns the underlying `fearless_simd::Level`.

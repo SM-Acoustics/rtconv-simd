@@ -58,7 +58,12 @@ fn make_signal(len: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-fn bench_fft_stages<F: FftBackend>(label: &str, fft: &F, size: FftSize, micro_rt_ns: Option<f64>) -> f64 {
+fn bench_fft_stages<F: FftBackend>(
+    label: &str,
+    fft: &F,
+    size: FftSize,
+    micro_rt_ns: Option<f64>,
+) -> f64 {
     let n = size.len();
     let bins = size.spectrum_bins();
     let x = make_signal(n, 42 + n as u64);
@@ -132,7 +137,8 @@ fn bench_partitioned<F: FftBackend + Clone>(
 
     let st = measure(
         || {
-            conv.process_block(black_box(&input), black_box(&mut out)).unwrap();
+            conv.process_block(black_box(&input), black_box(&mut out))
+                .unwrap();
         },
         WARMUP,
         ITERS,
@@ -169,7 +175,7 @@ fn bench_hybrid_4phases<F: FftBackend + Clone>(
     let req = HybridConvolver::memory_requirements(cfg, &fft).unwrap();
     let mut ws = vec![0.0f32; req.total_f32];
     let mut conv = HybridConvolver::prepare(&ir, cfg, &mut ws, cmac_backend, fft).unwrap();
-    conv.set_tail_spreading(spread);
+    conv.set_tail_spreading(spread).unwrap();
 
     // Warmup 100 full 4-phase cycles
     for _ in 0..400 {
@@ -185,10 +191,11 @@ fn bench_hybrid_4phases<F: FftBackend + Clone>(
     ];
 
     for _ in 0..cycles {
-        for p in 0..4 {
+        for phase in &mut phases {
             let t0 = Instant::now();
-            conv.process_block(black_box(&input), black_box(&mut out)).unwrap();
-            phases[p].push(t0.elapsed().as_nanos() as f64 / 1000.0);
+            conv.process_block(black_box(&input), black_box(&mut out))
+                .unwrap();
+            phase.push(t0.elapsed().as_nanos() as f64 / 1000.0);
         }
     }
 
@@ -221,9 +228,15 @@ fn bench_hybrid_4phases<F: FftBackend + Clone>(
 }
 
 fn main() {
-    let best = SimdBackend::detect();
+    let best = SimdBackend::detect_or_baseline();
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     let sse2 = SimdBackend::try_sse2().unwrap_or(SimdBackend::baseline());
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let sse2 = SimdBackend::baseline();
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     let avx2 = SimdBackend::try_avx2().unwrap_or(best);
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let avx2 = best;
 
     println!("=== WO-RTCONV-002: SIMD FFT Backends & Tail-Spreading Benchmarks ===");
     println!("Host best SIMD backend: {}", best.name());
@@ -275,10 +288,23 @@ fn main() {
     }
 
     // 3. Fase E: Hybrid(H128/T128) @ B_host = 32 — 4-Phase Callback Breakdown (BURST vs SPREAD)
-    println!("--- 3. Fase E: Hybrid(H128/T128) @ Blk=32 (4-Callback Cycle: Med P0..P3 | p99 P0..P3 | Worst p99/666.67us) ---");
+    println!(
+        "--- 3. Fase E: Hybrid(H128/T128) @ Blk=32 (4-Callback Cycle: Med P0..P3 | p99 P0..P3 | Worst p99/666.67us) ---"
+    );
     println!(
         "{:<24} {:<6} {:<6} {:<7} {:<7} {:<7} {:<7} | {:<7} {:<7} {:<7} {:<7} | {:<7}",
-        "FFT Backend", "IR", "Mode", "MedP0", "MedP1", "MedP2", "MedP3", "p99P0", "p99P1", "p99P2", "p99P3", "Peak%"
+        "FFT Backend",
+        "IR",
+        "Mode",
+        "MedP0",
+        "MedP1",
+        "MedP2",
+        "MedP3",
+        "p99P0",
+        "p99P1",
+        "p99P2",
+        "p99P3",
+        "Peak%"
     );
     for &ir_len in &[2048usize, 16383] {
         bench_hybrid_4phases("MicroFftBackend", micro, best, ir_len, false);

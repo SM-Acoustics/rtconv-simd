@@ -318,6 +318,7 @@ pub fn cmac_simd(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 #[simd]
 fn cmac_fdl_impl<S: Simd>(
     simd: S,

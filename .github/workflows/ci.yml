@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "release/*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-and-docs:
+    name: Format, Clippy & Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  test-matrix:
+    name: Build & Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --lib --no-default-features
+      - run: cargo check --all-features
+      - run: cargo test --release --no-default-features
+      - run: cargo test --release --all-features
+      - name: Isolated Zero-Allocation RT Suite
+        run: cargo test --release --all-features --test no_alloc_rt -- --test-threads=1

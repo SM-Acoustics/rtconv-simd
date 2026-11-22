@@ -123,7 +123,12 @@ fn mixed_phase_ir(len: usize) -> Vec<f32> {
         .collect()
 }
 
-fn run_direct_block(ir: &[f32], input: &[f32], block_size: usize, backend: SimdBackend) -> Vec<f32> {
+fn run_direct_block(
+    ir: &[f32],
+    input: &[f32],
+    block_size: usize,
+    backend: SimdBackend,
+) -> Vec<f32> {
     let cfg = DirectConfig {
         max_ir_len: ir.len(),
     };
@@ -201,7 +206,7 @@ fn assert_all_engines_match(
     min_snr_db: f64,
 ) {
     let reference = reference_convolve_f64(ir, input);
-    let backend = SimdBackend::detect();
+    let backend = SimdBackend::detect_or_baseline();
 
     // Direct (sample-by-sample and block-by-block)
     let y_dir_s = run_direct_sample(ir, input, backend);
@@ -222,7 +227,7 @@ fn assert_all_engines_match(
 
     // Partitioned (block 32/FFT 64, block 64/FFT 128, block 128/FFT 256)
     for &b in &[32usize, 64, 128] {
-        if input.len() % b == 0 {
+        if input.len().is_multiple_of(b) {
             let y_part = run_partitioned(ir, input, b, backend);
             let m = compute_metrics(&reference, &y_part);
             assert!(
@@ -266,7 +271,7 @@ fn assert_all_engines_match(
 #[test]
 fn test_fft_roundtrip_and_spectral_multiply_64_128_256() {
     let fft = MicroFftBackend::new();
-    let backend = SimdBackend::detect();
+    let backend = SimdBackend::detect_or_baseline();
     let mut rng = Rng::new(0x1234_5678_9ABC_DEF0);
 
     for &size in &[FftSize::N64, FftSize::N128, FftSize::N256] {
@@ -380,9 +385,9 @@ fn test_case_08_09_multitone_and_silence_transitions() {
     let ir = mixed_phase_ir(173);
     let n = 1024;
     let mut multitone = vec![0.0f32; n];
-    for i in 0..n {
+    for (i, sample) in multitone.iter_mut().enumerate() {
         let t = i as f32 / 48_000.0;
-        multitone[i] = 0.4 * (2.0 * PI * 440.0 * t).sin()
+        *sample = 0.4 * (2.0 * PI * 440.0 * t).sin()
             + 0.3 * (2.0 * PI * 1760.0 * t).cos()
             + 0.2 * (2.0 * PI * 6311.0 * t).sin();
     }
@@ -390,9 +395,7 @@ fn test_case_08_09_multitone_and_silence_transitions() {
 
     // Silence -> signal -> silence (including tail drain)
     let mut gated = vec![0.0f32; 1024];
-    for i in 128..512 {
-        gated[i] = multitone[i];
-    }
+    gated[128..512].copy_from_slice(&multitone[128..512]);
     assert_all_engines_match("silence_signal_silence", &ir, &gated, 5e-5, 100.0);
 }
 
@@ -401,14 +404,19 @@ fn test_case_10_reset_and_stream_reproducibility() {
     let mut rng = Rng::new(2026);
     let ir = rng.vec_f32(290, 0.3);
     let input = rng.vec_f32(512, 0.9);
-    let backend = SimdBackend::detect();
+    let backend = SimdBackend::detect_or_baseline();
     let fft = MicroFftBackend::new();
 
     // Direct reset
     let dcfg = DirectConfig {
         max_ir_len: ir.len(),
     };
-    let mut dws = vec![0.0f32; DirectConvolver::memory_requirements(dcfg).unwrap().total_f32];
+    let mut dws = vec![
+        0.0f32;
+        DirectConvolver::memory_requirements(dcfg)
+            .unwrap()
+            .total_f32
+    ];
     let mut dconv = DirectConvolver::prepare(&ir, dcfg, &mut dws, backend).unwrap();
     let mut out1 = vec![0.0f32; 512];
     let mut out2 = vec![0.0f32; 512];
@@ -429,11 +437,21 @@ fn test_case_10_reset_and_stream_reproducibility() {
             .total_f32
     ];
     let mut pconv = PartitionedConvolver::prepare(&ir, pcfg, &mut pws, backend, fft).unwrap();
-    for (i, o) in input.chunks_exact(64).zip(out1.chunks_exact_mut(64)) {
+    for (i, o) in input
+        .as_chunks::<64>()
+        .0
+        .iter()
+        .zip(out1.as_chunks_mut::<64>().0.iter_mut())
+    {
         pconv.process_block(i, o).unwrap();
     }
     pconv.reset();
-    for (i, o) in input.chunks_exact(64).zip(out2.chunks_exact_mut(64)) {
+    for (i, o) in input
+        .as_chunks::<64>()
+        .0
+        .iter()
+        .zip(out2.as_chunks_mut::<64>().0.iter_mut())
+    {
         pconv.process_block(i, o).unwrap();
     }
     assert_eq!(out1, out2);
@@ -451,11 +469,21 @@ fn test_case_10_reset_and_stream_reproducibility() {
             .total_f32
     ];
     let mut hconv = HybridConvolver::prepare(&ir, hcfg, &mut hws, backend, fft).unwrap();
-    for (i, o) in input.chunks_exact(32).zip(out1.chunks_exact_mut(32)) {
+    for (i, o) in input
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(out1.as_chunks_mut::<32>().0.iter_mut())
+    {
         hconv.process_block(i, o).unwrap();
     }
     hconv.reset();
-    for (i, o) in input.chunks_exact(32).zip(out2.chunks_exact_mut(32)) {
+    for (i, o) in input
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(out2.as_chunks_mut::<32>().0.iter_mut())
+    {
         hconv.process_block(i, o).unwrap();
     }
     assert_eq!(out1, out2);
@@ -468,8 +496,8 @@ fn test_case_11_12_13_non_multiple_ir_boundaries_and_tail_drain() {
         let ir = rng.vec_f32(ir_len, 0.25);
         // Active burst followed by full tail drain of zeros
         let mut input = vec![0.0f32; 1024];
-        for i in 0..256 {
-            input[i] = rng.next_f32();
+        for sample in input.iter_mut().take(256) {
+            *sample = rng.next_f32();
         }
         assert_all_engines_match(&format!("ir_len_{ir_len}"), &ir, &input, 5e-5, 95.0);
     }
@@ -518,7 +546,15 @@ fn test_case_14_cross_backend_agreement() {
         let hr = rng.vec_f32(65, 1.0);
         let hi = rng.vec_f32(65, 1.0);
         cmac_scalar(&mut acc_re_s, &mut acc_im_s, &xr, &xi, &hr, &hi);
-        cmac_simd(backend.level(), &mut acc_re_v, &mut acc_im_v, &xr, &xi, &hr, &hi);
+        cmac_simd(
+            backend.level(),
+            &mut acc_re_v,
+            &mut acc_im_v,
+            &xr,
+            &xi,
+            &hr,
+            &hi,
+        );
         assert!(compute_metrics(&acc_re_s, &acc_re_v).max_abs < 1e-5);
         assert!(compute_metrics(&acc_im_s, &acc_im_v).max_abs < 1e-5);
 
@@ -540,14 +576,20 @@ fn test_randomized_property_sweep() {
         let ir_len = 1 + (rng.next_u64() as usize % 400);
         let ir = rng.vec_f32(ir_len, 0.2);
         let input = rng.vec_f32(512, 0.8);
-        assert_all_engines_match(&format!("prop_trial_{trial}_len_{ir_len}"), &ir, &input, 8e-5, 95.0);
+        assert_all_engines_match(
+            &format!("prop_trial_{trial}_len_{ir_len}"),
+            &ir,
+            &input,
+            8e-5,
+            95.0,
+        );
     }
 }
 
 #[test]
 fn test_validation_errors() {
     let mut ws = vec![0.0f32; 4096];
-    let backend = SimdBackend::detect();
+    let backend = SimdBackend::detect_or_baseline();
     let fft = MicroFftBackend::new();
 
     assert_eq!(
@@ -555,20 +597,44 @@ fn test_validation_errors() {
         Some(ConvError::EmptyIr)
     );
     assert_eq!(
-        DirectConvolver::prepare(&[1.0, f32::NAN], DirectConfig { max_ir_len: 16 }, &mut ws, backend).err(),
+        DirectConvolver::prepare(
+            &[1.0, f32::NAN],
+            DirectConfig { max_ir_len: 16 },
+            &mut ws,
+            backend
+        )
+        .err(),
         Some(ConvError::NonFiniteCoefficient { index: 1 })
     );
     assert_eq!(
-        DirectConvolver::prepare(&[1.0; 20], DirectConfig { max_ir_len: 16 }, &mut ws, backend).err(),
-        Some(ConvError::IrTooLong { ir_len: 20, max_ir_len: 16 })
+        DirectConvolver::prepare(
+            &[1.0; 20],
+            DirectConfig { max_ir_len: 16 },
+            &mut ws,
+            backend
+        )
+        .err(),
+        Some(ConvError::IrTooLong {
+            ir_len: 20,
+            max_ir_len: 16
+        })
     );
     assert!(matches!(
-        DirectConvolver::prepare(&[1.0; 16], DirectConfig { max_ir_len: 16 }, &mut ws[..10], backend).err(),
+        DirectConvolver::prepare(
+            &[1.0; 16],
+            DirectConfig { max_ir_len: 16 },
+            &mut ws[..10],
+            backend
+        )
+        .err(),
         Some(ConvError::WorkspaceTooSmall { .. })
     ));
     assert_eq!(
         PartitionedConvolver::memory_requirements(
-            PartitionedConfig { block_size: 48, max_ir_len: 128 },
+            PartitionedConfig {
+                block_size: 48,
+                max_ir_len: 128
+            },
             &fft
         )
         .err(),
@@ -576,10 +642,17 @@ fn test_validation_errors() {
     );
     assert_eq!(
         HybridConvolver::memory_requirements(
-            HybridConfig { head_len: 32, tail_block_size: 64, max_ir_len: 256 },
+            HybridConfig {
+                head_len: 32,
+                tail_block_size: 64,
+                max_ir_len: 256
+            },
             &fft
         )
         .err(),
-        Some(ConvError::InvalidHybridConfig { head_len: 32, tail_block_size: 64 })
+        Some(ConvError::InvalidHybridConfig {
+            head_len: 32,
+            tail_block_size: 64
+        })
     );
 }

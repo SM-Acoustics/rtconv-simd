@@ -41,7 +41,9 @@ pub struct DirectConvolver<'a> {
 
 impl<'a> DirectConvolver<'a> {
     /// Computes workspace requirements using checked arithmetic.
-    pub fn memory_requirements(config: DirectConfig) -> Result<DirectMemoryRequirements, ConvError> {
+    pub fn memory_requirements(
+        config: DirectConfig,
+    ) -> Result<DirectMemoryRequirements, ConvError> {
         if config.max_ir_len == 0 {
             return Err(ConvError::EmptyIr);
         }
@@ -192,6 +194,7 @@ impl<'a> DirectConvolver<'a> {
         Capabilities {
             engine: EngineKind::Direct,
             simd_backend: self.backend.name(),
+            simd_active: self.backend.is_simd_active(),
             fft_backend: "none",
             fft_is_simd: false,
             block_size: None,

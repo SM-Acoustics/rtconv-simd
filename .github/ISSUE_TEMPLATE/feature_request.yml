@@ -1,0 +1,19 @@
+name: Feature Request
+description: Propose a new FFT backend, architecture optimization, or API enhancement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: What real-time DSP or embedded use case is not currently covered?
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: no_std & Real-Time Impact
+      description: Does this preserve no_std, zero-alloc, and bounded callback execution?
+    validations:
+      required: true

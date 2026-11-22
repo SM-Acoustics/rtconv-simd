@@ -54,6 +54,9 @@ pub enum ConvError {
     },
     /// Requested SIMD backend is not available on this target or feature set.
     BackendUnavailable,
+    /// Attempted to change runtime processing mode (e.g. hybrid tail spreading)
+    /// while a partial cycle is in progress; call before streaming or after `reset()`.
+    InvalidStateTransition,
 }
 
 impl fmt::Display for ConvError {
@@ -67,7 +70,10 @@ impl fmt::Display for ConvError {
                 )
             }
             Self::NonFiniteCoefficient { index } => {
-                write!(f, "non-finite impulse response coefficient at index {index}")
+                write!(
+                    f,
+                    "non-finite impulse response coefficient at index {index}"
+                )
             }
             Self::InvalidBlockSize { block_size } => {
                 write!(f, "invalid or unsupported block size: {block_size}")
@@ -99,6 +105,12 @@ impl fmt::Display for ConvError {
             }
             Self::BackendUnavailable => {
                 write!(f, "requested SIMD backend is unavailable on this target")
+            }
+            Self::InvalidStateTransition => {
+                write!(
+                    f,
+                    "cannot change hybrid tail-spreading mode mid-cycle; call before streaming or after reset()"
+                )
             }
         }
     }

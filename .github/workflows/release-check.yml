@@ -1,0 +1,33 @@
+name: Release Candidate Verification (Dry-Run Only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-check:
+    name: Package & Dry-Run Publish Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Dependency & license tree (no_std core)
+        run: cargo tree --no-default-features -e normal -f "{p} ({l})"
+      - name: Format & Clippy
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features -- -D warnings
+      - name: Full Test Suite
+        run: |
+          cargo test --release --no-default-features
+          cargo test --release --all-features
+          cargo test --release --all-features --test no_alloc_rt -- --test-threads=1
+      - name: Package Verification (no actual publish)
+        run: |
+          cargo package --list
+          cargo package
+          cargo publish --dry-run
