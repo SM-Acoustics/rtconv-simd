@@ -64,3 +64,15 @@
 
 - `dot_product`: AVX2+FMA reaches **8.83x** over scalar at 1,024 taps (`882.8 ns -> 100.0 ns`); at 32–64 taps on Zen 1, SSE2 (`7.8–10.9 ns`) outperforms AVX2 (`10.9–14.1 ns`).
 - `cmac_fdl`: Because LLVM auto-vectorizes `cmac_scalar` into SSE2 at `opt-level = 3`, explicit AVX2 beats scalar at `N=128` (`1.53x`) but shows slight overhead at `N=64` (`0.73x`) and `N=256` (`0.81x`) on Zen 1.
+
+## 6. IEEE 754 Subnormal Robustness (`cargo bench --bench denormal_bench`)
+
+Linux x86-64 container (`fearless_simd::Sse2`), 1024 taps, 32-sample blocks, µs per block, `HOST_ONLY`. "Before" is `main` at `bdb3589`; "after" adds `DENORMAL_GUARD`.
+
+| Case | Direct before | Direct after | Hybrid before | Hybrid after |
+| :--- | ---: | ---: | ---: | ---: |
+| Normal IR, input 0.1 | 4.57 | 4.29 | 0.93 | 1.01 |
+| Normal IR, input 1e-35 (subnormal products) | 142.75 | 4.11 | 1.57 | 1.02 |
+| Normal IR, input 1e-37 (subnormal products) | 346.30 | 4.33 | 48.08 | 0.92 |
+| Normal IR, input 1e-39 (subnormal input) | 342.04 | 4.15 | 47.66 | 0.96 |
+| Deep-tail IR (subnormal `f32` taps), input 0.1 | 67.37 | 4.15 | 1.07 | 0.92 |

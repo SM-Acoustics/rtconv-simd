@@ -15,6 +15,20 @@ Aligned with `SM-ENG-002` (*Proposed v1*): `prepare()` belongs to **Class B** (o
 5. **State transition safety**: `HybridConvolver::set_tail_spreading()` returns `Err(ConvError::InvalidStateTransition)` if called mid-cycle (`tail_pos != 0 || acc_primed`).
 6. **Panic freedom**: All buffer lengths, indices, and workspace sizes are validated via typed `ConvError` returns; `#![forbid(unsafe_code)]` is enforced at crate root.
 
+## IEEE 754 Subnormal Guard
+
+`f32` engines flush every magnitude below `simd_kernels::DENORMAL_GUARD = 2^-63` (≈ `1.08e-19`, ≈ −379 dBFS) to zero, at these points:
+
+- input samples;
+- IR coefficients and their partition spectra (at `prepare`);
+- each FDL input slot after its forward FFT;
+- the spectral accumulators before the inverse FFT;
+- the output samples.
+
+Guarding both inputs and coefficients at `2^-63` means every non-zero product is `≥ 2^-126`, a normal number. The slot, accumulator and output flushes remove subnormal residues left by cancellation. A decaying input therefore drains to exact zeros (`tests/denormal_guard.rs`).
+
+Without the guard, on x86-64 without FTZ/DAZ, a 1024-tap `DirectConvolver` took 346 µs per 32-sample block for 1e-37 inputs instead of 4.3 µs, which is 52 % of a 666 µs budget. Hosts may still enable FTZ/DAZ in their audio thread for complete coverage. The crate cannot do it itself under `#![forbid(unsafe_code)]`. Q1.15 engines are integer-only and unaffected.
+
 ## Admission-Control Model (`NonUniformBudget`)
 
 `NonUniformPlan::estimated_worst_ops_per_callback` is a conservative **operation count**, not a cycle count. For a host callback of `H` samples it includes:

@@ -33,6 +33,12 @@ contract that does not hold; **Medium** = misleading documentation or missing ve
 | F11 | **Gap** | Product goal | No way to load the FIR artifacts that design tools export (WAV PCM 16/24/32, IEEE 32/64, mono/stereo, raw `.bin`, text), and no automatic engine or numeric-domain selection. Users had to choose engines, block sizes, workspace layouts and Q15 scaling by hand. | Requirements | New `artifact` module (zero-copy, `no_std`, allocation-free decoder) and `auto` module (`AutoConvolver` / `AutoStereoConvolver` with a cost-model engine choice, compile-time FPU domain, gain headroom, and `const fn` workspace sizing). |
 | F12 | **Low** | Tests | Zero unit tests, zero doctests, and no sweep over IR lengths that straddle partition boundaries with fragmented host blocks for every backend. | `cargo test` output | `tests/adversarial_reference.rs` sweeps 17 IR lengths × scalar/SIMD × MicroFFT/SimdFixedFFT × B = 32/64/128 × BURST/SPREAD × random host blocks of 1–3B against an `f64` oracle (SNR > 100 dB required), plus NUPC custom plans with slack. A doctest was added in `auto`. |
 
+### Follow-up finding (same day, after merge of the review)
+
+| # | Severity | Area | Finding | Evidence | Resolution |
+| :-: | :--- | :--- | :--- | :--- | :--- |
+| F13 | **High** | IEEE 754 subnormals, all `f32` engines | On x86-64 without FTZ/DAZ (Rust's default), subnormal arithmetic is microcoded, so the cost depended on the signal: (a) decaying or near-silent inputs, (b) tiny normal inputs whose products with the taps are subnormal, (c) an f64 FIR design with a deep tail, which decodes to subnormal `f32` taps. Case (c) is a permanent slowdown. | `benches/denormal_bench.rs` (1024 taps, 32-sample blocks): Direct 4.57 µs normal vs 142.8 / 346.3 / 342.0 µs for 1e-35 / 1e-37 / 1e-39 inputs, and 67.4 µs for the deep-tail IR; Hybrid 0.93 vs 48.1 µs. | `simd_kernels::DENORMAL_GUARD = 2^-63` applied to inputs, coefficients, IR spectra, FDL slots, accumulators and outputs. Guarded × guarded products are `≥ 2^-126`, which is normal. **All cases now run at 4.1–4.3 µs (Direct) and 0.9–1.0 µs (Hybrid).** `tests/denormal_guard.rs`. |
+
 ### Verified correct (no change needed)
 
 - `f32` engines: `DirectConvolver`, `PartitionedConvolver` (50 % overlap-save FDL, Soo & Pang 1990 / Kulp 1988),
