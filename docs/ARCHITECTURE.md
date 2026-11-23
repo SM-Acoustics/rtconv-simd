@@ -4,9 +4,19 @@
 
 In the SM-Acoustics layered model (`SM-ENG-001`, *Proposed v1*), `rtconv-simd` sits at **L1 (Portable DSP Algorithms)**:
 
-- **Zero platform coupling**: No dependency on ESP-IDF, FreeRTOS, RTOS, HAL, OS audio drivers, MIDI, USB, networking, file I/O, or GUI frameworks.
-- **Core invariant**: `#![no_std]` and `#![forbid(unsafe_code)]`, with `default = []` (no `std` or `alloc`).
-- **Phase-agnostic semantics**: Any finite real causal FIR impulse response `&[f32]` is processed verbatim without phase classification, conversion, or normalization.
+- **Zero platform coupling**: No dependency on ESP-IDF, FreeRTOS, RTOS, HAL, OS audio drivers, MIDI, USB, networking, file I/O, or GUI frameworks. (The optional bare-metal ESP32-C6 validation harness lives in an independent excluded package under `hardware/esp32c6/`.)
+- **Core invariant**: `#![no_std]` and `#![forbid(unsafe_code)]`, with `default = []` (zero `std`, zero `alloc`).
+- **Phase-agnostic semantics**: Any finite real causal FIR impulse response (`&[f32]` or `&[i16]` Q1.15) is processed verbatim without phase classification, conversion, or normalization.
+
+## Three-Plane NUPC Architecture
+
+Both `NonUniformConvolver` (`f32`) and `FixedQ15NonUniformConvolver` (`Q1.15/BFP`) share the exact same planning and streaming contracts with zero logic duplication:
+
+1. **Planning Plane (`src/nonuniform/plan.rs`)**: Representation-independent stage validation (`1..=8` contiguous stages), strict zero-latency causality (`D_s >= B_s` for every FDL stage), `NonUniformBudget` admission control (`WithinKnownBounds` / `Exceeded` / `Unverified`), and default multi-stage profile (`Direct 0..32`, `FDL B=32 32..256`, `FDL B=64 256..1024`, `FDL B=128 1024..`).
+2. **Streaming Plane (`src/nonuniform/scheduler.rs`)**: Sample-time `NonUniformScheduler` with causal delay rings (`ir_offset + block_size`), `SPREAD` sub-stepping bounded by `min(slack_samples, B_s - 1)`, and `deadline_misses()` telemetry.
+3. **Numeric Plane**:
+   - `f32` (`src/nonuniform/stages.rs`, `src/nonuniform/mod.rs`): `Direct` SIMD FIR head + `FftBackend` 50% overlap-save FDL stages.
+   - `Q1.15/BFP` (`src/fixed/nonuniform.rs`): `i64`-accumulated Q1.15 direct head + conditional-scaling BFP `rfft_q15_bfp`/`irfft_q15_bfp` + exponent-aligned `i64` CMAC.
 
 ## Module Structure
 
@@ -19,3 +29,13 @@ In the SM-Acoustics layered model (`SM-ENG-001`, *Proposed v1*), `rtconv-simd` s
 - `src/direct.rs`: `DirectConvolver` (reverse-indexed circular buffer, unit-stride forward SIMD dot product).
 - `src/partitioned.rs`: `PartitionedConvolver` (50% overlap-save uniform FDL, single-shot and time-distributed helpers).
 - `src/hybrid.rs`: `HybridConvolver` (direct FIR head + partitioned FFT tail with `head_len == tail_block_size`, 0-sample latency, optional `set_tail_spreading(true)`).
+- `src/nonuniform/` (`#[cfg(feature = "nonuniform")]`):
+  - `plan.rs`: `NonUniformPlan`, `NonUniformConfig`, `NonUniformStageConfig`, `NonUniformBudget`, `BudgetVerdict`.
+  - `scheduler.rs`: Sample-time `NonUniformScheduler` and `SPREAD` work distribution.
+  - `memory.rs`: Checked workspace sizing (`NonUniformMemoryRequirements`).
+  - `stages.rs` + `mod.rs`: `NonUniformConvolver` (`f32`).
+- `src/fixed/` (`#[cfg(feature = "fixed-q15")]`):
+  - `q15.rs`: Q1.15 conversion, rounding `(acc + 16384) >> 15`, and symmetric saturation primitives.
+  - `direct.rs`: `FixedQ15DirectConvolver` (`i16` workspace, `i64` accumulator, `saturation_count()`).
+  - `block_float.rs`, `fft_q15.rs`, `fft_q15_tables.rs`, `partitioned.rs` (`#[cfg(feature = "fixed-fft")]`): Conditional per-stage BFP radix-2 FFT (`N64/N128/N256`, `512 B` ROM) and two-pass exponent-aligned `FixedQ15PartitionedConvolver`.
+  - `nonuniform.rs` (`#[cfg(feature = "fixed-nonuniform")]`): `FixedQ15NonUniformConvolver` integrating the shared NUPC Planning/Streaming planes with Q1.15/BFP stages.
