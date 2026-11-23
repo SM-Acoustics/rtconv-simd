@@ -16,8 +16,11 @@ Objective architectural comparison of pure-Rust real-time audio convolution crat
 | **Allocation-free `process()`** | **Yes** (`GlobalAlloc` verified across all 3 FFT backends) | Yes (`process()`, `set_response()`, `reset()`) | Yes (zero heap in processing loop) |
 | **FFT SIMD** | **Yes** (`SimdFixedFftBackend` `no_std` via `fearless_simd 1.2.0`; optional `PhastFftBackend`) | Via FFT dependency | Via `rustfft` SIMD |
 | **Arbitrary block sizes** | `DirectConvolver` & `HybridConvolver`: arbitrary; `PartitionedConvolver`: `32/64/128` | Arbitrary via internal buffering | Partitioned / direct primitives |
-| **Non-uniform partitioning** | Roadmap (uniform FDL + hybrid in `0.1.0`) | Yes (`TwoStageFFTConvolver`) | Roadmap / uniform engine |
+| **Non-uniform partitioning** | **Yes** (`NonUniformConvolver`, up to 8 zero-latency stages; `f32` and Q1.15/BFP) | Yes (`TwoStageFFTConvolver`) | Roadmap / uniform engine |
+| **FPU-less fixed-point engines** | **Yes** (Q1.15 direct, BFP FDL, BFP NUPC) | No | No |
+| **FIR file loading** | **Yes** (`no_std` WAV / raw / text, zero-copy) | No (caller supplies `&[f32]`) | No |
+| **Automatic engine selection** | **Yes** (`AutoConvolver`: FPU domain + cost model) | No | No |
 | **Time-distributed tail spreading** | **Yes** (`HybridConvolver::set_tail_spreading(true)`, 0 added latency) | No | No |
-| **Stereo / True Stereo** | Multi-channel via independent mono instances | Mono per instance | Built-in Mono, Stereo, True Stereo |
+| **Stereo / True Stereo** | `AutoStereoConvolver` (planar + interleaved); true stereo via 4 instances | Mono per instance | Built-in Mono, Stereo, True Stereo |
 | **IR crossfade** | Roadmap | `set_response()` | Not primary focus |
 | **Primary niche** | Embedded/MCU & deterministic RT DSP with explicit static RAM & `#![forbid(unsafe_code)]` | Desktop/plugin real-time convolution (including very long 65k+ IRs via two-stage) | Desktop guitar cab/reverb with built-in stereo routing |

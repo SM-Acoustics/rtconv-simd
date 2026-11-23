@@ -10,21 +10,44 @@ permissions:
 
 jobs:
   no-std-targets:
-    name: no_std Check (${{ matrix.target }})
+    name: no_std Build (${{ matrix.target }})
     strategy:
       fail-fast: false
       matrix:
         target:
-          - thumbv7em-none-eabihf
-          - riscv32imac-unknown-none-elf
+          - thumbv7em-none-eabihf # Cortex-M4F/M7 (hardware FPU -> f32 auto domain)
+          - thumbv6m-none-eabi # Cortex-M0/M0+ (no FPU -> Q1.15 auto domain)
+          - riscv32imac-unknown-none-elf # ESP32-C6 (no FPU -> Q1.15 auto domain)
+          - riscv32imafc-unknown-none-elf # ESP32-P4 (hardware FPU -> f32 auto domain)
           - aarch64-unknown-none
           - wasm32-unknown-unknown
     runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
-      - name: Compile-only no_std check (no flashing)
-        run: cargo check --lib --no-default-features --target ${{ matrix.target }}
+      - name: Core only (no features, no flashing)
+        run: cargo build --release --lib --no-default-features --target ${{ matrix.target }}
+      - name: Default features (auto + fixed-point + NUPC)
+        run: cargo build --release --lib --target ${{ matrix.target }}
+      - name: Fixed-point stack without auto
+        run: cargo build --release --lib --no-default-features --features fixed-nonuniform --target ${{ matrix.target }}
+
+  esp32c6-harness:
+    name: ESP32-C6 bare-metal harness (compile-only)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
+        with:
+          toolchain: stable
+          targets: riscv32imac-unknown-none-elf
+      - name: Build harness (no flashing, no hardware access)
+        working-directory: hardware/esp32c6
+        run: cargo build --release

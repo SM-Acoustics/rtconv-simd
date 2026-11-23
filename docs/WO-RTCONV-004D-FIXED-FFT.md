@@ -1,5 +1,7 @@
 # WO-RTCONV-004D — Fixed-Point Q1.15 / Block Floating Point FFT & FDL Convolver
 
+> **Superseded numbers (2026-11-23)**: the adversarial review ([`REVIEW-2026-11-ADVERSARIAL.md`](./REVIEW-2026-11-ADVERSARIAL.md)) found that this BFP implementation did not normalize quiet blocks (SNR fell with signal level) and that the fixed NUPC rounded each stage separately. Both were fixed. The SNR figures below are historical records of the work order, not current behaviour.
+
 **Work Order**: `RTCONV-004D`  
 **Branch**: `feat/rtconv-004d-fixed-fft`  
 **Feature Gate**: `fixed-fft = ["fixed-q15"]` (`default = []` preserved; `#![no_std]`, `#![forbid(unsafe_code)]`, zero heap, zero C/FFI)  

@@ -7,7 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — Target `0.2.0`
 
-### Added
+### Adversarial DSP review (2026-11-23) — see `docs/REVIEW-2026-11-ADVERSARIAL.md`
+
+#### Fixed
+- **Q1.15 FFT is now true block floating point** (`rfft_q15_bfp` / `irfft_q15_bfp`): quiet blocks are
+  normalized to the full mantissa (negative block exponent) before the per-stage conditional
+  down-scaling. `FixedQ15PartitionedConvolver` SNR at 0 / −20 / −40 dBFS input: 47.8 / 46.0 / 30.5 dB →
+  **68.7 / 50.4 / 30.5 dB**, within 1.7 dB of the Q1.15 output-rounding ceiling.
+- **`FixedQ15NonUniformConvolver` single rounding**: FDL stage outputs are carried at Q1.23 in the delay rings
+  (the ring now uses 2 `i16` words per sample) and the direct head is summed at Q2.30, with one final rounding.
+  SNR 47.7 / 43.0 / 25.8 dB → **69.4 / 50.4 / 30.5 dB**. The direct head is no longer saturated on its own
+  before the sum.
+- **Exact unit twiddles** (`W^0`, `W^{N/4}`) in the Q1.15 butterflies (previously `32767/32768`).
+- **`NonUniformPlan::estimated_worst_ops_per_callback` is now an actual upper bound.** It counts `ceil(H/B)`
+  block triggers per callback, both FFT transforms, and spread completions; before, it counted one block
+  whatever the host block size.
+- **`FixedQ15NonUniformMemoryRequirements::instance_bytes`** discloses the ~16.5 KiB of `i64` accumulators held
+  inside the convolver value. It is included in `NonUniformBudget` memory admission.
+- **`NonUniformConvolver` (`f32`) direct head now uses the selected SIMD backend** (it was ignored before).
+- Documentation claims corrected: partitioned latency, `fft_q15` stack usage, the competitive matrix,
+  harness coverage, and CI scope.
+
+#### Added
+- **`artifact` module** (always available, `no_std`, zero-copy, no allocation): `FirArtifact` decodes RIFF/WAVE
+  (PCM `u8`/`i16`/`i24`/`i32`, IEEE `f32`/`f64`, `WAVE_FORMAT_EXTENSIBLE`, any channel count), raw `.bin`
+  (`f32`/`f64` auto-detected, explicit integer layouts), and numeric text (decimal point or comma, multi-column).
+  It decodes to `f32`, Q1.15, or Q1.31; integer→fixed conversion uses integer arithmetic only.
+  `ConvError::Artifact(ArtifactError)` added.
+- **`auto` module (default feature)**: `AutoConvolver` / `AutoStereoConvolver` / `AutoWorkspace`.
+  - The numeric domain is chosen at compile time by `build.rs` from the target ISA: ESP32-C6 `riscv32imac` → Q1.15;
+    ESP32-P4 `riscv32imafc` → `f32`. Stable Rust does not expose RISC-V `F` as a cfg.
+  - The engine and partition size come from a cost model; Q1.15 gain headroom is automatic.
+  - Workspace sizing is a `const fn`, and `f32` / `i16` I/O works in both domains.
+- **`native-q15` feature** forces the Q1.15 auto domain on FPU targets.
+- **Per-partition BFP coefficients**: `FixedQ15PartitionedConvolver::prepare_q31`, `FixedQ15NonUniformConvolver::prepare_q31`
+  / `prepare_q31_with`. A 4096-tap linear-phase FIR measured 62.6 dB before the review, and now 64.2 dB
+  (Q1.15 taps) or **70.4 dB** (Q1.31 taps).
+- Tests: `tests/adversarial_reference.rs` (cross-engine `f64` oracle sweep), `tests/artifact_formats.rs`,
+  `tests/auto_convolver.rs`, `auto` coverage in `tests/no_alloc_rt.rs`, and README code blocks run as doctests.
+- `examples/auto_from_artifact.rs`. The ESP32-C6 harness now exercises `AutoConvolver` on a raw `.bin` artifact.
+- CI: ESP32-P4 (`riscv32imafc`) and Cortex-M0 (`thumbv6m`) targets; feature builds with `-D warnings` on every
+  embedded target; ESP32-C6 harness build; default-feature and `native-q15` test runs.
+
+#### Changed
+- `default = ["auto"]` (was `[]`). Every default feature is still `no_std` with no `alloc`; `--no-default-features`
+  gives the previous minimal core.
+
+### Added (work orders `WO-RTCONV-004*`)
 - **Multi-Stage Non-Uniform Partitioned Convolution (`--features nonuniform`)**: `NonUniformConvolver`, `NonUniformPlan`, `NonUniformStageConfig`, `NonUniformBudget`, `BudgetVerdict`, and sample-time `NonUniformScheduler` supporting up to `MAX_NONUNIFORM_STAGES = 8` causal zero-latency stages (`D_s >= B_s`), `SPREAD` work distribution, and admission-control validation (`#6`).
 - **Fixed-Point Q1.15 Direct FIR (`--features fixed-q15`)**: `FixedQ15DirectConvolver` with `i16` caller-managed workspace (50% RAM vs `f32`), `i64` accumulation, round-half-up `(acc + 16384) >> 15`, symmetric saturation, and `saturation_count()` telemetry (`#7`).
 - **Fixed-Point Q1.15 / Block Floating Point FFT & FDL (`--features fixed-fft`)**: Conditional per-stage BFP radix-2 FFT (`rfft_q15_bfp` / `irfft_q15_bfp` for `N64/N128/N256`, `512 B` twiddle ROM) and two-pass exponent-aligned `FixedQ15PartitionedConvolver` (`#8`).

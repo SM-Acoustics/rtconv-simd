@@ -18,7 +18,7 @@ All core convolvers operate exclusively inside a single caller-owned workspace s
 
 - **`FixedQ15DirectConvolver`** (`feature = "fixed-q15"`): `2 * max_ir_len` `i16` elements (**50% RAM** vs `DirectConvolver` `f32` — `128 B` for 32 taps, `2,048 B` for 512 taps).
 - **`FixedQ15PartitionedConvolver`** (`feature = "fixed-fft"`): Split `ir_re`/`ir_im`/`ir_exp`, FDL ring + per-slot BFP exponents, and caller `&mut [i16]` scratch; shares a **`512 B`** `const` twiddle ROM (`TWIDDLE_COS_256` + `TWIDDLE_SIN_256`) across `N64`/`N128`/`N256`.
-- **`FixedQ15NonUniformConvolver`** (`feature = "fixed-nonuniform"`): `FixedQ15NonUniformMemoryRequirements` breaks down `state_i16`, `spectral_i16`, `delay_i16`, `scratch_i16`, `total_i16`, and `total_bytes` (~50% of equivalent `f32` NUPC workspace RAM).
+- **`FixedQ15NonUniformConvolver`** (`feature = "fixed-nonuniform"`): `FixedQ15NonUniformMemoryRequirements` breaks down `state_i16`, `spectral_i16`, `delay_i16` (each causal-ring sample is a Q1.23 `i32` stored as **2** `i16` words, so stages are summed before a single rounding), `scratch_i16`, `total_i16`, `total_bytes`, and **`instance_bytes`**. The convolver value itself embeds `2 × 8 × 129` `i64` spectral accumulators (about **16.5 KiB**); this memory is not part of the workspace, is counted by `NonUniformBudget` memory admission, and should live in a `static` on MCUs.
 
 ## Concrete Footprint Table (`SimdFixedFftBackend`, 48 kHz)
 
@@ -34,4 +34,17 @@ All core convolvers operate exclusively inside a single caller-owned workspace s
 
 - **Read-only (`const`) tables (`SimdFixedFftBackend`)**: `~3.2 KiB` total (`BITREV_32/64/128`, `TW_COS/SIN_4/8/16/32/64`, `R2C_COS/SIN_256`), residing in `.rodata` / Flash.
 - **Read-only (`const`) tables (`fft_q15`)**: `512 B` total (`TWIDDLE_COS_256`, `TWIDDLE_SIN_256`).
+- **Stack note (`fft_q15`)**: `rfft_q15_bfp` / `irfft_q15_bfp` use two `[i32; 256]` work arrays (**2 KiB**) per call. `FixedQ15PartitionedConvolver::process_block` adds a 2 KiB `[i64; 129] × 2` accumulator, and `FixedQ15NonUniformConvolver` adds a 1 KiB `[i32; 256]` wide IFFT output, for a peak of about **4–5 KiB** of stack in the fixed-point engines.
 - **Stack note (`MicroFftBackend`)**: `MicroFftBackend` uses `0 B` external scratch but allocates `[Complex32; N]` on the stack inside `rfft_inverse` (`512 B` / `1,024 B` / `2,048 B` for `N = 64 / 128 / 256`). Embedded ISRs with tight stacks should prefer `SimdFixedFftBackend` or `fft_q15`.
+
+## Automatic Layer (`auto`, default feature)
+
+- `auto::workspace_len(max_taps)` (`const fn`) returns the elements of `auto::NativeElem` (`f32` with an FPU,
+  `i16` without) needed for any IR of up to `max_taps` taps. It is the worst case over the engines the cost
+  model can select for shorter IRs, plus the IR decode scratch (`max_taps` `f32`, or `2 × max_taps` `i16` for
+  Q1.31 taps).
+- `auto::engine_len_f32` / `engine_len_q15` mirror the engines' `memory_requirements` exactly. This is
+  asserted for every length 1–4500 plus 8191, 8192, 16383 and 65536 in `tests/auto_convolver.rs`.
+- `AutoWorkspace<{ workspace_len(N) }>` is a `const`-constructible array for `static` placement.
+  `stereo_workspace_len` doubles it.
+- The IR scratch tail of the workspace is used only during preparation.
