@@ -25,6 +25,8 @@ pub mod direct;
 pub mod error;
 pub mod fft;
 pub mod hybrid;
+#[cfg(feature = "nonuniform")]
+pub mod nonuniform;
 pub mod partitioned;
 #[cfg(feature = "phastft")]
 pub mod phastft_backend;
@@ -37,6 +39,12 @@ pub use error::ConvError;
 pub use fearless_simd::Level;
 pub use fft::{FftBackend, FftSize, MicroFftBackend};
 pub use hybrid::{HybridConfig, HybridConvolver, HybridMemoryRequirements};
+#[cfg(feature = "nonuniform")]
+pub use nonuniform::{
+    BudgetVerdict, MAX_NONUNIFORM_STAGES, NonUniformBudget, NonUniformCapabilities,
+    NonUniformConfig, NonUniformConvolver, NonUniformMemoryRequirements, NonUniformPlan,
+    NonUniformStageConfig, NonUniformStageKind, NonUniformStagePlan,
+};
 pub use partitioned::{PartitionedConfig, PartitionedConvolver, PartitionedMemoryRequirements};
 #[cfg(feature = "phastft")]
 pub use phastft_backend::PhastFftBackend;
@@ -51,6 +59,9 @@ pub enum EngineKind {
     Partitioned,
     /// Zero-latency hybrid direct head + FFT tail convolver.
     Hybrid,
+    /// Zero-latency non-uniform partitioned convolver (NUPC).
+    #[cfg(feature = "nonuniform")]
+    NonUniform,
 }
 
 /// Runtime metadata describing the active engine configuration and backends.
