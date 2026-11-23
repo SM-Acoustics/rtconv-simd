@@ -4,7 +4,7 @@
 //! Zero heap allocation, `#![forbid(unsafe_code)]`, FPU-free integer arithmetic with exact
 //! per-partition BFP exponent alignment and saturation telemetry.
 
-use crate::fixed::block_float::bfp_normalize_acc_i64_to_q15;
+use crate::fixed::block_float::{Q31Taps, TapSource, bfp_normalize_acc_i64_to_q15};
 use crate::fixed::fft_q15::{irfft_q15_bfp, rfft_q15_bfp};
 use crate::{ConvError, FftSize};
 
@@ -118,7 +118,35 @@ impl<'a> FixedQ15PartitionedConvolver<'a> {
         config: FixedQ15PartitionedConfig,
         workspace: &'a mut [i16],
     ) -> Result<Self, ConvError> {
-        if ir.is_empty() {
+        Self::prepare_from(&ir, config, workspace)
+    }
+
+    /// Prepares from Q1.31 taps (`tap / 2^31`, e.g. 24/32-bit PCM or float FIR files).
+    ///
+    /// Each partition is normalized to the full Q1.15 mantissa before its FFT and keeps its own
+    /// block exponent, so low-level IR tails retain ~15 significant bits instead of being
+    /// rounded on the absolute Q1.15 grid.
+    pub fn prepare_q31(
+        ir: &[i32],
+        config: FixedQ15PartitionedConfig,
+        workspace: &'a mut [i16],
+    ) -> Result<Self, ConvError> {
+        Self::prepare_from(
+            &Q31Taps {
+                len: ir.len(),
+                tap: |i| ir[i],
+            },
+            config,
+            workspace,
+        )
+    }
+
+    fn prepare_from<S: TapSource>(
+        ir: &S,
+        config: FixedQ15PartitionedConfig,
+        workspace: &'a mut [i16],
+    ) -> Result<Self, ConvError> {
+        if ir.len() == 0 {
             return Err(ConvError::EmptyIr);
         }
         if ir.len() > config.max_ir_len {
@@ -160,16 +188,18 @@ impl<'a> FixedQ15PartitionedConvolver<'a> {
             let start = p * b;
             let end = (start + b).min(ir.len());
             let copy_len = end - start;
-            workspace[time_scratch_off..time_scratch_off + n].fill(0);
-            workspace[time_scratch_off..time_scratch_off + copy_len]
-                .copy_from_slice(&ir[start..end]);
+            let exp_offset = ir.fill_block(
+                start,
+                copy_len,
+                &mut workspace[time_scratch_off..time_scratch_off + n],
+            );
 
             let (before_im, from_im) = workspace.split_at_mut(ir_im_off);
             let (im_region, from_time) = from_im.split_at_mut(time_scratch_off - ir_im_off);
             let re_slot = &mut before_im[ir_re_off + p * bins..ir_re_off + (p + 1) * bins];
             let im_slot = &mut im_region[p * bins..(p + 1) * bins];
             let exp = rfft_q15_bfp(fft_size, &from_time[..n], re_slot, im_slot)?;
-            workspace[ir_exp_off + p] = exp as i16;
+            workspace[ir_exp_off + p] = (exp as i32 + exp_offset) as i16;
         }
 
         Ok(Self {

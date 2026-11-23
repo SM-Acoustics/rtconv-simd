@@ -183,6 +183,11 @@ impl WorkspaceLayout {
 }
 
 /// Processes one sample through a Direct FIR stage using the selected `SimdBackend`.
+///
+/// Uses the same reverse-indexed circular history as [`crate::DirectConvolver`]: the newest
+/// sample is written at a decrementing cursor so that both coefficient and history segments are
+/// traversed forward with unit stride, which lets the dot product use the `fearless_simd`
+/// kernels (`dot_two_segments_simd`) instead of a scalar reversed loop.
 #[inline]
 pub(crate) fn direct_stage_process_sample(
     ws: &mut [f32],
@@ -194,33 +199,29 @@ pub(crate) fn direct_stage_process_sample(
     if active == 0 {
         return 0.0;
     }
-    let len = st.direct_len;
-    let head = st.direct_head;
-    ws[st.direct_hist_off + head] = x;
+    let pos = if st.direct_head == 0 {
+        active - 1
+    } else {
+        st.direct_head - 1
+    };
+    st.direct_head = pos;
+    ws[st.direct_hist_off + pos] = x;
 
-    let (coeffs_and_before, hist_and_after) = ws.split_at_mut(st.direct_hist_off);
-    let coeffs = &coeffs_and_before[st.direct_coeffs_off..st.direct_coeffs_off + active];
-    let hist = &hist_and_after[..len];
-
-    // Circular dot product: history[head], history[head-1], ..., wrap around.
-    let first_seg = (head + 1).min(active);
-    let mut acc = 0.0f32;
-    // Reverse order of hist[head + 1 - first_seg ..= head] matches coeffs[0..first_seg].
-    for k in 0..first_seg {
-        acc += coeffs[k] * hist[head - k];
+    let coeffs = &ws[st.direct_coeffs_off..st.direct_coeffs_off + active];
+    let hist = &ws[st.direct_hist_off..st.direct_hist_off + active];
+    let first_len = active - pos;
+    if backend.is_scalar() {
+        simd_kernels::dot_product_scalar(&coeffs[..first_len], &hist[pos..])
+            + simd_kernels::dot_product_scalar(&coeffs[first_len..], &hist[..pos])
+    } else {
+        simd_kernels::dot_two_segments_simd(
+            backend.level(),
+            &coeffs[..first_len],
+            &hist[pos..],
+            &coeffs[first_len..],
+            &hist[..pos],
+        )
     }
-    let rem = active - first_seg;
-    if rem > 0 {
-        let mut h_idx = len - 1;
-        for c in &coeffs[first_seg..active] {
-            acc += *c * hist[h_idx];
-            h_idx = h_idx.saturating_sub(1);
-        }
-    }
-    let _ = backend;
-
-    st.direct_head = if head + 1 == len { 0 } else { head + 1 };
-    acc
 }
 
 /// Runs RFFT on the completed `block_size` input window, shifts overlap-save history,
