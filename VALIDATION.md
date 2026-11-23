@@ -13,7 +13,7 @@
 
 ## 2. Host & Build Environment
 
-- **Host**: `SalatielPC` — AMD Ryzen 3 PRO 2300U w/ Radeon Vega Mobile Gfx (4C/4T, x86-64 Zen 1; SSE2, SSE4.2, AVX2, FMA; no AVX-512)
+- **Host**: AMD Ryzen 3 PRO 2300U w/ Radeon Vega Mobile Gfx (4C/4T, x86-64 Zen 1; SSE2, SSE4.2, AVX2, FMA; no AVX-512)
 - **OS**: Microsoft Windows 11 Pro, Version `10.0.26300` (64-bit)
 - **Toolchain**: `rustc 1.100.0 (0ef1bc386 2026-11-09)`, `cargo 1.100.0 (3acc79c0c 2026-11-05)`
 - **Profile**: `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`
