@@ -367,7 +367,7 @@ fn raw_float_score(bytes: &[u8], enc: SampleEncoding) -> (usize, usize) {
 /// the signature of `f64` data whose low mantissa words are zero (e.g. a Dirac impulse).
 fn f64_low_words_zero(bytes: &[u8]) -> bool {
     let mut any_odd = false;
-    for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+    for (i, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
         let nz = chunk.iter().any(|&b| b != 0);
         if i % 2 == 0 && nz {
             return false;
