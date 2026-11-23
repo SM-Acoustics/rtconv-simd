@@ -384,6 +384,36 @@ fn verify_fixed_q15_partitioned() {
     });
 }
 
+#[cfg(feature = "fixed-nonuniform")]
+fn verify_fixed_q15_nonuniform() {
+    use rtconv_simd::{FixedQ15NonUniformConvolver, NonUniformPlan};
+
+    let ir = [512i16; 1024];
+    let input = [4096i16; 32];
+    let mut output = [0i16; 32];
+    let plan = NonUniformPlan::default_profile(1024, 32).unwrap();
+    let req = FixedQ15NonUniformConvolver::memory_requirements(&plan).unwrap();
+    let mut ws = vec![0i16; req.total_i16];
+
+    let mut conv = None;
+    assert_zero_alloc("fixed_q15_nonuniform::prepare", || {
+        conv = Some(FixedQ15NonUniformConvolver::prepare(&ir, plan, &mut ws).unwrap());
+    });
+    let conv = conv.as_mut().unwrap();
+    assert_zero_alloc("fixed_q15_nonuniform::process_block", || {
+        for _ in 0..32 {
+            conv.process_block(&input, &mut output).unwrap();
+        }
+    });
+    assert_zero_alloc("fixed_q15_nonuniform::reset", || conv.reset());
+    assert_zero_alloc("fixed_q15_nonuniform::metadata", || {
+        black_box(conv.latency_samples());
+        black_box(conv.capabilities());
+        black_box(conv.deadline_misses());
+        black_box(conv.saturation_count());
+    });
+}
+
 fn main() {
     // Warm up runtime environment and CPU feature detection before arming instrumentation.
     let backend = SimdBackend::detect_or_baseline();
@@ -403,6 +433,8 @@ fn main() {
     verify_fixed_q15_direct();
     #[cfg(feature = "fixed-fft")]
     verify_fixed_q15_partitioned();
+    #[cfg(feature = "fixed-nonuniform")]
+    verify_fixed_q15_nonuniform();
 
     println!("no_alloc_rt: ALL ZERO-ALLOCATION AND POSITIVE-CONTROL CHECKS PASSED");
 }
