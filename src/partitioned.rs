@@ -17,7 +17,8 @@
 use crate::error::ConvError;
 use crate::fft::{FftBackend, FftSize, MicroFftBackend};
 use crate::simd_kernels::{
-    cmac_fdl_range_scalar, cmac_fdl_range_simd, cmac_fdl_scalar, cmac_fdl_simd,
+    cmac_fdl_range_scalar, cmac_fdl_range_simd, cmac_fdl_scalar, cmac_fdl_simd, copy_flush_tiny,
+    flush_tiny_in_place,
 };
 use crate::{Capabilities, EngineKind, SimdBackend};
 
@@ -212,7 +213,7 @@ impl<'a, F: FftBackend> PartitionedConvolver<'a, F> {
             let chunk_len = end - start;
 
             time_buf.fill(0.0);
-            time_buf[..chunk_len].copy_from_slice(&ir[start..end]);
+            copy_flush_tiny(&mut time_buf[..chunk_len], &ir[start..end]);
 
             let off = p * bins;
             fft.rfft_forward(
@@ -222,6 +223,9 @@ impl<'a, F: FftBackend> PartitionedConvolver<'a, F> {
                 &mut ir_im[off..off + bins],
                 fft_scratch,
             )?;
+            // Keep partition spectra out of the subnormal range as well.
+            flush_tiny_in_place(&mut ir_re[off..off + bins]);
+            flush_tiny_in_place(&mut ir_im[off..off + bins]);
             p += 1;
         }
         time_buf.fill(0.0);
@@ -269,8 +273,8 @@ impl<'a, F: FftBackend> PartitionedConvolver<'a, F> {
 
         // 1. Build 2B overlap-save input frame: [prev_input, input].
         self.time_buf[..b].copy_from_slice(self.prev_input);
-        self.time_buf[b..2 * b].copy_from_slice(input);
-        self.prev_input.copy_from_slice(input);
+        copy_flush_tiny(&mut self.time_buf[b..2 * b], input);
+        self.prev_input.copy_from_slice(&self.time_buf[b..2 * b]);
 
         // 2. Advance FDL ring buffer head and compute forward RFFT into head slot.
         self.fdl_head = if self.fdl_head + 1 == self.num_partitions {
@@ -286,6 +290,9 @@ impl<'a, F: FftBackend> PartitionedConvolver<'a, F> {
             &mut self.fdl_im[head_off..head_off + self.bins],
             self.fft_scratch,
         )?;
+        // Cancellation can leave subnormal bins; they would be re-multiplied for P blocks.
+        flush_tiny_in_place(&mut self.fdl_re[head_off..head_off + self.bins]);
+        flush_tiny_in_place(&mut self.fdl_im[head_off..head_off + self.bins]);
 
         // 3. Zero spectral accumulator and accumulate all P partitions (1 dispatch!).
         self.acc_re.fill(0.0);
@@ -318,6 +325,8 @@ impl<'a, F: FftBackend> PartitionedConvolver<'a, F> {
         }
 
         // 4. Inverse FFT (normalized by 1/N) and extract valid second half [B..2B].
+        flush_tiny_in_place(self.acc_re);
+        flush_tiny_in_place(self.acc_im);
         self.fft.rfft_inverse(
             self.fft_size,
             self.acc_re,
@@ -325,7 +334,7 @@ impl<'a, F: FftBackend> PartitionedConvolver<'a, F> {
             self.time_buf,
             self.fft_scratch,
         )?;
-        output.copy_from_slice(&self.time_buf[b..2 * b]);
+        copy_flush_tiny(output, &self.time_buf[b..2 * b]);
 
         Ok(())
     }
@@ -406,8 +415,8 @@ impl<'a, F: FftBackend> PartitionedConvolver<'a, F> {
         }
 
         self.time_buf[..b].copy_from_slice(self.prev_input);
-        self.time_buf[b..2 * b].copy_from_slice(input);
-        self.prev_input.copy_from_slice(input);
+        copy_flush_tiny(&mut self.time_buf[b..2 * b], input);
+        self.prev_input.copy_from_slice(&self.time_buf[b..2 * b]);
 
         self.fdl_head = if self.fdl_head + 1 == self.num_partitions {
             0
@@ -422,6 +431,9 @@ impl<'a, F: FftBackend> PartitionedConvolver<'a, F> {
             &mut self.fdl_im[head_off..head_off + self.bins],
             self.fft_scratch,
         )?;
+        // Cancellation can leave subnormal bins; they would be re-multiplied for P blocks.
+        flush_tiny_in_place(&mut self.fdl_re[head_off..head_off + self.bins]);
+        flush_tiny_in_place(&mut self.fdl_im[head_off..head_off + self.bins]);
 
         // Accumulate partition p = 0 onto pre-accumulated p = 1..P.
         if self.backend.is_scalar() {
@@ -455,6 +467,8 @@ impl<'a, F: FftBackend> PartitionedConvolver<'a, F> {
             );
         }
 
+        flush_tiny_in_place(self.acc_re);
+        flush_tiny_in_place(self.acc_im);
         self.fft.rfft_inverse(
             self.fft_size,
             self.acc_re,
@@ -462,7 +476,7 @@ impl<'a, F: FftBackend> PartitionedConvolver<'a, F> {
             self.time_buf,
             self.fft_scratch,
         )?;
-        output.copy_from_slice(&self.time_buf[b..2 * b]);
+        copy_flush_tiny(output, &self.time_buf[b..2 * b]);
 
         Ok(())
     }

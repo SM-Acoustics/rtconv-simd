@@ -5,7 +5,37 @@ All notable changes to `rtconv-simd` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — Target `0.2.0`
+## [Unreleased]
+
+Planned work is tracked in `docs/ROADMAP.md` and issue #13 (sub-issues #14–#24).
+
+## [0.2.0] - 2026-11-23
+
+Version bump on `main`. The `v0.2.0` tag, GitHub release and crates.io publication are maintainer actions.
+
+### IEEE 754 subnormal guard (2026-11-23)
+
+#### Fixed
+- **Subnormal (denormal) slowdowns in every `f32` engine.** New `simd_kernels::DENORMAL_GUARD = 2^-63`, with
+  `flush_tiny` / `copy_flush_tiny` / `flush_tiny_in_place`.
+  - What is flushed: input samples, IR coefficients, pre-transformed IR spectra, FDL input slots, spectral
+    accumulators and outputs, whenever `|v| < 2^-63` (≈ −379 dBFS).
+  - Why `2^-63`: every non-zero product of two guarded values is `≥ 2^-126`, i.e. normal.
+  - Measured on x86-64 without FTZ/DAZ (`benches/denormal_bench.rs`, 1024 taps):
+    - `DirectConvolver`: 346 → 4.3 µs per 32-sample block for 1e-37 inputs, and 67 → 4.2 µs for an IR whose
+      f64 deep tail decoded to subnormal `f32` taps.
+    - `HybridConvolver`: 48 → 0.9 µs.
+  - No measurable cost for normal signals.
+  - Q1.15 engines are integer-only and unchanged.
+- Tests: `tests/denormal_guard.rs` checks that tiny or subnormal inputs and coefficients are bit-identical to
+  their flushed counterparts, that no output is subnormal, and that a decaying input drains to exact zeros,
+  for every engine.
+
+#### Added
+- `benches/denormal_bench.rs`.
+- `docs/ROADMAP.md` rewritten around Wefers 2015 (*Partitioned convolution algorithms for real-time
+  auralization*), heterogeneous CPU/GPU execution, AES69 (SOFA), ISO 3382-1 and IEEE 754. GitHub issues
+  #13–#24 opened, each with scope and acceptance criteria.
 
 ### Adversarial DSP review (2026-11-23) — see `docs/REVIEW-2026-11-ADVERSARIAL.md`
 
@@ -67,7 +97,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pinned `dtolnay/rust-toolchain` by commit SHA with explicit `toolchain:` inputs across CI workflows and added a Dependabot `ignore` rule so MSRV `1.89.0` is never auto-bumped (`#5`).
 - Upgraded GitHub Actions `actions/checkout` from `v4` to `v7` across all four workflows (`#2`).
 
-## [0.1.0] - 2026-11-22 (GitHub Release)
+## [0.1.0] - 2026-11-22 (GitHub Release `v0.1.0`)
 
 ### Added
 - Pure Rust `#![no_std]`, `#![forbid(unsafe_code)]` FIR convolution core (`rtconv_simd`) with zero heap allocation in `prepare` and audio processing (`#1`).

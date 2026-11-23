@@ -119,8 +119,11 @@ impl<'a, F: FftBackend> NonUniformConvolver<'a, F> {
                 NonUniformStageKind::Direct => {
                     let active = st_lay.direct_active_len;
                     if active > 0 {
-                        workspace[st_lay.direct_coeffs_off..st_lay.direct_coeffs_off + active]
-                            .copy_from_slice(&ir[st_plan.ir_offset..st_plan.ir_offset + active]);
+                        crate::simd_kernels::copy_flush_tiny(
+                            &mut workspace
+                                [st_lay.direct_coeffs_off..st_lay.direct_coeffs_off + active],
+                            &ir[st_plan.ir_offset..st_plan.ir_offset + active],
+                        );
                     }
                 }
                 NonUniformStageKind::Fdl => {
@@ -140,8 +143,10 @@ impl<'a, F: FftBackend> NonUniformConvolver<'a, F> {
                         let t_off = layout.time_scratch_off;
                         workspace[t_off..t_off + n].fill(0.0);
                         if copy_len > 0 {
-                            workspace[t_off..t_off + copy_len]
-                                .copy_from_slice(&ir[tap_start..tap_start + copy_len]);
+                            crate::simd_kernels::copy_flush_tiny(
+                                &mut workspace[t_off..t_off + copy_len],
+                                &ir[tap_start..tap_start + copy_len],
+                            );
                         }
 
                         // RFFT partition into ir_re[p], ir_im[p].
@@ -163,6 +168,8 @@ impl<'a, F: FftBackend> NonUniformConvolver<'a, F> {
                             out_im,
                             &mut fft_sc_slice[..layout.max_fft_scratch],
                         )?;
+                        crate::simd_kernels::flush_tiny_in_place(out_re);
+                        crate::simd_kernels::flush_tiny_in_place(out_im);
                     }
                 }
             }
@@ -205,6 +212,7 @@ impl<'a, F: FftBackend> NonUniformConvolver<'a, F> {
 
     #[inline]
     fn process_sample_inner(&mut self, x: f32) -> Result<f32, ConvError> {
+        let x = crate::simd_kernels::flush_tiny(x);
         let mut sum = 0.0f32;
         let stage_count = self.layout.stage_count;
 
@@ -278,7 +286,7 @@ impl<'a, F: FftBackend> NonUniformConvolver<'a, F> {
         }
 
         self.scheduler.advance_sample();
-        Ok(sum)
+        Ok(crate::simd_kernels::flush_tiny(sum))
     }
 
     /// Deterministically resets all delay lines, FDL rings, and scheduler cursors while

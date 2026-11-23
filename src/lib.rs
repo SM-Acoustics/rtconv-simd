@@ -8,6 +8,9 @@
 //! - All working buffers are caller-supplied slices sized with checked arithmetic (or `const fn`
 //!   for [`auto`]); `prepare`, `process_*`, and `reset` never allocate.
 //! - Phase-agnostic: any finite causal FIR is applied verbatim (order, gain, phase, delay).
+//!   The exception is magnitudes below [`simd_kernels::DENORMAL_GUARD`] (`2^-63`, ≈ −379 dBFS):
+//!   `f32` engines flush them to zero to stay out of IEEE 754 subnormal arithmetic, which is up
+//!   to two orders of magnitude slower on x86 without FTZ/DAZ.
 //!
 //! ## Entry points
 //! - [`auto::AutoConvolver`] / [`auto::AutoStereoConvolver`] (feature `auto`, default): load a

@@ -27,7 +27,7 @@
 - **Desktop SIMD and FPU-less MCUs**:
   - `f32` is accelerated with `fearless_simd 1.2.0` (SSE2, SSE4.2, AVX2+FMA, NEON, WASM SIMD128).
   - The Q1.15 stack uses true block-floating-point FFTs. Its SNR stays within about 2 dB of the Q1.15 output-rounding limit across input levels (see [benchmarks](#numerical-accuracy-host_tested)).
-- **Phase-agnostic and bit-honest**: any finite causal FIR is processed as given. Tap order, gain, phase and delay are preserved, with no hidden normalization or windowing.
+- **Phase-agnostic and bit-honest**: any finite causal FIR is processed as given. Tap order, gain, phase and delay are preserved, with no hidden normalization or windowing. The one exception is that magnitudes below `2^-63` (≈ −379 dBFS) are flushed to zero to stay out of IEEE 754 subnormal arithmetic (see [Real-Time Guarantees](#real-time-guarantees-and-limits)).
 - **Evidence-labelled claims**: `HOST_TESTED`, `CI_VERIFIED`, `CROSS_COMPILE_VERIFIED` and `DEVICE_VERIFIED` are kept separate. There are no synthetic cycle counts and no WCET promises. See the [adversarial review](./docs/REVIEW-2026-11-ADVERSARIAL.md).
 
 ---
@@ -120,7 +120,7 @@ Typed errors (`ArtifactError`) cover truncation, unsupported formats, non-finite
 rtconv-simd = { git = "https://github.com/SM-Acoustics/rtconv-simd", branch = "main" }
 ```
 
-> **Release status**: `v0.1.0` is a GitHub Release (crates.io publication is pending). Everything else described here is on `main`, targeting `0.2.0`.
+> **Release status**: the crate version on `main` is **`0.2.0`** (see [`CHANGELOG.md`](./CHANGELOG.md)). The latest GitHub release is `v0.1.0`. Tagging `v0.2.0` and publishing to crates.io are maintainer actions. Planned work: [`docs/ROADMAP.md`](./docs/ROADMAP.md) and issue [#13](https://github.com/SM-Acoustics/rtconv-simd/issues/13).
 
 ---
 
@@ -211,6 +211,9 @@ Measured with `tests/adversarial_reference.rs` and `tests/auto_convolver.rs`.
   - `#![no_std]` and `#![forbid(unsafe_code)]`.
   - 0 heap allocations or deallocations (standalone `harness = false` `GlobalAlloc` binary with a positive control), covering every `f32` and Q1.15 engine, artifact parsing, and `AutoConvolver`.
   - No locks, threads or I/O; bounded loops; typed `ConvError` / `ArtifactError` rejections.
+  - **IEEE 754 subnormal guard.** Every `f32` engine flushes values below `simd_kernels::DENORMAL_GUARD = 2^-63` (≈ −379 dBFS) at its boundaries: inputs, coefficients, spectra, FDL slots, accumulators and outputs. Every non-zero product therefore stays a normal number.
+    - Without the guard, on x86 without FTZ/DAZ, decaying or near-silent signals made `DirectConvolver` up to 80× slower and `HybridConvolver` up to 50× slower, and an f64 FIR with a deep tail made it 15× slower permanently.
+    - With the guard, every case runs at the normal-signal cost (`benches/denormal_bench.rs`, [`docs/ROADMAP.md` §4](./docs/ROADMAP.md)).
 - **Limits**:
   - Host benchmarks are not WCET certifications.
   - `NonUniformBudget` is an operation-count admission model, not a timing proof.
