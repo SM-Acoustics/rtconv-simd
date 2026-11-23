@@ -28,6 +28,7 @@ use crate::direct::{DirectConfig, DirectConvolver};
 use crate::error::ConvError;
 use crate::fft::{FftBackend, FftSize, MicroFftBackend};
 use crate::partitioned::{PartitionedConfig, PartitionedConvolver};
+use crate::simd_kernels::flush_tiny;
 use crate::{Capabilities, EngineKind, SimdBackend};
 
 /// Configuration for [`HybridConvolver`].
@@ -294,8 +295,9 @@ impl<'a, F: FftBackend> HybridConvolver<'a, F> {
 
                 let mut i = 0;
                 while i < chunk {
-                    output[processed + i] += self.tail_out_buf[self.tail_pos + i];
-                    self.tail_in_buf[self.tail_pos + i] = input[processed + i];
+                    output[processed + i] =
+                        flush_tiny(output[processed + i] + self.tail_out_buf[self.tail_pos + i]);
+                    self.tail_in_buf[self.tail_pos + i] = flush_tiny(input[processed + i]);
                     i += 1;
                 }
 

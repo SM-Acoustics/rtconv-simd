@@ -82,6 +82,10 @@ name = "fft_backends_bench"
 harness = false
 
 [[bench]]
+name = "denormal_bench"
+harness = false
+
+[[bench]]
 name = "nonuniform_bench"
 harness = false
 required-features = ["nonuniform"]

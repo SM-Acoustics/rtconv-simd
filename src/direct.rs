@@ -6,7 +6,8 @@
 
 use crate::error::ConvError;
 use crate::simd_kernels::{
-    dot_product_scalar, dot_two_segments_simd, fir_block_scalar, fir_block_simd,
+    copy_flush_tiny, dot_product_scalar, dot_two_segments_simd, fir_block_scalar, fir_block_simd,
+    flush_tiny,
 };
 use crate::{Capabilities, EngineKind, SimdBackend};
 
@@ -65,7 +66,8 @@ impl<'a> DirectConvolver<'a> {
 
     /// Validates inputs and initializes a `DirectConvolver` inside caller-owned `workspace`.
     ///
-    /// Preserves the exact coefficients, order, amplitude, phase, and delay of `ir`.
+    /// Preserves the exact coefficients, order, amplitude, phase, and delay of `ir`, except that
+    /// magnitudes below [`crate::simd_kernels::DENORMAL_GUARD`] (`2^-63`) are flushed to zero.
     pub fn prepare(
         ir: &[f32],
         config: DirectConfig,
@@ -98,7 +100,8 @@ impl<'a> DirectConvolver<'a> {
         let (history_buf, _) = rest.split_at_mut(req.history_len);
 
         let ir_len = ir.len();
-        ir_buf[..ir_len].copy_from_slice(ir);
+        // Coefficients below `DENORMAL_GUARD` are flushed (see `simd_kernels::DENORMAL_GUARD`).
+        copy_flush_tiny(&mut ir_buf[..ir_len], ir);
         ir_buf[ir_len..].fill(0.0);
         history_buf.fill(0.0);
 
@@ -121,13 +124,13 @@ impl<'a> DirectConvolver<'a> {
             self.write_pos - 1
         };
         self.write_pos = pos;
-        self.history[pos] = input;
+        self.history[pos] = flush_tiny(input);
 
         let first_len = ir_len - pos;
         let ir_active = &self.ir[..ir_len];
         let hist_active = &self.history[..ir_len];
 
-        if self.backend.is_scalar() {
+        let y = if self.backend.is_scalar() {
             dot_product_scalar(&ir_active[..first_len], &hist_active[pos..ir_len])
                 + dot_product_scalar(&ir_active[first_len..ir_len], &hist_active[..pos])
         } else {
@@ -138,7 +141,8 @@ impl<'a> DirectConvolver<'a> {
                 &ir_active[first_len..ir_len],
                 &hist_active[..pos],
             )
-        }
+        };
+        flush_tiny(y)
     }
 
     /// Processes a block of samples using a single SIMD dispatch at block entry.

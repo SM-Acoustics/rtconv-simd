@@ -290,6 +290,9 @@ pub(crate) fn fdl_stage_start_block<F: FftBackend>(
     let sc = &mut fft_sc_slice[..max_fft_scratch];
 
     fft.rfft_forward(fft_enum, time_in, out_re, out_im, sc)?;
+    // Cancellation can leave subnormal bins; they would be re-multiplied for P blocks.
+    simd_kernels::flush_tiny_in_place(out_re);
+    simd_kernels::flush_tiny_in_place(out_im);
 
     // Zero stage spectral accumulators.
     ws[st.acc_re_off..st.acc_re_off + bins].fill(0.0);
@@ -364,6 +367,8 @@ pub(crate) fn fdl_stage_cmac_and_maybe_ifft<F: FftBackend>(
             *delay_write_pos += b;
             return Ok(());
         }
+        simd_kernels::flush_tiny_in_place(&mut ws[st.acc_re_off..st.acc_re_off + bins]);
+        simd_kernels::flush_tiny_in_place(&mut ws[st.acc_im_off..st.acc_im_off + bins]);
         // Disjoint borrows: acc_re < acc_im < time_scratch <= fft_scratch.
         let (before_time, from_time) = ws.split_at_mut(time_scratch_off);
         let (time_slice, fft_sc_slice) = from_time.split_at_mut(fft_scratch_off - time_scratch_off);

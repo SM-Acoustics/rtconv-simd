@@ -9,6 +9,42 @@
 use fearless_simd::{Level, Simd, dispatch, prelude::*};
 use fearless_simd_macros::simd;
 
+/// Magnitude below which `f32` input samples and filter coefficients are flushed to zero:
+/// `2^-63` (≈ `1.08e-19`, ≈ −379 dBFS).
+///
+/// IEEE 754 subnormal operands and results are executed by microcode assists on x86 when the
+/// host thread has not enabled FTZ/DAZ (Rust never does, and `#![forbid(unsafe_code)]` rules out
+/// touching `MXCSR`), and are slow on several other FPUs. Measured on x86-64 without FTZ/DAZ,
+/// a 1024-tap `DirectConvolver` ran 30–75× slower for inputs of `1e-35`..`1e-37` (normal numbers
+/// whose products with the taps are subnormal) and 15× slower, permanently, with an IR whose deep
+/// tail decoded to subnormal `f32` taps. Bounding every non-zero input **and** coefficient
+/// magnitude by `2^-63` guarantees that every non-zero product is at least `2^-126`, i.e. a normal
+/// number. The flushed values are ~380 dB below full scale, far under the 24-bit noise floor
+/// (−144 dBFS) and under `f32` resolution of any audible signal.
+pub const DENORMAL_GUARD: f32 = f32::from_bits(0x2000_0000);
+
+/// Returns `0.0` when `|x| < DENORMAL_GUARD`, otherwise `x` (`NaN` and infinities pass through).
+#[inline(always)]
+pub fn flush_tiny(x: f32) -> f32 {
+    if x.abs() < DENORMAL_GUARD { 0.0 } else { x }
+}
+
+/// Copies `src` into `dst` (up to the shorter length) applying [`flush_tiny`].
+#[inline]
+pub fn copy_flush_tiny(dst: &mut [f32], src: &[f32]) {
+    for (d, &s) in dst.iter_mut().zip(src) {
+        *d = flush_tiny(s);
+    }
+}
+
+/// Applies [`flush_tiny`] in place (used on coefficients and pre-transformed spectra).
+#[inline]
+pub fn flush_tiny_in_place(buf: &mut [f32]) {
+    for v in buf.iter_mut() {
+        *v = flush_tiny(*v);
+    }
+}
+
 /// Scalar reference dot product over two equal-length slices.
 ///
 /// Always executes scalar arithmetic without SIMD vectorization.
@@ -137,12 +173,12 @@ fn fir_block_impl<S: Simd>(
     let mut s = 0;
     while s < n {
         pos = if pos == 0 { ir_len - 1 } else { pos - 1 };
-        history[pos] = input[s];
+        history[pos] = flush_tiny(input[s]);
 
         let first_len = ir_len - pos;
         let y = dot_product_vec(simd, &ir[..first_len], &history[pos..ir_len])
             + dot_product_vec(simd, &ir[first_len..ir_len], &history[..pos]);
-        output[s] = y;
+        output[s] = flush_tiny(y);
         s += 1;
     }
 
@@ -188,12 +224,12 @@ pub fn fir_block_scalar(
     let mut s = 0;
     while s < n {
         pos = if pos == 0 { ir_len - 1 } else { pos - 1 };
-        history[pos] = input[s];
+        history[pos] = flush_tiny(input[s]);
 
         let first_len = ir_len - pos;
         let y = dot_product_scalar(&ir[..first_len], &history[pos..ir_len])
             + dot_product_scalar(&ir[first_len..ir_len], &history[..pos]);
-        output[s] = y;
+        output[s] = flush_tiny(y);
         s += 1;
     }
 
