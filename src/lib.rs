@@ -1,18 +1,23 @@
-//! `rtconv_simd`: Hard real-time, `#![no_std]`, allocation-free FIR convolution engine
-//! with `fearless_simd 1.2.0` acceleration and `microfft 0.6.0` primary FFT backend.
+//! `rtconv_simd`: zero-latency, allocation-free, `#![no_std]` FIR convolution with
+//! `fearless_simd` acceleration, a Q1.15 / block-floating-point stack for FPU-less MCUs, FIR
+//! artifact decoding, and a zero-configuration automatic layer.
 //!
 //! ## Core Guarantees
-//! - `#![no_std]` and `#![forbid(unsafe_code)]` in the DSP core.
-//! - Zero dependency on `std` or `alloc` in the core crate (`std` feature only enables
-//!   runtime x86 CPUID detection via `fearless_simd::Level::new()`).
-//! - All working buffers are caller-supplied (`&mut [f32]`) with checked size calculation.
-//! - Phase-agnostic: accepts any finite real causal FIR impulse response `&[f32]` and
-//!   preserves its exact temporal order, gain, phase, and group delay.
+//! - `#![no_std]` and `#![forbid(unsafe_code)]`; `alloc` is never used (the `std` feature only
+//!   enables runtime CPU detection via `fearless_simd::Level::new()`).
+//! - All working buffers are caller-supplied slices sized with checked arithmetic (or `const fn`
+//!   for [`auto`]); `prepare`, `process_*`, and `reset` never allocate.
+//! - Phase-agnostic: any finite causal FIR is applied verbatim (order, gain, phase, delay).
 //!
-//! ## Engines
-//! - [`DirectConvolver`]: Time-domain circular-buffer FIR convolution (sample and block API).
-//! - [`PartitionedConvolver`]: Uniform Frequency-Domain Delay Line (FDL) with 50% overlap-save.
-//! - [`HybridConvolver`]: Zero-latency combination of direct FIR head + partitioned FFT tail.
+//! ## Entry points
+//! - [`auto::AutoConvolver`] / [`auto::AutoStereoConvolver`] (feature `auto`, default): load a
+//!   WAV / raw / text FIR artifact ([`artifact::FirArtifact`]) and let the crate choose the
+//!   numeric domain (`f32` with an FPU, Q1.15 without), engine, and partition size.
+//! - [`DirectConvolver`]: time-domain FIR (sample and block API).
+//! - [`PartitionedConvolver`]: uniform frequency-domain delay line with 50 % overlap-save.
+//! - [`HybridConvolver`]: zero-latency direct head + partitioned FFT tail (BURST / SPREAD).
+//! - `NonUniformConvolver` (feature `nonuniform`): multi-stage zero-latency NUPC.
+//! - `fixed::*` (features `fixed-q15`, `fixed-fft`, `fixed-nonuniform`): Q1.15 / BFP engines.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -21,6 +26,14 @@
 #[cfg(test)]
 extern crate std;
 
+/// README code blocks compiled and run as doctests so the documentation cannot drift.
+#[cfg(all(doctest, feature = "auto"))]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
+
+pub mod artifact;
+#[cfg(feature = "auto")]
+pub mod auto;
 pub mod direct;
 pub mod error;
 pub mod fft;
@@ -36,6 +49,12 @@ pub mod simd_fft;
 mod simd_fft_tables;
 pub mod simd_kernels;
 
+pub use artifact::{ArtifactError, Container, FirArtifact, SampleEncoding};
+#[cfg(feature = "auto")]
+pub use auto::{
+    AutoConvolver, AutoEngine, AutoInfo, AutoStereoConvolver, AutoWorkspace, HAS_HARDWARE_FPU,
+    NativeElem, NumericDomain,
+};
 pub use direct::{DirectConfig, DirectConvolver, DirectMemoryRequirements};
 pub use error::ConvError;
 pub use fearless_simd::Level;

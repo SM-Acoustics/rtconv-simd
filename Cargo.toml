@@ -7,8 +7,8 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/SM-Acoustics/rtconv-simd"
 documentation = "https://docs.rs/rtconv-simd"
-description = "Pure Rust, no_std FIR convolution with SIMD FFT, caller-managed memory, and predictable real-time DSP workloads."
-keywords = ["dsp", "convolution", "simd", "audio", "no-std"]
+description = "Zero-latency, allocation-free no_std FIR convolution: SIMD FFT, Q1.15 block-floating-point engines for FPU-less MCUs, and automatic setup from WAV/raw/text FIR files."
+keywords = ["dsp", "convolution", "fir", "audio", "no-std"]
 categories = ["multimedia::audio", "no-std", "algorithms"]
 exclude = [
     ".github/*",
@@ -22,12 +22,23 @@ exclude = [
     "RT_AUDIT.md",
 ]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [lib]
 name = "rtconv_simd"
 path = "src/lib.rs"
 
 [features]
-default = []
+# `auto` is `no_std` and allocation-free like the rest of the crate; it only adds code.
+default = ["auto"]
+# Zero-configuration `AutoConvolver` / `AutoStereoConvolver`: FIR artifact in, engine chosen
+# from the IR length and the target's FPU (f32 on ESP32-P4/Cortex-M4F/desktop, Q1.15/BFP on
+# ESP32-C6/Cortex-M0). Pulls in the fixed-point and non-uniform engines.
+auto = ["fixed-nonuniform"]
+# Force the Q1.15 domain as `auto::NativeElem` even on targets with an FPU (RAM savings,
+# bit-exact cross-target behaviour, or host testing of the FPU-less path).
+native-q15 = ["auto"]
 # Enables runtime CPU feature detection (`Level::new()`) via `fearless_simd/std`.
 # Core DSP processing never uses `std` or `alloc`.
 std = ["fearless_simd/std"]
