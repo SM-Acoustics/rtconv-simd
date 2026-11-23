@@ -1,8 +1,19 @@
-//! Allocation-free real-time contract verification using a re-entrancy-safe `GlobalAlloc`.
+//! Standalone (`harness = false`) zero-allocation real-time contract verifier.
 //!
-//! All engine/backend scenarios run sequentially inside a single test entry point so no
-//! sibling test threads can allocate while `GUARD_ACTIVE` is armed, and `GlobalAlloc`
-//! touches only lock-free atomics (no TLS initialization inside `alloc`/`dealloc`).
+//! # Why `harness = false`?
+//! Running under Rust's default `libtest` harness spawns a worker thread while the main
+//! harness thread remains active (capturing output and managing channels). On macOS,
+//! background harness/runtime allocations on another thread intermittently raced with a
+//! process-wide `GUARD_ACTIVE` flag. Using `harness = false` gives a single-threaded
+//! process with zero `libtest` runner threads, and `GlobalAlloc` uses only lock-free
+//! atomics (avoiding TLS recursion observed on Rust 1.89.0).
+//!
+//! # Limitations
+//! This binary verifies that `rtconv_simd` performs zero Rust `GlobalAlloc` allocations
+//! or deallocations on the host process during `prepare`, `process_sample`,
+//! `process_block`, `reset`, and metadata queries. It does not intercept direct OS
+//! syscalls bypassing `GlobalAlloc` (none exist in `#![no_std]` `#![forbid(unsafe_code)]`
+//! core code).
 
 #[cfg(feature = "phastft")]
 use rtconv_simd::PhastFftBackend;
@@ -11,6 +22,7 @@ use rtconv_simd::{
     PartitionedConfig, PartitionedConvolver, SimdBackend, SimdFixedFftBackend,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 struct CountingAllocator;
@@ -19,6 +31,8 @@ static GUARD_ACTIVE: AtomicBool = AtomicBool::new(false);
 static ALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 static DEALLOC_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+// SAFETY: Delegates directly to `System` after updating lock-free atomic counters.
+// No TLS, no formatting, no locks, and no recursive allocations inside `alloc`/`dealloc`.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if GUARD_ACTIVE.load(Ordering::SeqCst) {
@@ -38,28 +52,46 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-fn assert_zero_alloc<F: FnOnce()>(label: &str, f: F) {
+fn measure_allocs<F: FnOnce()>(f: F) -> (usize, usize) {
     ALLOC_COUNT.store(0, Ordering::SeqCst);
     DEALLOC_COUNT.store(0, Ordering::SeqCst);
     GUARD_ACTIVE.store(true, Ordering::SeqCst);
     f();
     GUARD_ACTIVE.store(false, Ordering::SeqCst);
-    let allocs = ALLOC_COUNT.load(Ordering::SeqCst);
-    let deallocs = DEALLOC_COUNT.load(Ordering::SeqCst);
-    assert_eq!(allocs, 0, "{label}: detected {allocs} heap allocations");
+    (
+        ALLOC_COUNT.load(Ordering::SeqCst),
+        DEALLOC_COUNT.load(Ordering::SeqCst),
+    )
+}
+
+fn assert_zero_alloc<F: FnOnce()>(phase: &str, f: F) {
+    let (allocs, deallocs) = measure_allocs(f);
+    assert_eq!(
+        allocs, 0,
+        "phase `{phase}`: detected {allocs} heap allocations"
+    );
     assert_eq!(
         deallocs, 0,
-        "{label}: detected {deallocs} heap deallocations"
+        "phase `{phase}`: detected {deallocs} heap deallocations"
     );
 }
 
-fn verify_microfft_engines() {
+fn verify_positive_control() {
+    let (allocs, deallocs) = measure_allocs(|| {
+        let boxed = black_box(Box::new([0xA5u64; 16]));
+        drop(boxed);
+    });
+    assert!(
+        allocs >= 1 && deallocs >= 1,
+        "positive control failed: instrumentation did not detect deliberate Box allocation (allocs={allocs}, deallocs={deallocs})"
+    );
+}
+
+fn verify_microfft_engines(backend: SimdBackend) {
     let ir = [0.25f32; 512];
     let input = [0.5f32; 128];
     let mut output = [0.0f32; 128];
-
     let fft = MicroFftBackend::new();
-    let backend = SimdBackend::detect_or_baseline();
 
     let d_cfg = DirectConfig { max_ir_len: 512 };
     let mut d_ws = vec![
@@ -68,7 +100,6 @@ fn verify_microfft_engines() {
             .unwrap()
             .total_f32
     ];
-
     let p_cfg = PartitionedConfig {
         block_size: 64,
         max_ir_len: 512,
@@ -79,7 +110,6 @@ fn verify_microfft_engines() {
             .unwrap()
             .total_f32
     ];
-
     let h_cfg = HybridConfig {
         head_len: 128,
         tail_block_size: 128,
@@ -92,45 +122,73 @@ fn verify_microfft_engines() {
             .total_f32
     ];
 
-    assert_zero_alloc("MicroFft + Direct/Partitioned/Hybrid", || {
-        {
-            let mut conv = DirectConvolver::prepare(&ir, d_cfg, &mut d_ws, backend).unwrap();
-            let _ = conv.process_sample(0.1);
-            for _ in 0..16 {
-                conv.process_block(&input[..32], &mut output[..32]).unwrap();
-            }
-            conv.reset();
-            let _ = conv.latency_samples();
-            let _ = conv.capabilities();
+    // DirectConvolver: prepare, process_sample, process_block, reset, metadata
+    let mut d_conv = None;
+    assert_zero_alloc("direct::prepare", || {
+        d_conv = Some(DirectConvolver::prepare(&ir, d_cfg, &mut d_ws, backend).unwrap());
+    });
+    let d_conv = d_conv.as_mut().unwrap();
+    assert_zero_alloc("direct::process_sample", || {
+        for &s in &input[..64] {
+            black_box(d_conv.process_sample(s));
         }
-        {
-            let mut conv =
-                PartitionedConvolver::prepare(&ir, p_cfg, &mut p_ws, backend, fft).unwrap();
-            for _ in 0..16 {
-                conv.process_block(&input[..64], &mut output[..64]).unwrap();
-            }
-            conv.reset();
-            let _ = conv.latency_samples();
-            let _ = conv.capabilities();
+    });
+    assert_zero_alloc("direct::process_block", || {
+        for _ in 0..16 {
+            d_conv
+                .process_block(&input[..32], &mut output[..32])
+                .unwrap();
         }
-        {
-            let mut conv = HybridConvolver::prepare(&ir, h_cfg, &mut h_ws, backend, fft).unwrap();
-            for _ in 0..32 {
-                conv.process_block(&input[..32], &mut output[..32]).unwrap();
-            }
-            conv.reset();
-            let _ = conv.latency_samples();
-            let _ = conv.capabilities();
+    });
+    assert_zero_alloc("direct::reset", || d_conv.reset());
+    assert_zero_alloc("direct::metadata", || {
+        black_box(d_conv.latency_samples());
+        black_box(d_conv.capabilities());
+    });
+
+    // PartitionedConvolver (MicroFft): prepare, process_block, reset, metadata
+    let mut p_conv = None;
+    assert_zero_alloc("partitioned_microfft::prepare", || {
+        p_conv = Some(PartitionedConvolver::prepare(&ir, p_cfg, &mut p_ws, backend, fft).unwrap());
+    });
+    let p_conv = p_conv.as_mut().unwrap();
+    assert_zero_alloc("partitioned_microfft::process_block", || {
+        for _ in 0..16 {
+            p_conv
+                .process_block(&input[..64], &mut output[..64])
+                .unwrap();
         }
+    });
+    assert_zero_alloc("partitioned_microfft::reset", || p_conv.reset());
+    assert_zero_alloc("partitioned_microfft::metadata", || {
+        black_box(p_conv.latency_samples());
+        black_box(p_conv.capabilities());
+    });
+
+    // HybridConvolver (MicroFft): prepare, process_block, reset, metadata
+    let mut h_conv = None;
+    assert_zero_alloc("hybrid_microfft::prepare", || {
+        h_conv = Some(HybridConvolver::prepare(&ir, h_cfg, &mut h_ws, backend, fft).unwrap());
+    });
+    let h_conv = h_conv.as_mut().unwrap();
+    assert_zero_alloc("hybrid_microfft::process_block", || {
+        for _ in 0..32 {
+            h_conv
+                .process_block(&input[..32], &mut output[..32])
+                .unwrap();
+        }
+    });
+    assert_zero_alloc("hybrid_microfft::reset", || h_conv.reset());
+    assert_zero_alloc("hybrid_microfft::metadata", || {
+        black_box(h_conv.latency_samples());
+        black_box(h_conv.capabilities());
     });
 }
 
-fn verify_simd_fixed_and_tail_spreading() {
+fn verify_simd_fixed_and_tail_spreading(backend: SimdBackend) {
     let ir = [0.25f32; 1024];
     let input = [0.5f32; 128];
     let mut output = [0.0f32; 128];
-
-    let backend = SimdBackend::detect_or_baseline();
     let fft = SimdFixedFftBackend::new(backend);
 
     let p_cfg = PartitionedConfig {
@@ -155,40 +213,52 @@ fn verify_simd_fixed_and_tail_spreading() {
             .total_f32
     ];
 
-    assert_zero_alloc("SimdFixedFft + Hybrid(SPREAD)", || {
-        {
-            let mut pconv =
-                PartitionedConvolver::prepare(&ir, p_cfg, &mut p_ws, backend, fft).unwrap();
-            for _ in 0..8 {
-                pconv.process_block(&input, &mut output).unwrap();
-            }
-            pconv.reset();
+    let mut p_conv = None;
+    assert_zero_alloc("partitioned_simdfixed::prepare", || {
+        p_conv = Some(PartitionedConvolver::prepare(&ir, p_cfg, &mut p_ws, backend, fft).unwrap());
+    });
+    let p_conv = p_conv.as_mut().unwrap();
+    assert_zero_alloc("partitioned_simdfixed::process_block", || {
+        for _ in 0..8 {
+            p_conv.process_block(&input, &mut output).unwrap();
         }
-        {
-            let mut hconv = HybridConvolver::prepare_with_tail_spreading(
-                &ir, h_cfg, &mut h_ws, backend, fft, true,
-            )
-            .unwrap();
-            for _ in 0..32 {
-                hconv
-                    .process_block(&input[..32], &mut output[..32])
-                    .unwrap();
-            }
-            hconv.reset();
+    });
+    assert_zero_alloc("partitioned_simdfixed::reset", || p_conv.reset());
+    assert_zero_alloc("partitioned_simdfixed::metadata", || {
+        black_box(p_conv.latency_samples());
+        black_box(p_conv.capabilities());
+    });
+
+    let mut h_conv = None;
+    assert_zero_alloc("hybrid_simdfixed_spread::prepare", || {
+        h_conv = Some(
+            HybridConvolver::prepare_with_tail_spreading(&ir, h_cfg, &mut h_ws, backend, fft, true)
+                .unwrap(),
+        );
+    });
+    let h_conv = h_conv.as_mut().unwrap();
+    assert_zero_alloc("hybrid_simdfixed_spread::process_block", || {
+        for _ in 0..32 {
+            h_conv
+                .process_block(&input[..32], &mut output[..32])
+                .unwrap();
         }
+    });
+    assert_zero_alloc("hybrid_simdfixed_spread::reset", || h_conv.reset());
+    assert_zero_alloc("hybrid_simdfixed_spread::metadata", || {
+        black_box(h_conv.latency_samples());
+        black_box(h_conv.capabilities());
     });
 }
 
 #[cfg(feature = "phastft")]
-fn verify_phastft_audio_callback() {
+fn verify_phastft_audio_callback(backend: SimdBackend) {
     let ir = [0.25f32; 1024];
     let input = [0.5f32; 128];
     let mut output = [0.0f32; 128];
 
-    let backend = SimdBackend::detect_or_baseline();
     // Planner is constructed ONCE outside the RT audio callback.
     let fft = PhastFftBackend::new();
-
     let h_cfg = HybridConfig {
         head_len: 128,
         tail_block_size: 128,
@@ -200,24 +270,37 @@ fn verify_phastft_audio_callback() {
             .unwrap()
             .total_f32
     ];
-    let mut hconv =
+    let mut h_conv =
         HybridConvolver::prepare_with_tail_spreading(&ir, h_cfg, &mut h_ws, backend, fft, true)
             .unwrap();
 
-    assert_zero_alloc("PhastFftBackend audio callback", || {
+    assert_zero_alloc("hybrid_phastft_spread::process_block", || {
         for _ in 0..32 {
-            hconv
+            h_conv
                 .process_block(&input[..32], &mut output[..32])
                 .unwrap();
         }
-        hconv.reset();
+    });
+    assert_zero_alloc("hybrid_phastft_spread::reset", || h_conv.reset());
+    assert_zero_alloc("hybrid_phastft_spread::metadata", || {
+        black_box(h_conv.latency_samples());
+        black_box(h_conv.capabilities());
     });
 }
 
-#[test]
-fn test_zero_heap_allocations_all_engines_and_backends() {
-    verify_microfft_engines();
-    verify_simd_fixed_and_tail_spreading();
+fn main() {
+    // Warm up runtime environment and CPU feature detection before arming instrumentation.
+    let backend = SimdBackend::detect_or_baseline();
+    println!(
+        "no_alloc_rt: standalone harness starting (simd_active={})",
+        backend.is_simd_active()
+    );
+
+    verify_positive_control();
+    verify_microfft_engines(backend);
+    verify_simd_fixed_and_tail_spreading(backend);
     #[cfg(feature = "phastft")]
-    verify_phastft_audio_callback();
+    verify_phastft_audio_callback(backend);
+
+    println!("no_alloc_rt: ALL ZERO-ALLOCATION AND POSITIVE-CONTROL CHECKS PASSED");
 }
