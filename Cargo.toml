@@ -36,6 +36,8 @@ nonuniform = []
 fixed-q15 = []
 # Fixed-point Q1.15 / Block Floating Point FFT (N64/N128/N256) and FDL convolver.
 fixed-fft = ["fixed-q15"]
+# Integrated fixed-point Q1.15/BFP Non-Uniform Partitioned Convolver (reuses NUPC scheduler).
+fixed-nonuniform = ["nonuniform", "fixed-fft"]
 
 [dependencies]
 fearless_simd = { version = "1.2.0", default-features = false, features = ["force_support_fallback", "libm"] }

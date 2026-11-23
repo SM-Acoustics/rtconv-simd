@@ -45,6 +45,11 @@ pub use fixed::{
     FixedQ15DirectCapabilities, FixedQ15DirectConfig, FixedQ15DirectConvolver,
     FixedQ15DirectMemoryRequirements,
 };
+#[cfg(feature = "fixed-nonuniform")]
+pub use fixed::{
+    FixedQ15NonUniformCapabilities, FixedQ15NonUniformConvolver,
+    FixedQ15NonUniformMemoryRequirements,
+};
 #[cfg(feature = "fixed-fft")]
 pub use fixed::{
     FixedQ15PartitionedCapabilities, FixedQ15PartitionedConfig, FixedQ15PartitionedConvolver,

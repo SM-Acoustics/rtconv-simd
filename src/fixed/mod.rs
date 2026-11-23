@@ -10,6 +10,8 @@ pub mod direct;
 pub mod fft_q15;
 #[cfg(feature = "fixed-fft")]
 mod fft_q15_tables;
+#[cfg(feature = "fixed-nonuniform")]
+pub mod nonuniform;
 #[cfg(feature = "fixed-fft")]
 pub mod partitioned;
 pub mod q15;
@@ -20,6 +22,11 @@ pub use direct::{
 };
 #[cfg(feature = "fixed-fft")]
 pub use fft_q15::{irfft_q15_bfp, rfft_q15_bfp};
+#[cfg(feature = "fixed-nonuniform")]
+pub use nonuniform::{
+    FixedQ15NonUniformCapabilities, FixedQ15NonUniformConvolver,
+    FixedQ15NonUniformMemoryRequirements,
+};
 #[cfg(feature = "fixed-fft")]
 pub use partitioned::{
     FixedQ15PartitionedCapabilities, FixedQ15PartitionedConfig, FixedQ15PartitionedConvolver,
