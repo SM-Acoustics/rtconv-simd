@@ -352,6 +352,38 @@ fn verify_fixed_q15_direct() {
     });
 }
 
+#[cfg(feature = "fixed-fft")]
+fn verify_fixed_q15_partitioned() {
+    use rtconv_simd::{FixedQ15PartitionedConfig, FixedQ15PartitionedConvolver};
+
+    let ir = [1024i16; 512];
+    let input = [4096i16; 64];
+    let mut output = [0i16; 64];
+    let cfg = FixedQ15PartitionedConfig {
+        block_size: 64,
+        max_ir_len: 512,
+    };
+    let req = FixedQ15PartitionedConvolver::memory_requirements(cfg).unwrap();
+    let mut ws = vec![0i16; req.total_i16];
+
+    let mut conv = None;
+    assert_zero_alloc("fixed_q15_partitioned::prepare", || {
+        conv = Some(FixedQ15PartitionedConvolver::prepare(&ir, cfg, &mut ws).unwrap());
+    });
+    let conv = conv.as_mut().unwrap();
+    assert_zero_alloc("fixed_q15_partitioned::process_block", || {
+        for _ in 0..16 {
+            conv.process_block(&input, &mut output).unwrap();
+        }
+    });
+    assert_zero_alloc("fixed_q15_partitioned::reset", || conv.reset());
+    assert_zero_alloc("fixed_q15_partitioned::metadata", || {
+        black_box(conv.latency_samples());
+        black_box(conv.capabilities());
+        black_box(conv.saturation_count());
+    });
+}
+
 fn main() {
     // Warm up runtime environment and CPU feature detection before arming instrumentation.
     let backend = SimdBackend::detect_or_baseline();
@@ -369,6 +401,8 @@ fn main() {
     verify_nonuniform(backend);
     #[cfg(feature = "fixed-q15")]
     verify_fixed_q15_direct();
+    #[cfg(feature = "fixed-fft")]
+    verify_fixed_q15_partitioned();
 
     println!("no_alloc_rt: ALL ZERO-ALLOCATION AND POSITIVE-CONTROL CHECKS PASSED");
 }

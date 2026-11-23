@@ -34,6 +34,8 @@ phastft = ["std", "dep:phastft"]
 nonuniform = []
 # Fixed-point Q1.15 direct FIR engine (`#![no_std]`, zero-alloc, FPU-free).
 fixed-q15 = []
+# Fixed-point Q1.15 / Block Floating Point FFT (N64/N128/N256) and FDL convolver.
+fixed-fft = ["fixed-q15"]
 
 [dependencies]
 fearless_simd = { version = "1.2.0", default-features = false, features = ["force_support_fallback", "libm"] }
