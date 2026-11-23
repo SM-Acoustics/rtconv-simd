@@ -22,8 +22,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
       - name: Compile-only no_std check (no flashing)
         run: cargo check --lib --no-default-features --target ${{ matrix.target }}

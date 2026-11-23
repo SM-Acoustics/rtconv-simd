@@ -12,7 +12,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
+        with:
+          toolchain: "1.89.0"
       - run: rustc -vV
       - run: cargo check --lib --no-default-features
       - run: cargo check --all-features
@@ -24,8 +26,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
         with:
+          toolchain: stable
           components: rustfmt, clippy
       - name: Dependency & license tree (no_std core)
         run: cargo tree --no-default-features -e normal -f "{p} ({l})"
@@ -38,7 +41,7 @@ jobs:
         run: |
           cargo test --release --no-default-features
           cargo test --release --all-features
-          cargo test --release --all-features --test no_alloc_rt -- --test-threads=1
+          cargo test --release --all-features --test no_alloc_rt
       - name: Package Verification (no actual publish)
         run: |
           cargo package --list

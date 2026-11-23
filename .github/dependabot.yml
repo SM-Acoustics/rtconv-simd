@@ -10,3 +10,8 @@ updates:
     schedule:
       interval: "monthly"
     open-pull-requests-limit: 5
+    ignore:
+      # Toolchain versions (e.g. MSRV 1.89.0) are controlled via the `toolchain:` input
+      # on a SHA-pinned `dtolnay/rust-toolchain` ref and must never be auto-bumped as
+      # GitHub Action semver tags.
+      - dependency-name: "dtolnay/rust-toolchain"

@@ -47,6 +47,10 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 
+[[test]]
+name = "no_alloc_rt"
+harness = false
+
 [[bench]]
 name = "rtconv_bench"
 harness = false
