@@ -107,3 +107,104 @@ pub fn bfp_normalize_acc_i64_to_q15(
 
     out_exp.clamp(i8::MIN as i32, i8::MAX as i32) as i8
 }
+
+/// Quantizes `len` Q1.31 taps `tap(start..start + len)` into a Q1.15 block normalized to the
+/// full 15-bit mantissa and returns the exponent offset `e` such that
+/// `tap / 2^31 ≈ dst / 32768 * 2^e`.
+///
+/// This is block-floating-point *coefficient* storage: each FFT partition keeps 15 significant
+/// bits relative to its own peak, so the low-level tail of a decaying or linear-phase FIR is not
+/// rounded to a few LSBs of an absolute Q1.15 grid. Unused `dst` entries are zeroed.
+pub(crate) fn quantize_block_q31<F: Fn(usize) -> i32>(
+    tap: &F,
+    start: usize,
+    len: usize,
+    dst: &mut [i16],
+) -> i32 {
+    dst.fill(0);
+    let mut peak = 0u32;
+    for i in 0..len {
+        peak = peak.max(tap(start + i).unsigned_abs());
+    }
+    if peak == 0 {
+        return 0;
+    }
+    let bits = 32 - peak.leading_zeros();
+    let r = bits.saturating_sub(15);
+    for (i, d) in dst[..len].iter_mut().enumerate() {
+        let v = tap(start + i) as i64;
+        let q = if r == 0 {
+            v
+        } else {
+            let half = 1i64 << (r - 1);
+            if v >= 0 {
+                (v + half) >> r
+            } else {
+                -((-v + half) >> r)
+            }
+        };
+        *d = q.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+    }
+    r as i32 - 16
+}
+
+/// Rounds a Q1.31 tap to Q1.15 (nearest, ties away from zero) with saturation.
+#[inline]
+pub(crate) fn q31_to_q15(v: i32) -> i16 {
+    let v = v as i64;
+    let q = if v >= 0 {
+        (v + (1 << 15)) >> 16
+    } else {
+        -((-v + (1 << 15)) >> 16)
+    };
+    q.clamp(i16::MIN as i64, i16::MAX as i64) as i16
+}
+
+/// Source of FIR taps for the fixed-point engines' preparation step.
+pub(crate) trait TapSource {
+    /// Number of taps.
+    fn len(&self) -> usize;
+    /// Tap `i` rounded to absolute Q1.15 (direct-form stages).
+    fn q15(&self, i: usize) -> i16;
+    /// Writes taps `start..start + len` into `dst` (zero-padded) for a forward FFT and returns
+    /// the exponent offset to add to the FFT block exponent.
+    fn fill_block(&self, start: usize, len: usize, dst: &mut [i16]) -> i32;
+}
+
+/// Q1.15 taps used verbatim (bit-exact legacy path).
+impl TapSource for &[i16] {
+    #[inline]
+    fn len(&self) -> usize {
+        <[i16]>::len(self)
+    }
+    #[inline]
+    fn q15(&self, i: usize) -> i16 {
+        self[i]
+    }
+    fn fill_block(&self, start: usize, len: usize, dst: &mut [i16]) -> i32 {
+        dst.fill(0);
+        dst[..len].copy_from_slice(&self[start..start + len]);
+        0
+    }
+}
+
+/// Q1.31 taps accessed by index, stored per FFT partition with block-floating-point
+/// normalization ([`quantize_block_q31`]).
+pub(crate) struct Q31Taps<F: Fn(usize) -> i32> {
+    pub len: usize,
+    pub tap: F,
+}
+
+impl<F: Fn(usize) -> i32> TapSource for Q31Taps<F> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+    #[inline]
+    fn q15(&self, i: usize) -> i16 {
+        q31_to_q15((self.tap)(i))
+    }
+    fn fill_block(&self, start: usize, len: usize, dst: &mut [i16]) -> i32 {
+        quantize_block_q31(&self.tap, start, len, dst)
+    }
+}

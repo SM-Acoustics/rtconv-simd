@@ -119,6 +119,68 @@ pub struct NonUniformPlan {
     estimated_worst_ops_per_callback: usize,
 }
 
+/// Conservative upper bound on real multiply-accumulate-equivalent operations that one FDL
+/// stage can execute inside a single host callback of `host_block` samples.
+///
+/// Model (operations, not cycles):
+/// - A complex multiply-accumulate (CMAC) costs 4 real MACs; one partition costs `4 * (B + 1)`.
+/// - One `N`-point real transform is bounded by `5 * N * log2(N)` (Cooley–Tukey radix-2
+///   operation count, conservative for the half-length complex FFT used for real data).
+/// - A callback of `H` samples contains at most `t = ceil(H / B)` block triggers, each running
+///   one forward RFFT and (unless spread) one IFFT plus all `P` partitions.
+/// - A spread stage may additionally finish one in-flight block (one IFFT) and run at most
+///   `min(steps, ceil(H / step_interval) + 1)` CMAC sub-steps of `ceil(P / steps)` partitions for
+///   each of the `t + 1` blocks overlapping the callback, never more than `(t + 1) * P` partitions.
+fn fdl_stage_worst_ops(
+    block_size: usize,
+    num_partitions: usize,
+    slack_samples: usize,
+    spread_steps: usize,
+    host_block: usize,
+) -> Result<usize, ConvError> {
+    let overflow = ConvError::ArithmeticOverflow;
+    let n = block_size.checked_mul(2).ok_or(overflow)?;
+    let log2_n = n.trailing_zeros() as usize;
+    let transform_ops = n
+        .checked_mul(log2_n)
+        .and_then(|v| v.checked_mul(5))
+        .ok_or(overflow)?;
+    let partition_ops = (block_size + 1).checked_mul(4).ok_or(overflow)?;
+    let triggers = host_block.div_ceil(block_size).max(1);
+
+    let spread = spread_steps > 1 && slack_samples > 0;
+    let (transforms, partitions) = if !spread {
+        (
+            triggers.checked_mul(2).ok_or(overflow)?,
+            triggers.checked_mul(num_partitions).ok_or(overflow)?,
+        )
+    } else {
+        let blocks = triggers.checked_add(1).ok_or(overflow)?;
+        let effective_window = slack_samples.min(block_size - 1).max(1);
+        let step_interval = (effective_window / (spread_steps - 1)).max(1);
+        let steps_per_block = spread_steps.min(host_block.div_ceil(step_interval) + 1);
+        let parts_per_step = num_partitions.div_ceil(spread_steps);
+        let by_steps = blocks
+            .checked_mul(steps_per_block)
+            .and_then(|v| v.checked_mul(parts_per_step))
+            .ok_or(overflow)?;
+        let by_total = blocks.checked_mul(num_partitions).ok_or(overflow)?;
+        (
+            triggers.checked_mul(2).ok_or(overflow)? + 1,
+            by_steps.min(by_total),
+        )
+    };
+
+    transforms
+        .checked_mul(transform_ops)
+        .and_then(|t| {
+            partitions
+                .checked_mul(partition_ops)
+                .and_then(|c| t.checked_add(c))
+        })
+        .ok_or(overflow)
+}
+
 impl NonUniformPlan {
     /// Validates a caller-provided [`NonUniformConfig`] and builds a [`NonUniformPlan`].
     ///
@@ -190,7 +252,7 @@ impl NonUniformPlan {
                 let slack_samples = st.ir_offset - st.block_size;
 
                 // Spread partitions across available slack when slack >= host_block_max.
-                // Never exceeds num_partitions or block_size / host_block_max.
+                // Bounded by `num_partitions` and by 8 sub-steps.
                 let spread_steps =
                     if slack_samples >= config.host_block_max && config.host_block_max > 0 {
                         let max_slots = (slack_samples / config.host_block_max).max(1);
@@ -199,17 +261,14 @@ impl NonUniformPlan {
                         1
                     };
 
-                // Conservative op estimate: 1 FFT/IFFT (~5*N*log2(N)) + per-step CMAC bins * 4.
-                let bins = st.block_size + 1;
-                let parts_per_step = num_partitions.div_ceil(spread_steps);
-                let cmac_ops = parts_per_step
-                    .checked_mul(bins)
-                    .and_then(|v| v.checked_mul(4))
-                    .ok_or(ConvError::ArithmeticOverflow)?;
-                let fft_ops = fft_size * 40;
                 worst_ops = worst_ops
-                    .checked_add(cmac_ops)
-                    .and_then(|v| v.checked_add(fft_ops))
+                    .checked_add(fdl_stage_worst_ops(
+                        st.block_size,
+                        num_partitions,
+                        slack_samples,
+                        spread_steps,
+                        config.host_block_max,
+                    )?)
                     .ok_or(ConvError::ArithmeticOverflow)?;
 
                 NonUniformStagePlan {
@@ -321,7 +380,10 @@ impl NonUniformPlan {
         self.host_block_max
     }
 
-    /// Conservative upper-bound estimate of MAC/CMAC+FFT operations per callback.
+    /// Conservative upper-bound estimate of real multiply-accumulate-equivalent operations
+    /// (direct MACs, FFT/IFFT operation counts and 4 MACs per complex MAC) that a single host
+    /// callback of up to `host_block_max` samples can execute. This is an operation count, not a
+    /// cycle count or a WCET proof.
     #[inline]
     pub const fn estimated_worst_ops_per_callback(&self) -> usize {
         self.estimated_worst_ops_per_callback

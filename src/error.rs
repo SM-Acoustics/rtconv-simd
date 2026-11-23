@@ -1,5 +1,6 @@
 //! Typed errors for configuration, preparation, and boundary validation.
 
+use crate::artifact::ArtifactError;
 use core::fmt;
 
 /// Error returned during convolver configuration, preparation, or contract-checked calls.
@@ -60,6 +61,15 @@ pub enum ConvError {
     /// Non-uniform partitioned configuration violates causality, contiguity, stage count,
     /// or per-callback deadline/budget constraints.
     InvalidNonUniformConfig,
+    /// A FIR artifact (WAV / raw / text) could not be parsed or decoded.
+    Artifact(ArtifactError),
+}
+
+impl From<ArtifactError> for ConvError {
+    #[inline]
+    fn from(e: ArtifactError) -> Self {
+        Self::Artifact(e)
+    }
 }
 
 impl fmt::Display for ConvError {
@@ -121,8 +131,16 @@ impl fmt::Display for ConvError {
                     "invalid non-uniform partitioned configuration (causality, contiguity, stage count, or budget violation)"
                 )
             }
+            Self::Artifact(e) => write!(f, "FIR artifact error: {e}"),
         }
     }
 }
 
-impl core::error::Error for ConvError {}
+impl core::error::Error for ConvError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Artifact(e) => Some(e),
+            _ => None,
+        }
+    }
+}

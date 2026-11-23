@@ -414,6 +414,82 @@ fn verify_fixed_q15_nonuniform() {
     });
 }
 
+#[cfg(feature = "auto")]
+fn verify_auto() {
+    use rtconv_simd::auto::{
+        AutoConvolver, AutoStereoConvolver, workspace_len_f32, workspace_len_q15,
+    };
+
+    // 2,000-tap stereo IEEE-float WAV (rePhase "32 bits IEEE stereo" layout), built before arming.
+    let taps = 2000usize;
+    let mut data = Vec::new();
+    for k in 0..taps {
+        let v = if k == 1000 {
+            0.9f32
+        } else {
+            1e-3 * ((k % 7) as f32 - 3.0)
+        };
+        data.extend_from_slice(&v.to_le_bytes());
+        data.extend_from_slice(&(-v).to_le_bytes());
+    }
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    for v in [3u16, 2] {
+        wav.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in [48_000u32, 48_000 * 8] {
+        wav.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in [8u16, 32] {
+        wav.extend_from_slice(&v.to_le_bytes());
+    }
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    wav.extend_from_slice(&data);
+
+    let mut wsf = vec![0.0f32; 2 * workspace_len_f32(taps)];
+    let mut wsq = vec![0i16; workspace_len_q15(taps)];
+    let in_f = [0.25f32; 37];
+    let mut out_f = [0.0f32; 37];
+    let mut out_r = [0.0f32; 37];
+    let in_q = [8192i16; 37];
+    let mut out_q = [0i16; 37];
+    let mut inter = [4096i16; 64];
+
+    let mut stereo = None;
+    assert_zero_alloc("auto::stereo_f32::from_bytes", || {
+        stereo = Some(AutoStereoConvolver::from_bytes(&wav, &mut wsf).unwrap());
+    });
+    let stereo = stereo.as_mut().unwrap();
+    assert_zero_alloc("auto::stereo_f32::process", || {
+        for _ in 0..64 {
+            stereo
+                .process_f32(&in_f, &in_f, &mut out_f, &mut out_r)
+                .unwrap();
+            stereo.process_interleaved_i16(&mut inter).unwrap();
+        }
+    });
+    assert_zero_alloc("auto::stereo_f32::reset", || stereo.reset());
+
+    let mut q = None;
+    assert_zero_alloc("auto::q15::from_bytes", || {
+        q = Some(AutoConvolver::from_bytes(&wav, 1, &mut wsq).unwrap());
+    });
+    let q = q.as_mut().unwrap();
+    assert_zero_alloc("auto::q15::process", || {
+        for _ in 0..64 {
+            q.process_i16(&in_q, &mut out_q).unwrap();
+            q.process_f32(&in_f, &mut out_f).unwrap();
+        }
+        black_box(q.info());
+        black_box(q.saturation_count());
+    });
+    assert_zero_alloc("auto::q15::reset", || q.reset());
+}
+
 fn main() {
     // Warm up runtime environment and CPU feature detection before arming instrumentation.
     let backend = SimdBackend::detect_or_baseline();
@@ -435,6 +511,8 @@ fn main() {
     verify_fixed_q15_partitioned();
     #[cfg(feature = "fixed-nonuniform")]
     verify_fixed_q15_nonuniform();
+    #[cfg(feature = "auto")]
+    verify_auto();
 
     println!("no_alloc_rt: ALL ZERO-ALLOCATION AND POSITIVE-CONTROL CHECKS PASSED");
 }
