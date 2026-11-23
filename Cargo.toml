@@ -15,6 +15,9 @@ exclude = [
     ".gitignore",
     ".gitattributes",
     "rustfmt.toml",
+    "hardware/*",
+    "scripts/*",
+    "AGENTS.md",
     "VALIDATION.md",
     "RT_AUDIT.md",
 ]

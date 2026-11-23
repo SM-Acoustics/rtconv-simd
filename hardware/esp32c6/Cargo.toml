@@ -1,0 +1,14 @@
+[package]
+name = "rtconv-esp32c6-harness"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+rtconv-simd = { path = "../..", default-features = false, features = ["fixed-nonuniform"] }
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
