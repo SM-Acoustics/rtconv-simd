@@ -57,6 +57,9 @@ pub enum ConvError {
     /// Attempted to change runtime processing mode (e.g. hybrid tail spreading)
     /// while a partial cycle is in progress; call before streaming or after `reset()`.
     InvalidStateTransition,
+    /// Non-uniform partitioned configuration violates causality, contiguity, stage count,
+    /// or per-callback deadline/budget constraints.
+    InvalidNonUniformConfig,
 }
 
 impl fmt::Display for ConvError {
@@ -110,6 +113,12 @@ impl fmt::Display for ConvError {
                 write!(
                     f,
                     "cannot change hybrid tail-spreading mode mid-cycle; call before streaming or after reset()"
+                )
+            }
+            Self::InvalidNonUniformConfig => {
+                write!(
+                    f,
+                    "invalid non-uniform partitioned configuration (causality, contiguity, stage count, or budget violation)"
                 )
             }
         }

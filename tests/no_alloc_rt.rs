@@ -288,6 +288,36 @@ fn verify_phastft_audio_callback(backend: SimdBackend) {
     });
 }
 
+#[cfg(feature = "nonuniform")]
+fn verify_nonuniform(backend: SimdBackend) {
+    use rtconv_simd::{NonUniformConvolver, NonUniformPlan};
+
+    let ir = [0.25f32; 2048];
+    let input = [0.5f32; 32];
+    let mut output = [0.0f32; 32];
+    let fft = SimdFixedFftBackend::new(backend);
+    let plan = NonUniformPlan::default_profile(2048, 32).unwrap();
+    let req = NonUniformConvolver::memory_requirements(&plan, &fft).unwrap();
+    let mut ws = vec![0.0f32; req.total_f32];
+
+    let mut conv = None;
+    assert_zero_alloc("nonuniform::prepare", || {
+        conv = Some(NonUniformConvolver::prepare(&ir, plan, &mut ws, backend, fft).unwrap());
+    });
+    let conv = conv.as_mut().unwrap();
+    assert_zero_alloc("nonuniform::process_block", || {
+        for _ in 0..32 {
+            conv.process_block(&input, &mut output).unwrap();
+        }
+    });
+    assert_zero_alloc("nonuniform::reset", || conv.reset());
+    assert_zero_alloc("nonuniform::metadata", || {
+        black_box(conv.latency_samples());
+        black_box(conv.capabilities());
+        black_box(conv.deadline_misses());
+    });
+}
+
 fn main() {
     // Warm up runtime environment and CPU feature detection before arming instrumentation.
     let backend = SimdBackend::detect_or_baseline();
@@ -301,6 +331,8 @@ fn main() {
     verify_simd_fixed_and_tail_spreading(backend);
     #[cfg(feature = "phastft")]
     verify_phastft_audio_callback(backend);
+    #[cfg(feature = "nonuniform")]
+    verify_nonuniform(backend);
 
     println!("no_alloc_rt: ALL ZERO-ALLOCATION AND POSITIVE-CONTROL CHECKS PASSED");
 }
