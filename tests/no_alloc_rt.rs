@@ -318,6 +318,40 @@ fn verify_nonuniform(backend: SimdBackend) {
     });
 }
 
+#[cfg(feature = "fixed-q15")]
+fn verify_fixed_q15_direct() {
+    use rtconv_simd::{FixedQ15DirectConfig, FixedQ15DirectConvolver};
+
+    let ir = [8192i16; 128];
+    let input = [4096i16; 32];
+    let mut output = [0i16; 32];
+    let cfg = FixedQ15DirectConfig { max_ir_len: 128 };
+    let req = FixedQ15DirectConvolver::memory_requirements(cfg).unwrap();
+    let mut ws = vec![0i16; req.total_i16];
+
+    let mut conv = None;
+    assert_zero_alloc("fixed_q15_direct::prepare", || {
+        conv = Some(FixedQ15DirectConvolver::prepare(&ir, cfg, &mut ws).unwrap());
+    });
+    let conv = conv.as_mut().unwrap();
+    assert_zero_alloc("fixed_q15_direct::process_sample", || {
+        for &x in &input {
+            black_box(conv.process_sample(x));
+        }
+    });
+    assert_zero_alloc("fixed_q15_direct::process_block", || {
+        for _ in 0..16 {
+            conv.process_block(&input, &mut output).unwrap();
+        }
+    });
+    assert_zero_alloc("fixed_q15_direct::reset", || conv.reset());
+    assert_zero_alloc("fixed_q15_direct::metadata", || {
+        black_box(conv.latency_samples());
+        black_box(conv.capabilities());
+        black_box(conv.saturation_count());
+    });
+}
+
 fn main() {
     // Warm up runtime environment and CPU feature detection before arming instrumentation.
     let backend = SimdBackend::detect_or_baseline();
@@ -333,6 +367,8 @@ fn main() {
     verify_phastft_audio_callback(backend);
     #[cfg(feature = "nonuniform")]
     verify_nonuniform(backend);
+    #[cfg(feature = "fixed-q15")]
+    verify_fixed_q15_direct();
 
     println!("no_alloc_rt: ALL ZERO-ALLOCATION AND POSITIVE-CONTROL CHECKS PASSED");
 }
