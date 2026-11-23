@@ -24,6 +24,8 @@ extern crate std;
 pub mod direct;
 pub mod error;
 pub mod fft;
+#[cfg(feature = "fixed-q15")]
+pub mod fixed;
 pub mod hybrid;
 #[cfg(feature = "nonuniform")]
 pub mod nonuniform;
@@ -38,6 +40,11 @@ pub use direct::{DirectConfig, DirectConvolver, DirectMemoryRequirements};
 pub use error::ConvError;
 pub use fearless_simd::Level;
 pub use fft::{FftBackend, FftSize, MicroFftBackend};
+#[cfg(feature = "fixed-q15")]
+pub use fixed::{
+    FixedQ15DirectCapabilities, FixedQ15DirectConfig, FixedQ15DirectConvolver,
+    FixedQ15DirectMemoryRequirements,
+};
 pub use hybrid::{HybridConfig, HybridConvolver, HybridMemoryRequirements};
 #[cfg(feature = "nonuniform")]
 pub use nonuniform::{

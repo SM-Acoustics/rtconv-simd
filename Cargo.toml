@@ -32,6 +32,8 @@ std = ["fearless_simd/std"]
 phastft = ["std", "dep:phastft"]
 # Non-uniform partitioned convolution (NUPC) engine (`#![no_std]`, zero-alloc).
 nonuniform = []
+# Fixed-point Q1.15 direct FIR engine (`#![no_std]`, zero-alloc, FPU-free).
+fixed-q15 = []
 
 [dependencies]
 fearless_simd = { version = "1.2.0", default-features = false, features = ["force_support_fallback", "libm"] }
@@ -65,3 +67,8 @@ harness = false
 name = "nonuniform_bench"
 harness = false
 required-features = ["nonuniform"]
+
+[[bench]]
+name = "fixed_q15_bench"
+harness = false
+required-features = ["fixed-q15"]
