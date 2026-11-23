@@ -1,0 +1,7 @@
+# Agentic assurance — RTConv SIMD
+
+Adopts the proposed [SM-ENG-005 organization standard](https://github.com/SM-Acoustics/.github/blob/main/standards/SM-ENG-005-AGENTIC-ASSURANCE.md) after maintainer acceptance. Before that merge, this file provides a review proposal and does not override accepted baseline/ADRs.
+
+For every implementation or optimization, record the runtime entry point and prove it is exercised by the real convolution path. An unused SIMD kernel, dead feature branch, fake successful initialization or test-only dispatch is not complete. Independent reference convolution, block/partition invariance, denormal/overflow and boundary tests are mandatory for a VERIFIED claim. Compare release-mode CPU features, partition plans, latency, allocation/blocking behavior and maximal observed callback execution under stressed workloads. Distinguish target hardware/device from host benchmark; a CI build and synthetic throughput estimate are not a WCET proof.
+
+The default behavior for unsupported SIMD features must be an explicit supported fallback with measured behavior or a typed refusal; no silent numerical corruption. Preserve MSRV and existing CI/architecture gates. Never weaken tests, change security policy, publish/release or force-push to obtain green CI. Review new `unsafe`, aligned access, CPU feature detection and FFI for soundness. PRs must include provenance, exact commands, commit, target, golden vectors, negative cases, coverage of production dispatch, capability status and residual risks. No agent may approve its own changes.

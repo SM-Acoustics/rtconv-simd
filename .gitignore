@@ -1,2 +1,6 @@
 /target
 
+
+# Python assurance-tool caches
+__pycache__/
+*.py[cod]
