@@ -35,9 +35,9 @@ use crate::{Capabilities, EngineKind, SimdBackend};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HybridConfig {
     /// Length of the direct FIR head in samples. Must equal `tail_block_size`
-    /// (`32`, `64`, or `128`) to guarantee zero-latency alignment.
+    /// (power of two in `32..=8192`) to guarantee zero-latency alignment.
     pub head_len: usize,
-    /// Partition block size `B_tail` for the FFT tail (`32`, `64`, or `128`).
+    /// Partition block size `B_tail` for the FFT tail (power of two in `32..=8192`).
     pub tail_block_size: usize,
     /// Maximum supported total impulse response length in samples.
     pub max_ir_len: usize,

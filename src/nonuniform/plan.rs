@@ -4,7 +4,7 @@
 //! Validates causal zero-latency stage alignment (`ir_offset >= block_size` for FDL stages),
 //! contiguity, FFT block sizes, slack windows, and admission-control budgets before streaming.
 
-use crate::ConvError;
+use crate::{ConvError, FftSize};
 
 /// Maximum number of stages supported in a single [`NonUniformPlan`] (stack-allocated, zero heap).
 pub const MAX_NONUNIFORM_STAGES: usize = 8;
@@ -25,8 +25,9 @@ pub struct NonUniformStageConfig {
     pub ir_offset: usize,
     /// Number of taps `L_s` covered by this stage.
     pub ir_len: usize,
-    /// Partition block size `B_s`: `1` for Direct FIR head, or `32` / `64` / `128` for FDL stages
-    /// (corresponding to FFT sizes `N64` / `N128` / `N256`).
+    /// Partition block size `B_s`: `1` for Direct FIR head, or a supported power-of-two FDL
+    /// block size in `32..=8192` (corresponding to FFT sizes `N64` through `N16384`).
+    /// Note that fixed-point Q1.15 engines accept FDL block sizes up to `1024` (`N2048`).
     pub block_size: usize,
 }
 
@@ -81,7 +82,7 @@ pub struct NonUniformStagePlan {
     pub ir_offset: usize,
     /// Maximum tap count `L_s` allocated for this stage.
     pub ir_len: usize,
-    /// Block size `B_s` (`1` for Direct, `32 | 64 | 128` for FDL).
+    /// Block size `B_s` (`1` for Direct, power-of-two `32..=8192` for FDL).
     pub block_size: usize,
     /// FFT size `N_s = 2 * B_s` (`0` for Direct).
     pub fft_size: usize,
@@ -188,7 +189,7 @@ impl NonUniformPlan {
     /// - `1..=MAX_NONUNIFORM_STAGES` stages, `max_ir_len > 0`, `host_block_max > 0`.
     /// - Contiguous coverage starting at `ir_offset == 0` with zero gaps or overlaps.
     /// - Strict zero-latency causality: every FDL stage requires `ir_offset >= block_size`.
-    /// - Supported FDL block sizes: `32` (`N64`), `64` (`N128`), `128` (`N256`).
+    /// - Supported FDL block sizes: powers of two in `32..=8192` (`N64` through `N16384`).
     pub fn validate(config: NonUniformConfig<'_>) -> Result<Self, ConvError> {
         if config.max_ir_len == 0
             || config.host_block_max == 0
@@ -235,19 +236,12 @@ impl NonUniformPlan {
                     spread_steps: 1,
                 }
             } else {
-                if !matches!(st.block_size, 32 | 64 | 128) {
-                    return Err(ConvError::InvalidBlockSize {
-                        block_size: st.block_size,
-                    });
-                }
+                let fft = FftSize::from_block_size(st.block_size)?;
                 // Strict causal zero-latency condition: D_s >= B_s.
                 if st.ir_offset < st.block_size {
                     return Err(ConvError::InvalidNonUniformConfig);
                 }
-                let fft_size = st
-                    .block_size
-                    .checked_mul(2)
-                    .ok_or(ConvError::ArithmeticOverflow)?;
+                let fft_size = fft.len();
                 let num_partitions = st.ir_len.div_ceil(st.block_size);
                 let slack_samples = st.ir_offset - st.block_size;
 

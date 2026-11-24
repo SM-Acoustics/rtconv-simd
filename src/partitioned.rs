@@ -25,8 +25,8 @@ use crate::{Capabilities, EngineKind, SimdBackend};
 /// Configuration for [`PartitionedConvolver`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PartitionedConfig {
-    /// Processing block size `B` in samples (`32`, `64`, or `128`).
-    /// Corresponding FFT size is `N = 2 * B` (`64`, `128`, or `256`).
+    /// Processing block size `B` in samples (power of two in `32..=8192`).
+    /// Corresponding FFT size is `N = 2 * B` (`64..=16384`).
     pub block_size: usize,
     /// Maximum supported impulse response length in samples.
     pub max_ir_len: usize,

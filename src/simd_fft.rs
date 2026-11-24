@@ -1,31 +1,30 @@
 //! Embedded `#![no_std]`, zero-allocation SIMD FFT backend (`SimdFixedFftBackend`)
-//! for `N = 64, 128, 256` using `fearless_simd 1.2.0`.
+//! for `N = 64 ..= 16384` using `fearless_simd 1.2.0`.
 //!
 //! ## Design
 //! - Computes `N`-point RFFT and `N`-point normalized C2R IFFT via an inner
-//!   `M = N / 2`-point split-complex (SoA) DIT FFT (`M = 32, 64, 128`), halving
+//!   `M = N / 2`-point split-complex (SoA) DIT FFT (`M = 32 ..= 8192`), halving
 //!   the complex transform work compared to a full `N`-point complex IFFT.
 //! - Uses caller-provided external scratch (`N` floats = `re[0..M]` + `im[0..M]`),
-//!   avoiding large stack allocations (unlike `MicroFftBackend`'s 2 KiB stack buffer).
-//! - Precomputed `const` twiddle and bit-reversal tables (`simd_fft_tables.rs`);
-//!   zero runtime trig, zero `alloc`, zero `unsafe`.
+//!   avoiding large stack allocations on microcontrollers.
+//! - Single precomputed quarter-wave cosine ROM (`16,388 B` in `.rodata` / Flash,
+//!   derived in `f64` and rounded to `f32` under IEEE 754 RNE via `build.rs`),
+//!   indexed with power-of-two stride across all sizes `N = 64 ..= 16384`.
+//! - Bit-reversal indices are computed via `usize::reverse_bits()` (`0 B` bitrev ROM).
 //! - Stages 1 & 2 (`half = 1, 2`) are fused into a multiplication-free radix-4 pass.
-//! - Stages `half = 4, 8, 16, 32, 64` use explicit `fearless_simd 1.2.0` vector
-//!   butterflies (`f32x4` for `half = 4` and native `S::f32s` for `half >= LEN`).
+//! - Stages `half = 4 ..= M/2` use explicit `fearless_simd 1.2.0` vector butterflies
+//!   (`f32x4` for `half = 4` and native `S::f32s` for `half >= LEN`).
 //! - Falls back cleanly to scalar butterflies when `SimdBackend::scalar()` is
 //!   selected or when the target has no SIMD support (e.g. RISC-V).
 
 use crate::SimdBackend;
 use crate::error::ConvError;
 use crate::fft::{FftBackend, FftSize};
-use crate::simd_fft_tables::{
-    BITREV_32, BITREV_64, BITREV_128, R2C_COS_256, R2C_SIN_256, TW_COS_4, TW_COS_8, TW_COS_16,
-    TW_COS_32, TW_COS_64, TW_SIN_4, TW_SIN_8, TW_SIN_16, TW_SIN_32, TW_SIN_64,
-};
+use crate::simd_fft_tables::{MAX_FFT_SIZE, SIMD_FFT_ROM_BYTES, TW_QUARTER, twiddle_q1};
 use fearless_simd::{Simd, dispatch, f32x4, prelude::*};
 use fearless_simd_macros::simd;
 
-/// Allocation-free, `#![no_std]` SIMD FFT backend for `N = 64, 128, 256`.
+/// Allocation-free, `#![no_std]` SIMD FFT backend supporting `N = 64 ..= 16384`.
 #[derive(Clone, Copy, Debug)]
 pub struct SimdFixedFftBackend {
     backend: SimdBackend,
@@ -42,6 +41,13 @@ impl SimdFixedFftBackend {
     #[inline]
     pub const fn simd_backend(&self) -> SimdBackend {
         self.backend
+    }
+
+    /// Exact read-only twiddle table size in bytes (`16,388 B`, single quarter-wave table
+    /// shared across `N64` through `N16384`; `0 B` bit-reversal ROM).
+    #[inline]
+    pub const fn rom_table_bytes() -> usize {
+        SIMD_FFT_ROM_BYTES
     }
 }
 
@@ -116,38 +122,54 @@ fn radix4_stage01(re: &mut [f32], im: &mut [f32], m: usize, inverse: bool) {
     }
 }
 
-/// Scalar butterfly stage for `half >= 4`.
+/// Scalar butterfly stage for any `half >= 4` using the strided quarter-wave ROM.
+/// Keeps `base` as the outer loop for sequential L1d cache locality and splits `j` at `half / 2`
+/// into quadrant 1 and quadrant 2 to stay branchless in the inner loop.
 #[inline(always)]
-fn stage_scalar(
-    re: &mut [f32],
-    im: &mut [f32],
-    m: usize,
-    half: usize,
-    tw_cos: &[f32],
-    tw_sin: &[f32],
-    inverse: bool,
-) {
+fn stage_scalar(re: &mut [f32], im: &mut [f32], m: usize, half: usize, inverse: bool) {
     let step = half * 2;
+    let q_half = half / 2;
+    let tw_stride = (MAX_FFT_SIZE / 2) / half;
     let mut base = 0;
     if !inverse {
         while base < m {
             let mut j = 0;
-            while j < half {
+            let mut idx = 0;
+            while j < q_half {
+                let (wr, wi) = twiddle_q1(idx);
                 let i0 = base + j;
                 let i1 = i0 + half;
                 let ur = re[i0];
                 let ui = im[i0];
                 let vr = re[i1];
                 let vi = im[i1];
-                let wr = tw_cos[j];
-                let wi = tw_sin[j];
-                // t = v * (wr - j*wi)
                 let tr = vr * wr + vi * wi;
                 let ti = vi * wr - vr * wi;
                 re[i0] = ur + tr;
                 im[i0] = ui + ti;
                 re[i1] = ur - tr;
                 im[i1] = ui - ti;
+                idx += tw_stride;
+                j += 1;
+            }
+            let mut rem = 0;
+            while j < half {
+                let (s, c_neg) = twiddle_q1(rem);
+                let wr = -c_neg;
+                let wi = s;
+                let i0 = base + j;
+                let i1 = i0 + half;
+                let ur = re[i0];
+                let ui = im[i0];
+                let vr = re[i1];
+                let vi = im[i1];
+                let tr = vr * wr + vi * wi;
+                let ti = vi * wr - vr * wi;
+                re[i0] = ur + tr;
+                im[i0] = ui + ti;
+                re[i1] = ur - tr;
+                im[i1] = ui - ti;
+                rem += tw_stride;
                 j += 1;
             }
             base += step;
@@ -155,22 +177,42 @@ fn stage_scalar(
     } else {
         while base < m {
             let mut j = 0;
-            while j < half {
+            let mut idx = 0;
+            while j < q_half {
+                let (wr, wi) = twiddle_q1(idx);
                 let i0 = base + j;
                 let i1 = i0 + half;
                 let ur = re[i0];
                 let ui = im[i0];
                 let vr = re[i1];
                 let vi = im[i1];
-                let wr = tw_cos[j];
-                let wi = tw_sin[j];
-                // t = v * (wr + j*wi)
                 let tr = vr * wr - vi * wi;
                 let ti = vr * wi + vi * wr;
                 re[i0] = ur + tr;
                 im[i0] = ui + ti;
                 re[i1] = ur - tr;
                 im[i1] = ui - ti;
+                idx += tw_stride;
+                j += 1;
+            }
+            let mut rem = 0;
+            while j < half {
+                let (s, c_neg) = twiddle_q1(rem);
+                let wr = -c_neg;
+                let wi = s;
+                let i0 = base + j;
+                let i1 = i0 + half;
+                let ur = re[i0];
+                let ui = im[i0];
+                let vr = re[i1];
+                let vi = im[i1];
+                let tr = vr * wr - vi * wi;
+                let ti = vr * wi + vi * wr;
+                re[i0] = ur + tr;
+                im[i0] = ui + ti;
+                re[i1] = ur - tr;
+                im[i1] = ui - ti;
+                rem += tw_stride;
                 j += 1;
             }
             base += step;
@@ -181,8 +223,11 @@ fn stage_scalar(
 /// 4-wide SIMD butterfly stage (`half == 4`), works cleanly on SSE2, AVX2, NEON, WASM.
 #[inline(always)]
 fn stage_half4_simd<S: Simd>(simd: S, re: &mut [f32], im: &mut [f32], m: usize, inverse: bool) {
-    let wr = f32x4::from_slice(simd, &TW_COS_4);
-    let wi = f32x4::from_slice(simd, &TW_SIN_4);
+    let (c1, s1) = twiddle_q1(TW_QUARTER / 2); // cos(pi/4), sin(pi/4)
+    let tw_cos = [1.0f32, c1, 0.0f32, -c1];
+    let tw_sin = [0.0f32, s1, 1.0f32, s1];
+    let wr = f32x4::from_slice(simd, &tw_cos);
+    let wi = f32x4::from_slice(simd, &tw_sin);
     let mut base = 0;
     if !inverse {
         while base + 8 <= m {
@@ -219,38 +264,191 @@ fn stage_half4_simd<S: Simd>(simd: S, re: &mut [f32], im: &mut [f32], m: usize, 
     }
 }
 
-/// Native-width SIMD butterfly stage for `half >= 8` (exact multiple of `S::f32s::LEN` on SSE2/AVX2/NEON/WASM).
+/// Register-hoisted SIMD butterfly stage for `half == 8`: loads all 8 twiddles once outside the
+/// sequential `base` loop (1 native vector on AVX2, 2 `f32x4` vectors on SSE2/NEON/WASM).
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
+fn stage_half8_simd<S: Simd>(simd: S, re: &mut [f32], im: &mut [f32], m: usize, inverse: bool) {
+    let q = TW_QUARTER / 4;
+    let (c1, s1) = twiddle_q1(q);
+    let (c2, s2) = twiddle_q1(2 * q);
+    let (c3, s3) = twiddle_q1(3 * q);
+    let tw_cos = [1.0f32, c1, c2, c3, 0.0f32, -c3, -c2, -c1];
+    let tw_sin = [0.0f32, s1, s2, s3, 1.0f32, s3, s2, s1];
+
+    if S::f32s::LEN == 8 {
+        let wr = S::f32s::from_slice(simd, &tw_cos);
+        let wi = S::f32s::from_slice(simd, &tw_sin);
+        let mut base = 0;
+        if !inverse {
+            while base + 16 <= m {
+                let ur = S::f32s::from_slice(simd, &re[base..base + 8]);
+                let ui = S::f32s::from_slice(simd, &im[base..base + 8]);
+                let vr = S::f32s::from_slice(simd, &re[base + 8..base + 16]);
+                let vi = S::f32s::from_slice(simd, &im[base + 8..base + 16]);
+
+                let tr = vr.mul_add(wr, vi * wi);
+                let ti = vi.mul_add(wr, -(vr * wi));
+
+                (ur + tr).store_slice(&mut re[base..base + 8]);
+                (ui + ti).store_slice(&mut im[base..base + 8]);
+                (ur - tr).store_slice(&mut re[base + 8..base + 16]);
+                (ui - ti).store_slice(&mut im[base + 8..base + 16]);
+                base += 16;
+            }
+        } else {
+            while base + 16 <= m {
+                let ur = S::f32s::from_slice(simd, &re[base..base + 8]);
+                let ui = S::f32s::from_slice(simd, &im[base..base + 8]);
+                let vr = S::f32s::from_slice(simd, &re[base + 8..base + 16]);
+                let vi = S::f32s::from_slice(simd, &im[base + 8..base + 16]);
+
+                let tr = vr.mul_add(wr, -(vi * wi));
+                let ti = vr.mul_add(wi, vi * wr);
+
+                (ur + tr).store_slice(&mut re[base..base + 8]);
+                (ui + ti).store_slice(&mut im[base..base + 8]);
+                (ur - tr).store_slice(&mut re[base + 8..base + 16]);
+                (ui - ti).store_slice(&mut im[base + 8..base + 16]);
+                base += 16;
+            }
+        }
+        return;
+    }
+
+    let wr0 = f32x4::from_slice(simd, &tw_cos[0..4]);
+    let wi0 = f32x4::from_slice(simd, &tw_sin[0..4]);
+    let wr1 = f32x4::from_slice(simd, &tw_cos[4..8]);
+    let wi1 = f32x4::from_slice(simd, &tw_sin[4..8]);
+    let mut base = 0;
+    if !inverse {
+        while base + 16 <= m {
+            let ur0 = f32x4::from_slice(simd, &re[base..base + 4]);
+            let ui0 = f32x4::from_slice(simd, &im[base..base + 4]);
+            let vr0 = f32x4::from_slice(simd, &re[base + 8..base + 12]);
+            let vi0 = f32x4::from_slice(simd, &im[base + 8..base + 12]);
+            let tr0 = vr0.mul_add(wr0, vi0 * wi0);
+            let ti0 = vi0.mul_add(wr0, -(vr0 * wi0));
+            (ur0 + tr0).store_slice(&mut re[base..base + 4]);
+            (ui0 + ti0).store_slice(&mut im[base..base + 4]);
+            (ur0 - tr0).store_slice(&mut re[base + 8..base + 12]);
+            (ui0 - ti0).store_slice(&mut im[base + 8..base + 12]);
+
+            let ur1 = f32x4::from_slice(simd, &re[base + 4..base + 8]);
+            let ui1 = f32x4::from_slice(simd, &im[base + 4..base + 8]);
+            let vr1 = f32x4::from_slice(simd, &re[base + 12..base + 16]);
+            let vi1 = f32x4::from_slice(simd, &im[base + 12..base + 16]);
+            let tr1 = vr1.mul_add(wr1, vi1 * wi1);
+            let ti1 = vi1.mul_add(wr1, -(vr1 * wi1));
+            (ur1 + tr1).store_slice(&mut re[base + 4..base + 8]);
+            (ui1 + ti1).store_slice(&mut im[base + 4..base + 8]);
+            (ur1 - tr1).store_slice(&mut re[base + 12..base + 16]);
+            (ui1 - ti1).store_slice(&mut im[base + 12..base + 16]);
+            base += 16;
+        }
+    } else {
+        while base + 16 <= m {
+            let ur0 = f32x4::from_slice(simd, &re[base..base + 4]);
+            let ui0 = f32x4::from_slice(simd, &im[base..base + 4]);
+            let vr0 = f32x4::from_slice(simd, &re[base + 8..base + 12]);
+            let vi0 = f32x4::from_slice(simd, &im[base + 8..base + 12]);
+            let tr0 = vr0.mul_add(wr0, -(vi0 * wi0));
+            let ti0 = vr0.mul_add(wi0, vi0 * wr0);
+            (ur0 + tr0).store_slice(&mut re[base..base + 4]);
+            (ui0 + ti0).store_slice(&mut im[base..base + 4]);
+            (ur0 - tr0).store_slice(&mut re[base + 8..base + 12]);
+            (ui0 - ti0).store_slice(&mut im[base + 8..base + 12]);
+
+            let ur1 = f32x4::from_slice(simd, &re[base + 4..base + 8]);
+            let ui1 = f32x4::from_slice(simd, &im[base + 4..base + 8]);
+            let vr1 = f32x4::from_slice(simd, &re[base + 12..base + 16]);
+            let vi1 = f32x4::from_slice(simd, &im[base + 12..base + 16]);
+            let tr1 = vr1.mul_add(wr1, -(vi1 * wi1));
+            let ti1 = vr1.mul_add(wi1, vi1 * wr1);
+            (ur1 + tr1).store_slice(&mut re[base + 4..base + 8]);
+            (ui1 + ti1).store_slice(&mut im[base + 4..base + 8]);
+            (ur1 - tr1).store_slice(&mut re[base + 12..base + 16]);
+            (ui1 - ti1).store_slice(&mut im[base + 12..base + 16]);
+            base += 16;
+        }
+    }
+}
+
+/// Loads `lanes` quadrant-1 twiddles starting at `idx0` (`idx_last <= TW_QUARTER`).
+#[inline(always)]
+fn load_twiddle_q1_vec<S: Simd>(simd: S, idx0: usize, tw_stride: usize) -> (S::f32s, S::f32s) {
+    let lanes = S::f32s::LEN;
+    let mut wr_buf = [0.0f32; 16];
+    let mut wi_buf = [0.0f32; 16];
+    let mut l = 0;
+    let mut idx = idx0;
+    while l < lanes {
+        let (c, s) = twiddle_q1(idx);
+        wr_buf[l] = c;
+        wi_buf[l] = s;
+        idx += tw_stride;
+        l += 1;
+    }
+    (
+        S::f32s::from_slice(simd, &wr_buf[..lanes]),
+        S::f32s::from_slice(simd, &wi_buf[..lanes]),
+    )
+}
+
+/// Loads `lanes` quadrant-2 twiddles starting at `rem0 = idx0 - TW_QUARTER`.
+#[inline(always)]
+fn load_twiddle_q2_vec<S: Simd>(simd: S, rem0: usize, tw_stride: usize) -> (S::f32s, S::f32s) {
+    let lanes = S::f32s::LEN;
+    let mut wr_buf = [0.0f32; 16];
+    let mut wi_buf = [0.0f32; 16];
+    let mut l = 0;
+    let mut rem = rem0;
+    while l < lanes {
+        let (s, c_neg) = twiddle_q1(rem);
+        wr_buf[l] = -c_neg;
+        wi_buf[l] = s;
+        rem += tw_stride;
+        l += 1;
+    }
+    (
+        S::f32s::from_slice(simd, &wr_buf[..lanes]),
+        S::f32s::from_slice(simd, &wi_buf[..lanes]),
+    )
+}
+
+/// Native-width SIMD butterfly stage for any `half >= 16` (branchless Q1/Q2 split on `j`,
+/// hoisting each twiddle vector load outside the `base` group loop).
+#[inline(always)]
 fn stage_native_simd<S: Simd>(
     simd: S,
     re: &mut [f32],
     im: &mut [f32],
     m: usize,
     half: usize,
-    tw_cos: &[f32],
-    tw_sin: &[f32],
     inverse: bool,
 ) {
     let lanes = S::f32s::LEN;
-    if half < lanes || !half.is_multiple_of(lanes) {
-        stage_scalar(re, im, m, half, tw_cos, tw_sin, inverse);
+    let q_half = half / 2;
+    if q_half < lanes || !q_half.is_multiple_of(lanes) || lanes > 16 {
+        stage_scalar(re, im, m, half, inverse);
         return;
     }
     let step = half * 2;
-    let mut base = 0;
+    let tw_stride = (MAX_FFT_SIZE / 2) / half;
+    let vec_tw_step = lanes * tw_stride;
+
+    let mut j = 0;
+    let mut idx = 0;
     if !inverse {
-        while base < m {
-            let mut j = 0;
-            while j < half {
+        while j < q_half {
+            let (wr, wi) = load_twiddle_q1_vec(simd, idx, tw_stride);
+            let mut base = 0;
+            while base < m {
                 let i0 = base + j;
                 let i1 = i0 + half;
                 let ur = S::f32s::from_slice(simd, &re[i0..i0 + lanes]);
                 let ui = S::f32s::from_slice(simd, &im[i0..i0 + lanes]);
                 let vr = S::f32s::from_slice(simd, &re[i1..i1 + lanes]);
                 let vi = S::f32s::from_slice(simd, &im[i1..i1 + lanes]);
-                let wr = S::f32s::from_slice(simd, &tw_cos[j..j + lanes]);
-                let wi = S::f32s::from_slice(simd, &tw_sin[j..j + lanes]);
 
                 let tr = vr.mul_add(wr, vi * wi);
                 let ti = vi.mul_add(wr, -(vr * wi));
@@ -259,22 +457,46 @@ fn stage_native_simd<S: Simd>(
                 (ui + ti).store_slice(&mut im[i0..i0 + lanes]);
                 (ur - tr).store_slice(&mut re[i1..i1 + lanes]);
                 (ui - ti).store_slice(&mut im[i1..i1 + lanes]);
-                j += lanes;
+                base += step;
             }
-            base += step;
+            idx += vec_tw_step;
+            j += lanes;
         }
-    } else {
-        while base < m {
-            let mut j = 0;
-            while j < half {
+        let mut rem = 0;
+        while j < half {
+            let (wr, wi) = load_twiddle_q2_vec(simd, rem, tw_stride);
+            let mut base = 0;
+            while base < m {
                 let i0 = base + j;
                 let i1 = i0 + half;
                 let ur = S::f32s::from_slice(simd, &re[i0..i0 + lanes]);
                 let ui = S::f32s::from_slice(simd, &im[i0..i0 + lanes]);
                 let vr = S::f32s::from_slice(simd, &re[i1..i1 + lanes]);
                 let vi = S::f32s::from_slice(simd, &im[i1..i1 + lanes]);
-                let wr = S::f32s::from_slice(simd, &tw_cos[j..j + lanes]);
-                let wi = S::f32s::from_slice(simd, &tw_sin[j..j + lanes]);
+
+                let tr = vr.mul_add(wr, vi * wi);
+                let ti = vi.mul_add(wr, -(vr * wi));
+
+                (ur + tr).store_slice(&mut re[i0..i0 + lanes]);
+                (ui + ti).store_slice(&mut im[i0..i0 + lanes]);
+                (ur - tr).store_slice(&mut re[i1..i1 + lanes]);
+                (ui - ti).store_slice(&mut im[i1..i1 + lanes]);
+                base += step;
+            }
+            rem += vec_tw_step;
+            j += lanes;
+        }
+    } else {
+        while j < q_half {
+            let (wr, wi) = load_twiddle_q1_vec(simd, idx, tw_stride);
+            let mut base = 0;
+            while base < m {
+                let i0 = base + j;
+                let i1 = i0 + half;
+                let ur = S::f32s::from_slice(simd, &re[i0..i0 + lanes]);
+                let ui = S::f32s::from_slice(simd, &im[i0..i0 + lanes]);
+                let vr = S::f32s::from_slice(simd, &re[i1..i1 + lanes]);
+                let vi = S::f32s::from_slice(simd, &im[i1..i1 + lanes]);
 
                 let tr = vr.mul_add(wr, -(vi * wi));
                 let ti = vr.mul_add(wi, vi * wr);
@@ -283,9 +505,34 @@ fn stage_native_simd<S: Simd>(
                 (ui + ti).store_slice(&mut im[i0..i0 + lanes]);
                 (ur - tr).store_slice(&mut re[i1..i1 + lanes]);
                 (ui - ti).store_slice(&mut im[i1..i1 + lanes]);
-                j += lanes;
+                base += step;
             }
-            base += step;
+            idx += vec_tw_step;
+            j += lanes;
+        }
+        let mut rem = 0;
+        while j < half {
+            let (wr, wi) = load_twiddle_q2_vec(simd, rem, tw_stride);
+            let mut base = 0;
+            while base < m {
+                let i0 = base + j;
+                let i1 = i0 + half;
+                let ur = S::f32s::from_slice(simd, &re[i0..i0 + lanes]);
+                let ui = S::f32s::from_slice(simd, &im[i0..i0 + lanes]);
+                let vr = S::f32s::from_slice(simd, &re[i1..i1 + lanes]);
+                let vi = S::f32s::from_slice(simd, &im[i1..i1 + lanes]);
+
+                let tr = vr.mul_add(wr, -(vi * wi));
+                let ti = vr.mul_add(wi, vi * wr);
+
+                (ur + tr).store_slice(&mut re[i0..i0 + lanes]);
+                (ui + ti).store_slice(&mut im[i0..i0 + lanes]);
+                (ur - tr).store_slice(&mut re[i1..i1 + lanes]);
+                (ui - ti).store_slice(&mut im[i1..i1 + lanes]);
+                base += step;
+            }
+            rem += vec_tw_step;
+            j += lanes;
         }
     }
 }
@@ -293,14 +540,10 @@ fn stage_native_simd<S: Simd>(
 #[inline(always)]
 fn cfft_core_scalar(re: &mut [f32], im: &mut [f32], m: usize, inverse: bool) {
     radix4_stage01(re, im, m, inverse);
-    stage_scalar(re, im, m, 4, &TW_COS_4, &TW_SIN_4, inverse);
-    stage_scalar(re, im, m, 8, &TW_COS_8, &TW_SIN_8, inverse);
-    stage_scalar(re, im, m, 16, &TW_COS_16, &TW_SIN_16, inverse);
-    if m >= 64 {
-        stage_scalar(re, im, m, 32, &TW_COS_32, &TW_SIN_32, inverse);
-    }
-    if m >= 128 {
-        stage_scalar(re, im, m, 64, &TW_COS_64, &TW_SIN_64, inverse);
+    let mut half = 4;
+    while half < m {
+        stage_scalar(re, im, m, half, inverse);
+        half <<= 1;
     }
 }
 
@@ -308,26 +551,18 @@ fn cfft_core_scalar(re: &mut [f32], im: &mut [f32], m: usize, inverse: bool) {
 fn cfft_core_simd<S: Simd>(simd: S, re: &mut [f32], im: &mut [f32], m: usize, inverse: bool) {
     radix4_stage01(re, im, m, inverse);
     stage_half4_simd(simd, re, im, m, inverse);
-    stage_native_simd(simd, re, im, m, 8, &TW_COS_8, &TW_SIN_8, inverse);
-    stage_native_simd(simd, re, im, m, 16, &TW_COS_16, &TW_SIN_16, inverse);
-    if m >= 64 {
-        stage_native_simd(simd, re, im, m, 32, &TW_COS_32, &TW_SIN_32, inverse);
+    if m > 8 {
+        stage_half8_simd(simd, re, im, m, inverse);
     }
-    if m >= 128 {
-        stage_native_simd(simd, re, im, m, 64, &TW_COS_64, &TW_SIN_64, inverse);
+    let mut half = 16;
+    while half < m {
+        stage_native_simd(simd, re, im, m, half, inverse);
+        half <<= 1;
     }
 }
 
 #[inline(always)]
-fn r2c_untangle(
-    z_re: &[f32],
-    z_im: &[f32],
-    spec_re: &mut [f32],
-    spec_im: &mut [f32],
-    m: usize,
-    r2c_cos: &[f32],
-    r2c_sin: &[f32],
-) {
+fn r2c_untangle(z_re: &[f32], z_im: &[f32], spec_re: &mut [f32], spec_im: &mut [f32], m: usize) {
     // k = 0 (DC) and k = M (Nyquist)
     spec_re[0] = z_re[0] + z_im[0];
     spec_im[0] = 0.0;
@@ -339,6 +574,9 @@ fn r2c_untangle(
     spec_re[half_m] = z_re[half_m];
     spec_im[half_m] = -z_im[half_m];
 
+    // Stride into the N_MAX = 16384 quarter-wave table for N = 2*M:
+    // angle = 2*pi*k / (2*M) = 2*pi*(k * (MAX_FFT_SIZE / (2*M))) / MAX_FFT_SIZE.
+    let r2c_stride = (MAX_FFT_SIZE / 2) / m;
     let mut k = 1;
     while k < half_m {
         let mk = m - k;
@@ -352,8 +590,7 @@ fn r2c_untangle(
         let b_re = 0.5 * (b + d);
         let b_im = 0.5 * (c - a);
 
-        let wc = r2c_cos[k];
-        let ws = r2c_sin[k];
+        let (wc, ws) = twiddle_q1(k * r2c_stride);
 
         // W_N^k * B = (wc - j*ws) * (b_re + j*b_im)
         let wb_re = wc * b_re + ws * b_im;
@@ -368,31 +605,29 @@ fn r2c_untangle(
 }
 
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
 fn c2r_preprocess_bitrev(
     spec_re: &[f32],
     spec_im: &[f32],
     re: &mut [f32],
     im: &mut [f32],
     m: usize,
-    bitrev: &[u8],
-    r2c_cos: &[f32],
-    r2c_sin: &[f32],
 ) {
     // Fold 1/N = 0.5/M directly into the pre-process pass.
     let inv_n = 0.5 / (m as f32);
     let inv_m = 1.0 / (m as f32);
+    let bitrev_shift = usize::BITS - m.trailing_zeros();
 
-    // k = 0 -> bitrev[0] = 0
+    // k = 0 -> bitrev(0) = 0
     re[0] = inv_n * (spec_re[0] + spec_re[m]);
     im[0] = inv_n * (spec_re[0] - spec_re[m]);
 
     // k = M/2
     let half_m = m / 2;
-    let br_mid = bitrev[half_m] as usize;
+    let br_mid = half_m.reverse_bits() >> bitrev_shift;
     re[br_mid] = inv_m * spec_re[half_m];
     im[br_mid] = -inv_m * spec_im[half_m];
 
+    let r2c_stride = (MAX_FFT_SIZE / 2) / m;
     let mut k = 1;
     while k < half_m {
         let mk = m - k;
@@ -406,15 +641,14 @@ fn c2r_preprocess_bitrev(
         let d_re = inv_n * (xr1 - xr2);
         let d_im = inv_n * (xi1 + xi2);
 
-        let wc = r2c_cos[k];
-        let ws = r2c_sin[k];
+        let (wc, ws) = twiddle_q1(k * r2c_stride);
 
         // conj(W_N^k) * D = (wc + j*ws) * (d_re + j*d_im)
         let o_re = wc * d_re - ws * d_im;
         let o_im = wc * d_im + ws * d_re;
 
-        let br_k = bitrev[k] as usize;
-        let br_mk = bitrev[mk] as usize;
+        let br_k = k.reverse_bits() >> bitrev_shift;
+        let br_mk = mk.reverse_bits() >> bitrev_shift;
         re[br_k] = e_re - o_im;
         im[br_k] = e_im + o_re;
         re[br_mk] = e_re + o_im;
@@ -424,11 +658,14 @@ fn c2r_preprocess_bitrev(
 }
 
 #[inline(always)]
-fn tables_for(size: FftSize) -> (usize, &'static [u8], &'static [f32], &'static [f32]) {
-    match size {
-        FftSize::N64 => (32, &BITREV_32, &TW_COS_32, &TW_SIN_32),
-        FftSize::N128 => (64, &BITREV_64, &TW_COS_64, &TW_SIN_64),
-        FftSize::N256 => (128, &BITREV_128, &R2C_COS_256, &R2C_SIN_256),
+fn pack_time_bitrev(time_in: &[f32], re: &mut [f32], im: &mut [f32], m: usize) {
+    let bitrev_shift = usize::BITS - m.trailing_zeros();
+    let mut k = 0;
+    while k < m {
+        let br = k.reverse_bits() >> bitrev_shift;
+        re[k] = time_in[2 * br];
+        im[k] = time_in[2 * br + 1];
+        k += 1;
     }
 }
 
@@ -441,19 +678,11 @@ fn rfft_forward_simd_impl<S: Simd>(
     spec_im: &mut [f32],
     scratch: &mut [f32],
 ) {
-    let (m, bitrev, r2c_cos, r2c_sin) = tables_for(size);
+    let m = size.half_len();
     let (re, im) = scratch[..2 * m].split_at_mut(m);
-
-    let mut k = 0;
-    while k < m {
-        let br = bitrev[k] as usize;
-        re[br] = time_in[2 * k];
-        im[br] = time_in[2 * k + 1];
-        k += 1;
-    }
-
+    pack_time_bitrev(time_in, re, im, m);
     cfft_core_simd(simd, re, im, m, false);
-    r2c_untangle(re, im, spec_re, spec_im, m, r2c_cos, r2c_sin);
+    r2c_untangle(re, im, spec_re, spec_im, m);
 }
 
 #[simd]
@@ -465,12 +694,10 @@ fn rfft_inverse_simd_impl<S: Simd>(
     time_out: &mut [f32],
     scratch: &mut [f32],
 ) {
-    let (m, bitrev, r2c_cos, r2c_sin) = tables_for(size);
+    let m = size.half_len();
     let (re, im) = scratch[..2 * m].split_at_mut(m);
-
-    c2r_preprocess_bitrev(spec_re, spec_im, re, im, m, bitrev, r2c_cos, r2c_sin);
+    c2r_preprocess_bitrev(spec_re, spec_im, re, im, m);
     cfft_core_simd(simd, re, im, m, true);
-
     let mut k = 0;
     while k < m {
         time_out[2 * k] = re[k];
@@ -495,8 +722,8 @@ impl FftBackend for SimdFixedFftBackend {
     }
 
     #[inline]
-    fn supports_size(&self, size: FftSize) -> bool {
-        matches!(size, FftSize::N64 | FftSize::N128 | FftSize::N256)
+    fn supports_size(&self, _size: FftSize) -> bool {
+        true
     }
 
     #[inline]
@@ -535,17 +762,11 @@ impl FftBackend for SimdFixedFftBackend {
         }
 
         if self.backend.is_scalar() || self.backend.level().is_fallback() {
-            let (m, bitrev, r2c_cos, r2c_sin) = tables_for(size);
+            let m = size.half_len();
             let (re, im) = scratch[..2 * m].split_at_mut(m);
-            let mut k = 0;
-            while k < m {
-                let br = bitrev[k] as usize;
-                re[br] = time_in[2 * k];
-                im[br] = time_in[2 * k + 1];
-                k += 1;
-            }
+            pack_time_bitrev(time_in, re, im, m);
             cfft_core_scalar(re, im, m, false);
-            r2c_untangle(re, im, spec_re, spec_im, m, r2c_cos, r2c_sin);
+            r2c_untangle(re, im, spec_re, spec_im, m);
         } else {
             dispatch!(
                 self.backend.level(),
@@ -585,9 +806,9 @@ impl FftBackend for SimdFixedFftBackend {
         }
 
         if self.backend.is_scalar() || self.backend.level().is_fallback() {
-            let (m, bitrev, r2c_cos, r2c_sin) = tables_for(size);
+            let m = size.half_len();
             let (re, im) = scratch[..2 * m].split_at_mut(m);
-            c2r_preprocess_bitrev(spec_re, spec_im, re, im, m, bitrev, r2c_cos, r2c_sin);
+            c2r_preprocess_bitrev(spec_re, spec_im, re, im, m);
             cfft_core_scalar(re, im, m, true);
             let mut k = 0;
             while k < m {

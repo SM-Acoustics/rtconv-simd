@@ -9,10 +9,10 @@
 
 ## Backend Architecture
 
-1. **`MicroFftBackend`** ([`microfft 0.6.0`](https://docs.rs/microfft/0.6.0)): `#![no_std]` scalar radix-2 RFFT (`N/2` CFFT) and full `N`-point complex IFFT. Reliable baseline; zero external scratch.
-2. **`SimdFixedFftBackend`** ([`fearless_simd 1.2.0`](https://docs.rs/fearless_simd/1.2.0)): `#![no_std]` split-complex SoA DIT FFT running `N/2`-point CFFT for **both** R2C and C2R (halving inverse work vs `microfft`), fused multiplication-free radix-4 stages 0–1, explicit `f32x4` (`half = 4`) and `S::f32s` (`half >= 8`) SIMD butterflies, and `const` twiddle tables.
-3. **`PhastFftBackend`** ([`phastft 0.4.1`](https://docs.rs/phastft), `--features phastft`): Desktop-only SIMD R2C/C2R with pre-initialized `PlannerR2c32` and `default-features = false` (no `rayon`). Internally uses `fearless_simd 0.5.0` side-by-side with the core crate's `fearless_simd 1.2.0`.
+1. **`MicroFftBackend`** ([`microfft 0.6.0`](https://docs.rs/microfft/0.6.0), `features = ["size-16384"]`): `#![no_std]` scalar radix-2 RFFT (`N/2` CFFT) for `N = 64..=16384` (`16,380 B` sine ROM) and zero-stack Hermitian real-FFT inverse (`rfft` on time-reversed real-symmetric input inside the caller's `N`-float external scratch; `< 256 B` peak stack).
+2. **`SimdFixedFftBackend`** ([`fearless_simd 1.2.0`](https://docs.rs/fearless_simd/1.2.0)): `#![no_std]` split-complex SoA DIT FFT for `N = 64..=16384` running `N/2`-point CFFT for **both** R2C and C2R, fused multiplication-free radix-4 stages 0–1, register-hoisted `half = 4, 8` and branchless Q1/Q2 native `S::f32s` butterflies for `half >= 16`, single strided quarter-wave `f64`-derived IEEE 754 RNE `static` ROM (`16,388 B` generated in `build.rs`), and `usize::reverse_bits()` (`0 B` bit-reversal ROM).
+3. **`PhastFftBackend`** ([`phastft 0.4.1`](https://docs.rs/phastft), `--features phastft`): Desktop-only SIMD R2C/C2R for `N = 64..=16384` with pre-initialized `PlannerR2c32` and `default-features = false` (no `rayon`). Internally uses `fearless_simd 0.5.0` side-by-side with the core crate's `fearless_simd 1.2.0`.
 
 ## Disassembly Verification (`PROVEN`, `HOST_ONLY`)
 
-Inspecting `cargo rustc --lib --release -- --emit=asm` on `x86_64-pc-windows-gnu` confirms **`96` hardware FMA (`vfmadd`/`vfmsub`/`vfnmadd`), `527` 256-bit `ymm`, and `5,251` 128-bit `xmm`** references emitted directly inside `librtconv_simd` (up from `FMA=0, YMM=0` in the WO-001 baseline).
+Inspecting `cargo rustc --lib --release -- --emit=asm` on `x86_64-pc-windows-gnu` (0.2.0 baseline) confirmed **`96` hardware FMA (`vfmadd`/`vfmsub`/`vfnmadd`), `527` 256-bit `ymm`, and `5,251` 128-bit `xmm`** references emitted directly inside `librtconv_simd` (up from `FMA=0, YMM=0` in the WO-001 baseline).

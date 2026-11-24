@@ -290,11 +290,12 @@ fn test_fft_roundtrip_and_spectral_multiply_64_128_256() {
         let mut acc_re = vec![0.0f32; bins];
         let mut acc_im = vec![0.0f32; bins];
         let mut out = vec![0.0f32; n];
+        let mut scratch = vec![0.0f32; fft.scratch_len_f32(size)];
 
         // 1. Pure RFFT -> IFFT round-trip
-        fft.rfft_forward(size, &x, &mut x_re, &mut x_im, &mut [])
+        fft.rfft_forward(size, &x, &mut x_re, &mut x_im, &mut scratch)
             .unwrap();
-        fft.rfft_inverse(size, &x_re, &x_im, &mut out, &mut [])
+        fft.rfft_inverse(size, &x_re, &x_im, &mut out, &mut scratch)
             .unwrap();
         let m_rt = compute_metrics(&x, &out);
         assert!(
@@ -303,7 +304,7 @@ fn test_fft_roundtrip_and_spectral_multiply_64_128_256() {
         );
 
         // 2. Full RFFT -> CMAC -> IFFT circular convolution check
-        fft.rfft_forward(size, &h_time, &mut h_re, &mut h_im, &mut [])
+        fft.rfft_forward(size, &h_time, &mut h_re, &mut h_im, &mut scratch)
             .unwrap();
         cmac_simd(
             backend.level(),
@@ -314,7 +315,7 @@ fn test_fft_roundtrip_and_spectral_multiply_64_128_256() {
             &h_re,
             &h_im,
         );
-        fft.rfft_inverse(size, &acc_re, &acc_im, &mut out, &mut [])
+        fft.rfft_inverse(size, &acc_re, &acc_im, &mut out, &mut scratch)
             .unwrap();
 
         let mut expected = vec![0.0f32; n];

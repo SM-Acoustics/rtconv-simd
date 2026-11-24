@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Planned work is tracked in `docs/ROADMAP.md` and issue #13 (sub-issues #14–#24).
 
+### Large FFT Sizes `N512`–`N16384` (`f32`) & up to `N2048` (`Q1.15`) — Issue #14 (PR-A)
+
+#### Added
+- **`FftSize` extended to `N512`, `N1024`, `N2048`, `N4096`, `N8192`, `N16384`** (`block_size` `32..=8192`), plus `FftSize::ALL` and `FftSize::log2()`.
+- **Build-time single quarter-wave twiddle ROMs (`build.rs`)**: `TW_COS_Q: [f32; 4097]` (`16,388 B`, `f64` → `f32` IEEE 754 RNE) shared across `N64..=N16384` in `SimdFixedFftBackend` (`0 B` bit-reversal ROM via `usize::reverse_bits()`) and `TWIDDLE_COS_Q_2048: [i16; 513]` (`1,026 B`, `f64::round_ties_even`) shared across `N64..=N2048` in `fft_q15`.
+- **Zero-stack Q1.15 BFP FFT scratch API (`src/fixed/fft_q15.rs`)**: `rfft_q15_bfp_with_scratch` / `irfft_q15_bfp_with_scratch`, `fixed_fft_scratch_len_i32`, `fixed_fft_supports_size`, `fixed_fft_rom_bytes`, and convergent round-to-nearest-even (`round_even_sat_q15_from_i64`, `round_shift_even_i32/i64`).
+- **AES17 & ITU-R BS.1770-5 audio verification suite (`tests/aes17_audio_metrics.rs`)**: 997 Hz tone at `−60 dBFS`, `−1 dBFS`, and `0 dBFS` across `f32` (`N512..=N16384`, SNR `127.9–135.9 dB`, DR `193.4–201.8 dB`) and `Q1.15` (`N64..=N2048`, reporting exact `~2.7 dB/stage` BFP degradation vs the 98.09 dB Q1.15 sine ceiling and `0.00 dB` DR loss at `−60 dBFS`).
+- **131,072-tap adversarial `f64` oracle sweep (`tests/adversarial_reference.rs`)**: NUPC up to `N16384` (`SNR = 131.77 dB`, `max_abs = 6.122e-6`, `deadline_misses = 0`), plus large-FFT coverage in `tests/fft_backends_suite.rs` (`> 131.9 dB` across all backends), `tests/denormal_guard.rs`, `tests/no_alloc_rt.rs`, and `tests/auto_convolver.rs` (`workspace_len(131_072)` in `const` generics).
+- **GUM Type A + ISO 80000-1 / ABNT NBR 5891 benchmarks (`benches/nonuniform_bench.rs`, `benches/fft_backends_bench.rs`)**: 16k and 64k taps NUPC vs Hybrid (`HOST_ONLY`) and isolated FFT/CMAC/DOT calibration timings for Issue #15.
+
+#### Changed
+- **`MicroFftBackend`**: enabled `microfft` `size-16384` (`16,380 B` sine ROM) and replaced stack-allocated `[f32; N]` / `[Complex32; N]` arrays with caller-supplied `N`-float external scratch (`scratch_len_f32 == size.len()`) and a zero-stack Hermitian real-FFT inverse identity (`< 256 B` peak stack across `N64..=N16384`).
+- **`SimdFixedFftBackend` & `PhastFftBackend`**: generalized to `N64..=N16384`; `SimdFixedFftBackend` adds register-hoisted `half = 8` and branchless Q1/Q2 `S::f32s` butterflies.
+- **`PartitionedConfig`, `HybridConfig`, `NonUniformPlan::validate`, `auto::select_f32`**: extended to `block_size` `32..=8192`; `auto::worst_engine_len_f32` uses O(1) analytical regime endpoints so `workspace_len(131_072)` evaluates cleanly in `const` generics.
+- **`FixedQ15PartitionedConvolver` & `FixedQ15NonUniformConvolver`**: extended to `block_size <= 1024` (`N2048`), rejecting `> 1024` with `ConvError::UnsupportedFftSize`; moved per-stage `i64` spectral accumulators and FFT `re`/`im` work arrays into the caller `&mut [i16]` workspace (peak stack `< 512 B`, `FixedQ15NonUniformConvolver::instance_bytes < 4 KiB`, single convergent RNE rounding at final output). Legacy stack-based `rfft_q15_bfp` / `irfft_q15_bfp` remain capped at `N <= 256` and return `Err(ConvError::UnsupportedFftSize)` for `N > 256`.
+
 ## [0.2.0] - 2026-11-23
 
 Version bump on `main`. The `v0.2.0` tag, GitHub release and crates.io publication are maintainer actions.

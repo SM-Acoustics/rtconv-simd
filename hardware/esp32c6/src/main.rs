@@ -118,7 +118,7 @@ pub fn run_synthetic_suite() -> HarnessReport {
         block_size: 32,
         max_ir_len: 64,
     };
-    let mut pws = [0i16; 512];
+    let mut pws = [0i16; 1024];
     let mut q15_fdl_sats = 0u64;
     if let Ok(mut pconv) = FixedQ15PartitionedConvolver::prepare(&ir_q15, pcfg, &mut pws) {
         if pconv.process_block(&in_q15, &mut out_q15).is_ok() {

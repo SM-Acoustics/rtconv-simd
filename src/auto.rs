@@ -13,7 +13,7 @@
 //!    - `f32`: direct FIR costs `L` MACs/sample; the zero-latency hybrid (direct head of `B` taps
 //!      plus a uniformly partitioned overlap-save tail, Gardner 1995 / Garcia 2002) costs about
 //!      `B + 4 L / B + 20 log2(2B)` (head MACs + `4` real MACs per complex bin per partition +
-//!      forward/inverse FFT); the cheapest of `Direct`, `B = 32`, `64`, `128` is selected.
+//!      forward/inverse FFT); the cheapest of `Direct` and `B = 32..=8192` is selected.
 //!    - `Q1.15`: direct FIR up to [`Q15_DIRECT_MAX_TAPS`] taps, otherwise the multi-stage
 //!      zero-latency non-uniform convolver (`Direct 32 | B=32 | B=64 | B=128`).
 //! 3. **Gain headroom** for Q1.15: filters whose peak tap exceeds `1.0` are scaled by `2^-s`
@@ -114,7 +114,7 @@ pub enum AutoEngine {
 /// per partition block); not yet validated by on-device cycle measurements.
 pub const Q15_DIRECT_MAX_TAPS: usize = 128;
 
-const HYBRID_BLOCKS: [usize; 3] = [32, 64, 128];
+const HYBRID_BLOCKS: [usize; 9] = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
 
 const fn log2(x: usize) -> usize {
     (usize::BITS - 1 - x.leading_zeros()) as usize
@@ -190,46 +190,47 @@ pub const fn engine_len_q15(taps: usize) -> usize {
             let stop = if taps < end { taps } else { end };
             let p = (stop - off).div_ceil(b);
             let bins = b + 1;
-            // overlap(2B) + ir/fdl spectra + exponents + Q1.23 delay ring (2 words/sample).
-            total += 2 * b + 4 * p * bins + 2 * p + 2 * (off + b);
+            // overlap(2B) + ir/fdl spectra + exponents + i64 accumulators (8*bins)
+            // + Q1.23 delay ring (2 words/sample).
+            total += 2 * b + 4 * p * bins + 2 * p + 8 * bins + 2 * (off + b);
             max_fft = 2 * b;
             max_bins = bins;
         }
         i += 1;
     }
-    total + 2 * max_bins + max_fft
+    // Shared scratch: spec_re + spec_im + time_scratch + packed FFT butterfly scratch (4*max_fft)
+    total + 2 * max_bins + 5 * max_fft
 }
 
 const fn max(a: usize, b: usize) -> usize {
     if a > b { a } else { b }
 }
 
-/// Largest IR length (`<= max_taps`) that maps to each distinct `f32` engine, scanning the
-/// cost-model regime boundaries (all below a few thousand taps).
+/// Exact maximum `f32` engine workspace across all `1 <= L <= max_taps`.
+///
+/// Within each fixed engine regime (`Direct` or `Hybrid(b)`), `engine_len_f32(L)` is monotonically
+/// non-decreasing in `L`. For `hybrid_cost(L, b) = b + (4 * L) / b + 20 * log2(2 * b)`, transitions
+/// between consecutive regimes are monotone and occur at:
+/// - `Direct -> Hybrid(32)` at `L = 174` (regime end `173`),
+/// - `Hybrid(b) -> Hybrid(2b)` at `L = b * (b + 20) / 2 + b / 4` (regime end `L - 1`).
+///
+/// Checking `max_taps` and every analytical regime end `< max_taps` finds the exact maximum in
+/// `O(1)` time during `const` evaluation even for `max_taps >= 131_072`.
 const fn worst_engine_len_f32(max_taps: usize) -> usize {
     let mut worst = engine_len_f32(max_taps);
-    let mut l = 1;
-    let mut prev = select_f32(1);
-    let limit = if max_taps < 8192 { max_taps } else { 8192 };
-    while l <= limit {
-        let cur = select_f32(l);
-        if !engine_eq(cur, prev) {
-            worst = max(worst, engine_len_f32(l - 1));
-            prev = cur;
+    if max_taps > 173 {
+        worst = max(worst, engine_len_f32(173));
+    }
+    let mut i = 0;
+    while i + 1 < HYBRID_BLOCKS.len() {
+        let b = HYBRID_BLOCKS[i];
+        let regime_end = b * (b + 20) / 2 + b / 4 - 1;
+        if regime_end < max_taps {
+            worst = max(worst, engine_len_f32(regime_end));
         }
-        l += 1;
+        i += 1;
     }
     worst
-}
-
-const fn engine_eq(a: AutoEngine, b: AutoEngine) -> bool {
-    match (a, b) {
-        (AutoEngine::Direct, AutoEngine::Direct)
-        | (AutoEngine::FixedDirect, AutoEngine::FixedDirect)
-        | (AutoEngine::FixedNonUniform, AutoEngine::FixedNonUniform) => true,
-        (AutoEngine::Hybrid { block_size: x }, AutoEngine::Hybrid { block_size: y }) => x == y,
-        _ => false,
-    }
 }
 
 /// Total `f32` workspace for any IR of up to `max_taps` taps in the `f32` domain
@@ -399,8 +400,9 @@ enum Engine<'a> {
 
 /// Zero-latency, zero-allocation convolver that configures itself from the FIR it is given.
 ///
-/// The value is large for the Q1.15 non-uniform engine (it embeds `~17 KiB` of `i64`
-/// spectral accumulators); keep it in a `static` or long-lived task frame on MCUs.
+/// All signal buffers, FDL spectra, and Q1.15 accumulators live inside the caller-supplied
+/// workspace; the `AutoConvolver` value itself holds only compact engine metadata and scheduler
+/// state.
 pub struct AutoConvolver<'a> {
     engine: Engine<'a>,
     info: AutoInfo,

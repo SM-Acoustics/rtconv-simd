@@ -4,16 +4,20 @@
 //! Zero heap allocation, `#![forbid(unsafe_code)]`, FPU-free integer arithmetic with exact
 //! per-partition BFP exponent alignment and saturation telemetry.
 
-use crate::fixed::block_float::{Q31Taps, TapSource, bfp_normalize_acc_i64_to_q15};
-use crate::fixed::fft_q15::{irfft_q15_bfp, rfft_q15_bfp};
+use crate::fixed::block_float::{
+    Q31Taps, TapSource, bfp_normalize_acc_i16ws_to_q15, load_i64_from_i16, store_i64_to_i16,
+};
+use crate::fixed::fft_q15::{
+    fixed_fft_scratch_len_i16, fixed_fft_supports_size, irfft_q15_bfp_ws, rfft_q15_bfp_ws,
+};
 use crate::{ConvError, FftSize};
-
-const MAX_BINS: usize = 129; // N256 -> 256 / 2 + 1
 
 /// Configuration for [`FixedQ15PartitionedConvolver`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FixedQ15PartitionedConfig {
-    /// Processing block size `B` (`32`, `64`, or `128`, corresponding to FFT `N64`/`N128`/`N256`).
+    /// Processing block size `B` (`32`, `64`, `128`, `256`, `512`, or `1024`, corresponding to
+    /// FFT sizes `N64` through `N2048`). Larger block sizes are rejected with
+    /// [`ConvError::UnsupportedFftSize`].
     pub block_size: usize,
     /// Maximum supported impulse response length in taps.
     pub max_ir_len: usize,
@@ -69,9 +73,12 @@ pub struct FixedQ15PartitionedConvolver<'a> {
     fdl_im_off: usize,
     ir_exp_off: usize,
     fdl_exp_off: usize,
+    acc_re_off: usize,
+    acc_im_off: usize,
     acc_spec_re_off: usize,
     acc_spec_im_off: usize,
     time_scratch_off: usize,
+    fft_scratch_off: usize,
 }
 
 impl<'a> FixedQ15PartitionedConvolver<'a> {
@@ -83,21 +90,29 @@ impl<'a> FixedQ15PartitionedConvolver<'a> {
             return Err(ConvError::EmptyIr);
         }
         let fft = FftSize::from_block_size(config.block_size)?;
+        if !fixed_fft_supports_size(fft) {
+            return Err(ConvError::UnsupportedFftSize {
+                fft_size: fft.len(),
+            });
+        }
         let n = fft.len();
         let bins = fft.spectrum_bins();
         let num_partitions = config.max_ir_len.div_ceil(config.block_size);
         let part_bins = num_partitions
             .checked_mul(bins)
             .ok_or(ConvError::ArithmeticOverflow)?;
+        let fft_sc = fixed_fft_scratch_len_i16(fft);
 
         // Layout:
         // overlap_in(N) + ir_re(P*bins) + ir_im(P*bins) + fdl_re(P*bins) + fdl_im(P*bins)
-        // + ir_exp(P) + fdl_exp(P) + acc_spec_re(bins) + acc_spec_im(bins) + time_scratch(N)
+        // + ir_exp(P) + fdl_exp(P) + acc_re(4*bins) + acc_im(4*bins)
+        // + acc_spec_re(bins) + acc_spec_im(bins) + time_scratch(N) + fft_scratch(4*N)
         let total_i16 = n
             .checked_mul(2)
             .and_then(|v| v.checked_add(part_bins.checked_mul(4)?))
             .and_then(|v| v.checked_add(num_partitions.checked_mul(2)?))
-            .and_then(|v| v.checked_add(bins.checked_mul(2)?))
+            .and_then(|v| v.checked_add(bins.checked_mul(10)?))
+            .and_then(|v| v.checked_add(fft_sc))
             .ok_or(ConvError::ArithmeticOverflow)?;
         let total_bytes = total_i16
             .checked_mul(core::mem::size_of::<i16>())
@@ -169,6 +184,7 @@ impl<'a> FixedQ15PartitionedConvolver<'a> {
         let bins = fft_size.spectrum_bins();
         let p_total = req.num_partitions;
         let part_bins = p_total * bins;
+        let fft_sc = fixed_fft_scratch_len_i16(fft_size);
 
         let overlap_in_off = 0;
         let ir_re_off = overlap_in_off + n;
@@ -177,9 +193,12 @@ impl<'a> FixedQ15PartitionedConvolver<'a> {
         let fdl_im_off = fdl_re_off + part_bins;
         let ir_exp_off = fdl_im_off + part_bins;
         let fdl_exp_off = ir_exp_off + p_total;
-        let acc_spec_re_off = fdl_exp_off + p_total;
+        let acc_re_off = fdl_exp_off + p_total;
+        let acc_im_off = acc_re_off + 4 * bins;
+        let acc_spec_re_off = acc_im_off + 4 * bins;
         let acc_spec_im_off = acc_spec_re_off + bins;
         let time_scratch_off = acc_spec_im_off + bins;
+        let fft_scratch_off = time_scratch_off + n;
 
         workspace[..req.total_i16].fill(0);
 
@@ -196,9 +215,17 @@ impl<'a> FixedQ15PartitionedConvolver<'a> {
 
             let (before_im, from_im) = workspace.split_at_mut(ir_im_off);
             let (im_region, from_time) = from_im.split_at_mut(time_scratch_off - ir_im_off);
+            let (time_region, fft_sc_region) =
+                from_time.split_at_mut(fft_scratch_off - time_scratch_off);
             let re_slot = &mut before_im[ir_re_off + p * bins..ir_re_off + (p + 1) * bins];
             let im_slot = &mut im_region[p * bins..(p + 1) * bins];
-            let exp = rfft_q15_bfp(fft_size, &from_time[..n], re_slot, im_slot)?;
+            let exp = rfft_q15_bfp_ws(
+                fft_size,
+                &time_region[..n],
+                re_slot,
+                im_slot,
+                &mut fft_sc_region[..fft_sc],
+            )?;
             workspace[ir_exp_off + p] = (exp as i32 + exp_offset) as i16;
         }
 
@@ -220,9 +247,12 @@ impl<'a> FixedQ15PartitionedConvolver<'a> {
             fdl_im_off,
             ir_exp_off,
             fdl_exp_off,
+            acc_re_off,
+            acc_im_off,
             acc_spec_re_off,
             acc_spec_im_off,
             time_scratch_off,
+            fft_scratch_off,
         })
     }
 
@@ -238,6 +268,7 @@ impl<'a> FixedQ15PartitionedConvolver<'a> {
         let n = self.fft_size.len();
         let bins = self.bins;
         let p_total = self.num_partitions;
+        let fft_sc = fixed_fft_scratch_len_i16(self.fft_size);
 
         // 50% overlap-save shift: [prev_B | new_B]
         self.workspace.copy_within(
@@ -257,10 +288,18 @@ impl<'a> FixedQ15PartitionedConvolver<'a> {
         let (before_fdl_re, from_fdl_re) = self.workspace.split_at_mut(self.fdl_re_off);
         let (fdl_re_region, from_fdl_im) =
             from_fdl_re.split_at_mut(self.fdl_im_off - self.fdl_re_off);
+        let (fdl_im_region, fft_sc_region) =
+            from_fdl_im.split_at_mut(self.fft_scratch_off - self.fdl_im_off);
         let time_in = &before_fdl_re[self.overlap_in_off..self.overlap_in_off + n];
         let x_re_slot = &mut fdl_re_region[slot * bins..(slot + 1) * bins];
-        let x_im_slot = &mut from_fdl_im[slot * bins..(slot + 1) * bins];
-        let x_exp = rfft_q15_bfp(self.fft_size, time_in, x_re_slot, x_im_slot)?;
+        let x_im_slot = &mut fdl_im_region[slot * bins..(slot + 1) * bins];
+        let x_exp = rfft_q15_bfp_ws(
+            self.fft_size,
+            time_in,
+            x_re_slot,
+            x_im_slot,
+            &mut fft_sc_region[..fft_sc],
+        )?;
         self.workspace[self.fdl_exp_off + slot] = x_exp as i16;
 
         // Pass 1: find maximum product exponent across all active partitions for exact alignment.
@@ -278,9 +317,9 @@ impl<'a> FixedQ15PartitionedConvolver<'a> {
             return Ok(());
         }
 
-        // Pass 2: exponent-aligned i64 complex multiply-accumulate across all partitions.
-        let mut acc_re = [0i64; MAX_BINS];
-        let mut acc_im = [0i64; MAX_BINS];
+        // Pass 2: exponent-aligned i64 complex multiply-accumulate in caller workspace.
+        self.workspace[self.acc_re_off..self.acc_re_off + 4 * bins].fill(0);
+        self.workspace[self.acc_im_off..self.acc_im_off + 4 * bins].fill(0);
         for p in 0..self.active_partitions {
             let s = (self.fdl_head + p_total - p) % p_total;
             let pe = (self.workspace[self.fdl_exp_off + s] as i32)
@@ -299,37 +338,43 @@ impl<'a> FixedQ15PartitionedConvolver<'a> {
                 let hi = self.workspace[hi_base + k] as i64;
                 let pr = xr * hr - xi * hi;
                 let pi = xr * hi + xi * hr;
-                acc_re[k] += pr >> delta;
-                acc_im[k] += pi >> delta;
+                let re_off = self.acc_re_off + k * 4;
+                let im_off = self.acc_im_off + k * 4;
+                let ar = load_i64_from_i16(self.workspace, re_off) + (pr >> delta);
+                let ai = load_i64_from_i16(self.workspace, im_off) + (pi >> delta);
+                store_i64_to_i16(self.workspace, re_off, ar);
+                store_i64_to_i16(self.workspace, im_off, ai);
             }
         }
 
-        // Normalize i64 Q2.30 accumulator to Q1.15 BFP spectrum and run IRFFT.
+        // Normalize i64 Q2.30 accumulator to Q1.15 BFP spectrum and run IRFFT in caller scratch.
         let base_exp = max_exp.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
-        let (before_im, from_im) = self.workspace.split_at_mut(self.acc_spec_im_off);
-        let (im_region, from_time) =
-            from_im.split_at_mut(self.time_scratch_off - self.acc_spec_im_off);
-        let spec_re = &mut before_im[self.acc_spec_re_off..self.acc_spec_re_off + bins];
-        let spec_im = &mut im_region[..bins];
+        let (before_spec_re, from_spec_re) = self.workspace.split_at_mut(self.acc_spec_re_off);
+        let (spec_re_region, from_spec_im) =
+            from_spec_re.split_at_mut(self.acc_spec_im_off - self.acc_spec_re_off);
+        let (spec_im_region, from_time) =
+            from_spec_im.split_at_mut(self.time_scratch_off - self.acc_spec_im_off);
+        let (time_region, fft_sc_region) =
+            from_time.split_at_mut(self.fft_scratch_off - self.time_scratch_off);
+        let acc_re_ws = &before_spec_re[self.acc_re_off..self.acc_re_off + 4 * bins];
+        let acc_im_ws = &before_spec_re[self.acc_im_off..self.acc_im_off + 4 * bins];
+        let spec_re = &mut spec_re_region[..bins];
+        let spec_im = &mut spec_im_region[..bins];
 
-        let acc_exp = bfp_normalize_acc_i64_to_q15(
-            &acc_re[..bins],
-            &acc_im[..bins],
-            base_exp,
-            spec_re,
-            spec_im,
-        );
-        let sats = irfft_q15_bfp(
+        let acc_exp =
+            bfp_normalize_acc_i16ws_to_q15(acc_re_ws, acc_im_ws, bins, base_exp, spec_re, spec_im);
+        let sats = irfft_q15_bfp_ws(
             self.fft_size,
             spec_re,
             spec_im,
             acc_exp,
-            &mut from_time[..n],
+            &mut time_region[..n],
+            &mut fft_sc_region[..fft_sc],
         )?;
         self.saturation_count = self.saturation_count.saturating_add(sats);
 
         // Extract valid 50% overlap-save second half (`time_scratch[B..2*B]`).
-        output.copy_from_slice(&from_time[b..n]);
+        output.copy_from_slice(&time_region[b..n]);
         Ok(())
     }
 
@@ -342,6 +387,8 @@ impl<'a> FixedQ15PartitionedConvolver<'a> {
         self.workspace[self.fdl_re_off..self.fdl_re_off + part_bins].fill(0);
         self.workspace[self.fdl_im_off..self.fdl_im_off + part_bins].fill(0);
         self.workspace[self.fdl_exp_off..self.fdl_exp_off + self.num_partitions].fill(0);
+        self.workspace[self.acc_re_off..self.acc_re_off + 4 * self.bins].fill(0);
+        self.workspace[self.acc_im_off..self.acc_im_off + 4 * self.bins].fill(0);
         self.fdl_head = 0;
         self.saturation_count = 0;
     }

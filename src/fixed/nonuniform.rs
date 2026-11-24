@@ -4,9 +4,15 @@
 //! [`NonUniformBudget`]) and `Streaming Plane` ([`NonUniformScheduler`]) from `crate::nonuniform`,
 //! paired with the Q1.15/BFP `Numeric Plane` from `crate::fixed`.
 
-use crate::fixed::block_float::{Q31Taps, TapSource, bfp_normalize_acc_i64_to_q15};
-use crate::fixed::fft_q15::{irfft_q15_bfp_wide, rfft_q15_bfp};
-use crate::fixed::q15::round_sat_q15_from_i64;
+use crate::fixed::block_float::{
+    Q31Taps, TapSource, bfp_normalize_acc_i16ws_to_q15, load_i32_from_i16, load_i64_from_i16,
+    store_i64_to_i16,
+};
+use crate::fixed::fft_q15::{
+    fixed_fft_scratch_len_i16, fixed_fft_supports_size, irfft_q15_bfp_wide_second_half_ws,
+    rfft_q15_bfp_ws,
+};
+use crate::fixed::q15::round_even_sat_q15_from_i64;
 use crate::nonuniform::memory::stage_delay_ring_len;
 use crate::nonuniform::{
     BudgetVerdict, MAX_NONUNIFORM_STAGES, NonUniformBudget, NonUniformPlan, NonUniformScheduler,
@@ -14,12 +20,10 @@ use crate::nonuniform::{
 };
 use crate::{ConvError, FftSize};
 
-const MAX_BINS: usize = 129;
-
 /// Extra fractional bits carried by FDL stage outputs in the causal delay rings (`Q1.23` in
 /// `i32`, stored as two `i16` words). All stage contributions and the direct head are summed
-/// at this precision and rounded to Q1.15 exactly once per output sample, instead of rounding
-/// every stage separately (which costs ~`10*log10(stages)` dB of SNR).
+/// at this precision and rounded to Q1.15 exactly once per output sample (convergent RNE),
+/// instead of rounding every stage separately (which costs ~`10*log10(stages)` dB of SNR).
 const RING_FRAC_BITS: u32 = 8;
 
 #[inline(always)]
@@ -38,21 +42,21 @@ fn ring_store(ws: &mut [i16], off: usize, v: i32) {
 pub struct FixedQ15NonUniformMemoryRequirements {
     /// Time-domain state buffers (`i16`).
     pub state_i16: usize,
-    /// Frequency-domain BFP spectra + exponents (`i16`).
+    /// Frequency-domain BFP spectra, exponents, and per-stage `i64` accumulators (`i16`).
     pub spectral_i16: usize,
     /// Per-stage causal output delay rings (`i16`; each sample is a `Q1.23` `i32` stored as
     /// two `i16` words).
     pub delay_i16: usize,
-    /// Shared FFT time/spectrum scratch (`i16`).
+    /// Shared FFT time, spectrum, and butterfly scratch (`i16`).
     pub scratch_i16: usize,
     /// Total required `&mut [i16]` elements.
     pub total_i16: usize,
     /// Total required workspace size in bytes (`total_i16 * 2`).
     pub total_bytes: usize,
-    /// Size in bytes of the [`FixedQ15NonUniformConvolver`] value itself, which embeds the
-    /// per-stage `i64` spectral accumulators (`2 * MAX_NONUNIFORM_STAGES * 129 * 8` bytes).
-    /// This memory lives wherever the convolver is placed (stack, `static`, or a pool) and is
-    /// **not** part of the caller workspace; it is included in budget admission checks.
+    /// Size in bytes of the [`FixedQ15NonUniformConvolver`] value itself.
+    /// Per-stage `i64` spectral accumulators and FFT scratch live in the caller workspace, so
+    /// the instance holds only stage metadata and scheduler state; it is still included in
+    /// budget admission checks.
     pub instance_bytes: usize,
 }
 
@@ -86,6 +90,8 @@ struct FixedStageLayout {
     fdl_im_off: usize,
     ir_exp_off: usize,
     fdl_exp_off: usize,
+    acc_re_off: usize,
+    acc_im_off: usize,
     delay_ring_off: usize,
     delay_ring_len: usize,
     fdl_head: usize,
@@ -97,18 +103,20 @@ struct FixedStageLayout {
 }
 
 /// Zero-latency, caller-allocated Fixed-Point Q1.15/BFP Non-Uniform Partitioned Convolver.
+///
+/// Supports FDL stage FFT sizes `N64` through `N2048` (`block_size` `32..=1024`). Plans with
+/// larger FDL FFT stages return [`ConvError::UnsupportedFftSize`].
 pub struct FixedQ15NonUniformConvolver<'a> {
     plan: NonUniformPlan,
     stages: [FixedStageLayout; MAX_NONUNIFORM_STAGES],
     stage_count: usize,
     scheduler: NonUniformScheduler,
     workspace: &'a mut [i16],
-    acc_re: [[i64; MAX_BINS]; MAX_NONUNIFORM_STAGES],
-    acc_im: [[i64; MAX_BINS]; MAX_NONUNIFORM_STAGES],
     acc_max_exp: [i32; MAX_NONUNIFORM_STAGES],
     spec_re_scratch_off: usize,
     spec_im_scratch_off: usize,
     time_scratch_off: usize,
+    fft_scratch_off: usize,
     active_ir_len: usize,
     saturation_count: u64,
     budget_verdict: BudgetVerdict,
@@ -138,6 +146,11 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
                 }
                 NonUniformStageKind::Fdl => {
                     let fft = FftSize::from_len(st.fft_size)?;
+                    if !fixed_fft_supports_size(fft) {
+                        return Err(ConvError::UnsupportedFftSize {
+                            fft_size: st.fft_size,
+                        });
+                    }
                     let bins = fft.spectrum_bins();
                     let part_bins = st
                         .num_partitions
@@ -147,9 +160,11 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
                         .checked_add(st.fft_size)
                         .ok_or(ConvError::ArithmeticOverflow)?;
                     // ir_re, ir_im, fdl_re, fdl_im + ir_exp(P) + fdl_exp(P)
+                    // + acc_re(4*bins) + acc_im(4*bins)
                     let stage_spec = part_bins
                         .checked_mul(4)
                         .and_then(|v| v.checked_add(st.num_partitions.checked_mul(2)?))
+                        .and_then(|v| v.checked_add(bins.checked_mul(8)?))
                         .ok_or(ConvError::ArithmeticOverflow)?;
                     spectral_i16 = spectral_i16
                         .checked_add(stage_spec)
@@ -164,10 +179,11 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
             }
         }
 
-        // Shared scratch: spec_re(max_bins) + spec_im(max_bins) + time_scratch(max_fft)
+        // Shared scratch:
+        // spec_re(max_bins) + spec_im(max_bins) + time_scratch(max_fft) + fft_scratch(4 * max_fft)
         let scratch_i16 = max_bins
             .checked_mul(2)
-            .and_then(|v| v.checked_add(max_fft))
+            .and_then(|v| v.checked_add(max_fft.checked_mul(5)?))
             .ok_or(ConvError::ArithmeticOverflow)?;
         let total_i16 = state_i16
             .checked_add(spectral_i16)
@@ -311,6 +327,10 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
                     cursor += st.num_partitions;
                     let fdl_exp_off = cursor;
                     cursor += st.num_partitions;
+                    let acc_re_off = cursor;
+                    cursor += 4 * bins;
+                    let acc_im_off = cursor;
+                    cursor += 4 * bins;
                     let delay_ring_off = cursor;
                     cursor += 2 * dlen;
 
@@ -332,6 +352,8 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
                         fdl_im_off,
                         ir_exp_off,
                         fdl_exp_off,
+                        acc_re_off,
+                        acc_im_off,
                         delay_ring_off,
                         delay_ring_len: dlen,
                         fdl_head: 0,
@@ -352,6 +374,8 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
         cursor += max_bins;
         let time_scratch_off = cursor;
         cursor += max_fft;
+        let fft_scratch_off = cursor;
+        cursor += 4 * max_fft;
         workspace[..cursor].fill(0);
 
         // Pre-load direct coefficients and pre-transform all FDL IR partitions into Q15 BFP.
@@ -368,6 +392,7 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
                     let b = st.block_size;
                     let n = st.fft_size;
                     let bins = st.bins;
+                    let fft_sc = fixed_fft_scratch_len_i16(fft);
                     for p in 0..st.active_partitions {
                         let start = st_plan.ir_offset + p * b;
                         let end = (start + b)
@@ -382,10 +407,18 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
                         let (before_im, from_im) = workspace.split_at_mut(st.ir_im_off);
                         let (im_region, from_time) =
                             from_im.split_at_mut(time_scratch_off - st.ir_im_off);
+                        let (time_region, fft_sc_region) =
+                            from_time.split_at_mut(fft_scratch_off - time_scratch_off);
                         let re_slot =
                             &mut before_im[st.ir_re_off + p * bins..st.ir_re_off + (p + 1) * bins];
                         let im_slot = &mut im_region[p * bins..(p + 1) * bins];
-                        let exp = rfft_q15_bfp(fft, &from_time[..n], re_slot, im_slot)?;
+                        let exp = rfft_q15_bfp_ws(
+                            fft,
+                            &time_region[..n],
+                            re_slot,
+                            im_slot,
+                            &mut fft_sc_region[..fft_sc],
+                        )?;
                         workspace[st.ir_exp_off + p] = (exp as i32 + exp_offset) as i16;
                     }
                 }
@@ -399,12 +432,11 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
             stage_count: plan.stage_count(),
             scheduler,
             workspace,
-            acc_re: [[0i64; MAX_BINS]; MAX_NONUNIFORM_STAGES],
-            acc_im: [[0i64; MAX_BINS]; MAX_NONUNIFORM_STAGES],
             acc_max_exp: [i32::MIN; MAX_NONUNIFORM_STAGES],
             spec_re_scratch_off,
             spec_im_scratch_off,
             time_scratch_off,
+            fft_scratch_off,
             active_ir_len: ir.len(),
             saturation_count: 0,
             budget_verdict,
@@ -427,7 +459,7 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
 
     /// Processes a single Q1.15 sample with zero algorithmic latency.
     pub fn process_sample(&mut self, x: i16) -> Result<i16, ConvError> {
-        // Accumulate every stage at Q2.30 and round to Q1.15 exactly once.
+        // Accumulate every stage at Q2.30 and round to Q1.15 exactly once (convergent RNE).
         let mut sum: i64 = 0;
 
         for idx in 0..self.stage_count {
@@ -492,7 +524,7 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
         }
 
         self.scheduler.advance_sample();
-        let (y, sat) = round_sat_q15_from_i64(sum);
+        let (y, sat) = round_even_sat_q15_from_i64(sum);
         if sat {
             self.saturation_count = self.saturation_count.saturating_add(1);
         }
@@ -513,6 +545,7 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
         let p_total = st.num_partitions;
         let active_p = st.active_partitions;
         let fft = FftSize::from_len(n)?;
+        let fft_sc = fixed_fft_scratch_len_i16(fft);
 
         if active_p == 0 {
             self.workspace.copy_within(
@@ -550,13 +583,23 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
         let fdl_im_off = st.fdl_im_off;
         let fdl_exp_off = st.fdl_exp_off;
         let ir_exp_off = st.ir_exp_off;
+        let acc_re_off = st.acc_re_off;
+        let acc_im_off = st.acc_im_off;
         let time_off = self.time_scratch_off;
+        let fft_sc_off = self.fft_scratch_off;
 
         let (before_im, from_im) = self.workspace.split_at_mut(fdl_im_off);
         let (im_region, from_time) = from_im.split_at_mut(time_off - fdl_im_off);
+        let (time_region, fft_sc_region) = from_time.split_at_mut(fft_sc_off - time_off);
         let x_re_slot = &mut before_im[fdl_re_off + slot * bins..fdl_re_off + (slot + 1) * bins];
         let x_im_slot = &mut im_region[slot * bins..(slot + 1) * bins];
-        let x_exp = rfft_q15_bfp(fft, &from_time[..n], x_re_slot, x_im_slot)?;
+        let x_exp = rfft_q15_bfp_ws(
+            fft,
+            &time_region[..n],
+            x_re_slot,
+            x_im_slot,
+            &mut fft_sc_region[..fft_sc],
+        )?;
         self.workspace[fdl_exp_off + slot] = x_exp as i16;
 
         // Pre-compute max product exponent across all active partitions for this block so
@@ -571,8 +614,8 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
             }
         }
         self.acc_max_exp[idx] = max_exp;
-        self.acc_re[idx][..bins].fill(0);
-        self.acc_im[idx][..bins].fill(0);
+        self.workspace[acc_re_off..acc_re_off + 4 * bins].fill(0);
+        self.workspace[acc_im_off..acc_im_off + 4 * bins].fill(0);
 
         self.fdl_continue_cmac(idx, part_start, part_end, finish_ifft)
     }
@@ -611,8 +654,12 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
                     let hi = self.workspace[hi_base + k] as i64;
                     let pr = xr * hr - xi * hi;
                     let pi = xr * hi + xi * hr;
-                    self.acc_re[idx][k] += pr >> delta;
-                    self.acc_im[idx][k] += pi >> delta;
+                    let re_off = st.acc_re_off + k * 4;
+                    let im_off = st.acc_im_off + k * 4;
+                    let ar = load_i64_from_i16(self.workspace, re_off) + (pr >> delta);
+                    let ai = load_i64_from_i16(self.workspace, im_off) + (pi >> delta);
+                    store_i64_to_i16(self.workspace, re_off, ar);
+                    store_i64_to_i16(self.workspace, im_off, ai);
                 }
             }
         }
@@ -629,32 +676,43 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
             }
 
             let fft = FftSize::from_len(n)?;
+            let fft_sc = fixed_fft_scratch_len_i16(fft);
             let base_exp = max_exp.clamp(i8::MIN as i32, i8::MAX as i32) as i8;
-            let (before_im, from_im) = self.workspace.split_at_mut(self.spec_im_scratch_off);
-            let spec_re = &mut before_im[self.spec_re_scratch_off..self.spec_re_scratch_off + bins];
-            let spec_im = &mut from_im[..bins];
+            let (before_spec_re, from_spec_re) =
+                self.workspace.split_at_mut(self.spec_re_scratch_off);
+            let (spec_re_region, from_spec_im) =
+                from_spec_re.split_at_mut(self.spec_im_scratch_off - self.spec_re_scratch_off);
+            let (spec_im_region, from_fft_sc) =
+                from_spec_im.split_at_mut(self.fft_scratch_off - self.spec_im_scratch_off);
+            let acc_re_ws = &before_spec_re[st.acc_re_off..st.acc_re_off + 4 * bins];
+            let acc_im_ws = &before_spec_re[st.acc_im_off..st.acc_im_off + 4 * bins];
+            let spec_re = &mut spec_re_region[..bins];
+            let spec_im = &mut spec_im_region[..bins];
 
-            let acc_exp = bfp_normalize_acc_i64_to_q15(
-                &self.acc_re[idx][..bins],
-                &self.acc_im[idx][..bins],
-                base_exp,
-                spec_re,
-                spec_im,
+            let acc_exp = bfp_normalize_acc_i16ws_to_q15(
+                acc_re_ws, acc_im_ws, bins, base_exp, spec_re, spec_im,
             );
-            let mut time_wide = [0i32; 256];
-            let sats = irfft_q15_bfp_wide(
+            let (sats, is_zero) = irfft_q15_bfp_wide_second_half_ws(
                 fft,
                 spec_re,
                 spec_im,
                 acc_exp,
                 RING_FRAC_BITS,
-                &mut time_wide[..n],
+                &mut from_fft_sc[..fft_sc],
             )?;
             self.saturation_count = self.saturation_count.saturating_add(sats);
 
-            for (k, &sample) in time_wide[b..n].iter().enumerate() {
-                let r = (wp + k) % st.delay_ring_len;
-                ring_store(self.workspace, st.delay_ring_off + 2 * r, sample);
+            if is_zero {
+                for k in 0..b {
+                    let r = (wp + k) % st.delay_ring_len;
+                    ring_store(self.workspace, st.delay_ring_off + 2 * r, 0);
+                }
+            } else {
+                for k in 0..b {
+                    let sample = load_i32_from_i16(self.workspace, self.fft_scratch_off + k * 2);
+                    let r = (wp + k) % st.delay_ring_len;
+                    ring_store(self.workspace, st.delay_ring_off + 2 * r, sample);
+                }
             }
             self.scheduler.stage_state_mut(idx).delay_write_pos = wp + b;
         }
@@ -675,12 +733,12 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
                 self.workspace[st.fdl_re_off..st.fdl_re_off + part_bins].fill(0);
                 self.workspace[st.fdl_im_off..st.fdl_im_off + part_bins].fill(0);
                 self.workspace[st.fdl_exp_off..st.fdl_exp_off + st.num_partitions].fill(0);
+                self.workspace[st.acc_re_off..st.acc_re_off + 4 * st.bins].fill(0);
+                self.workspace[st.acc_im_off..st.acc_im_off + 4 * st.bins].fill(0);
                 self.workspace[st.delay_ring_off..st.delay_ring_off + 2 * st.delay_ring_len]
                     .fill(0);
                 st.fdl_head = 0;
             }
-            self.acc_re[idx].fill(0);
-            self.acc_im[idx].fill(0);
             self.acc_max_exp[idx] = i32::MIN;
         }
         self.scheduler.reset(&self.plan);

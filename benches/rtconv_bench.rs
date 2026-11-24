@@ -283,12 +283,13 @@ fn main() {
         let mut acc_re = vec![0.0f32; bins];
         let mut acc_im = vec![0.0f32; bins];
         let mut out = vec![0.0f32; n];
-        fft.rfft_forward(size, &h, &mut h_re, &mut h_im, &mut [])
+        let mut scratch = vec![0.0f32; fft.scratch_len_f32(size)];
+        fft.rfft_forward(size, &h, &mut h_re, &mut h_im, &mut scratch)
             .unwrap();
 
         let st = measure_us(
             || {
-                fft.rfft_forward(size, black_box(&x), &mut x_re, &mut x_im, &mut [])
+                fft.rfft_forward(size, black_box(&x), &mut x_re, &mut x_im, &mut scratch)
                     .unwrap();
                 acc_re.fill(0.0);
                 acc_im.fill(0.0);
@@ -304,7 +305,7 @@ fn main() {
                     bins,
                     0,
                 );
-                fft.rfft_inverse(size, &acc_re, &acc_im, black_box(&mut out), &mut [])
+                fft.rfft_inverse(size, &acc_re, &acc_im, black_box(&mut out), &mut scratch)
                     .unwrap();
             },
             WARMUP,
