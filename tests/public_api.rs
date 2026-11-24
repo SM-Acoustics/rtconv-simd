@@ -24,7 +24,11 @@ fn test_capabilities_distinguish_scalar_vs_simd_and_fft_simd() {
 
     let micro = MicroFftBackend::new();
     assert!(!micro.is_simd_accelerated());
-    assert_eq!(micro.scratch_len_f32(FftSize::N64), 0);
+    assert_eq!(micro.scratch_len_f32(FftSize::N64), 64);
+    for size in FftSize::ALL {
+        assert!(micro.supports_size(size));
+        assert_eq!(micro.scratch_len_f32(size), size.len());
+    }
 
     let pcfg = PartitionedConfig {
         block_size: 32,
@@ -43,6 +47,11 @@ fn test_capabilities_distinguish_scalar_vs_simd_and_fft_simd() {
     let fixed_sc = SimdFixedFftBackend::new(scalar);
     assert!(!fixed_sc.is_simd_accelerated());
     assert_eq!(fixed_sc.scratch_len_f32(FftSize::N64), 64);
+    assert_eq!(SimdFixedFftBackend::rom_table_bytes(), 16_388);
+    for size in FftSize::ALL {
+        assert!(fixed_sc.supports_size(size));
+        assert_eq!(fixed_sc.scratch_len_f32(size), size.len());
+    }
 
     let hcfg = HybridConfig {
         head_len: 64,

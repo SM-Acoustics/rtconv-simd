@@ -206,6 +206,250 @@ fn hybrid_burst_and_spread_match_oracle_with_fragmented_host_blocks() {
     }
 }
 
+/// Independent `f64` radix-2 FFT for exact `f64` linear convolution up to 131k+ taps.
+fn cfft_f64(re: &mut [f64], im: &mut [f64], inverse: bool) {
+    let n = re.len();
+    let bits = n.trailing_zeros();
+    for i in 0..n {
+        let rev = i.reverse_bits() >> (usize::BITS - bits);
+        if i < rev {
+            re.swap(i, rev);
+            im.swap(i, rev);
+        }
+    }
+    let sign = if inverse { 1.0 } else { -1.0 };
+    let mut half = 1usize;
+    while half < n {
+        let step = half << 1;
+        let ang_step = sign * 2.0 * core::f64::consts::PI / (step as f64);
+        for base in (0..n).step_by(step) {
+            for j in 0..half {
+                let ang = ang_step * (j as f64);
+                let (si, co) = ang.sin_cos();
+                let i0 = base + j;
+                let i1 = i0 + half;
+                let tr = re[i1] * co - im[i1] * si;
+                let ti = re[i1] * si + im[i1] * co;
+                re[i1] = re[i0] - tr;
+                im[i1] = im[i0] - ti;
+                re[i0] += tr;
+                im[i0] += ti;
+            }
+        }
+        half = step;
+    }
+    if inverse {
+        let inv = 1.0 / (n as f64);
+        for (r, i) in re.iter_mut().zip(im.iter_mut()) {
+            *r *= inv;
+            *i *= inv;
+        }
+    }
+}
+
+/// Fast exact `f64` causal linear convolution returning `y[0..x.len()]`.
+fn oracle_fast_f64(ir: &[f32], x: &[f32]) -> Vec<f64> {
+    let total = ir.len() + x.len() - 1;
+    let n = total.next_power_of_two();
+    let mut hr = vec![0.0f64; n];
+    let mut hi = vec![0.0f64; n];
+    let mut xr = vec![0.0f64; n];
+    let mut xi = vec![0.0f64; n];
+    for (i, &v) in ir.iter().enumerate() {
+        hr[i] = v as f64;
+    }
+    for (i, &v) in x.iter().enumerate() {
+        xr[i] = v as f64;
+    }
+    cfft_f64(&mut hr, &mut hi, false);
+    cfft_f64(&mut xr, &mut xi, false);
+    for k in 0..n {
+        let re = hr[k] * xr[k] - hi[k] * xi[k];
+        let im = hr[k] * xi[k] + hi[k] * xr[k];
+        hr[k] = re;
+        hi[k] = im;
+    }
+    cfft_f64(&mut hr, &mut hi, true);
+    hr.truncate(x.len());
+    hr
+}
+
+#[test]
+fn large_ir_sweep_up_to_131k_taps_matches_f64_oracle_over_100db() {
+    let mut rng = Rng::new(0x131_072);
+    // Cross-verify the fast f64 FFT oracle against the direct O(L*M) f64 oracle.
+    {
+        let h_chk = rng.vec(1025, 0.25);
+        let x_chk = rng.vec(1500, 0.8);
+        let d_ref = oracle(&h_chk, &x_chk);
+        let f_ref = oracle_fast_f64(&h_chk, &x_chk);
+        let diff = d_ref
+            .iter()
+            .zip(&f_ref)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max);
+        assert!(diff < 1e-11, "fast f64 oracle mismatch: {diff:.3e}");
+    }
+
+    let backend = SimdBackend::detect_or_baseline();
+    let simd_fft = SimdFixedFftBackend::new(backend);
+    let micro_fft = MicroFftBackend::new();
+
+    // 1. PartitionedConvolver across all new large block sizes B = 256..=8192 up to 131_072 taps.
+    for &(ir_len, b) in &[
+        (16_384usize, 256usize),
+        (32_769, 512),
+        (65_536, 1024),
+        (65_537, 2048),
+        (131_072, 4096),
+        (131_072, 8192),
+    ] {
+        // Decaying broadband room-like IR
+        let ir: Vec<f32> = (0..ir_len)
+            .map(|k| rng.next_f32() * 0.2 * (-(k as f32) * 5.0 / ir_len as f32).exp())
+            .collect();
+        let x_len = (4 * b).max(16_384);
+        let x = rng.vec(x_len, 0.8);
+        let reference = oracle_fast_f64(&ir, &x);
+
+        let cfg = PartitionedConfig {
+            block_size: b,
+            max_ir_len: ir_len,
+        };
+        for is_simd in [true, false] {
+            let mut out = vec![0.0f32; x_len];
+            if is_simd {
+                let req = PartitionedConvolver::memory_requirements(cfg, &simd_fft).unwrap();
+                let mut ws = vec![0.0f32; req.total_f32];
+                let mut conv =
+                    PartitionedConvolver::prepare(&ir, cfg, &mut ws, backend, simd_fft).unwrap();
+                for (ib, ob) in x.chunks_exact(b).zip(out.chunks_exact_mut(b)) {
+                    conv.process_block(ib, ob).unwrap();
+                }
+            } else {
+                let req = PartitionedConvolver::memory_requirements(cfg, &micro_fft).unwrap();
+                let mut ws = vec![0.0f32; req.total_f32];
+                let mut conv =
+                    PartitionedConvolver::prepare(&ir, cfg, &mut ws, backend, micro_fft).unwrap();
+                for (ib, ob) in x.chunks_exact(b).zip(out.chunks_exact_mut(b)) {
+                    conv.process_block(ib, ob).unwrap();
+                }
+            }
+            let (max_abs, snr) = compare(&reference, &out);
+            assert!(
+                snr > 100.0,
+                "large partitioned ir_len={ir_len} B={b} simd={is_simd} max_abs={max_abs:e} snr={snr:.2} dB"
+            );
+        }
+    }
+
+    // 2. HybridConvolver (SPREAD) with large tail blocks B = 256, 512, 1024 on fragmented host blocks.
+    for &(ir_len, b) in &[(16_385usize, 256usize), (65_536, 512), (131_072, 1024)] {
+        let ir: Vec<f32> = (0..ir_len)
+            .map(|k| rng.next_f32() * 0.2 * (-(k as f32) * 5.0 / ir_len as f32).exp())
+            .collect();
+        let x = rng.vec(8192, 0.8);
+        let reference = oracle_fast_f64(&ir, &x);
+        let cfg = HybridConfig {
+            head_len: b,
+            tail_block_size: b,
+            max_ir_len: ir_len,
+        };
+        let req = HybridConvolver::memory_requirements(cfg, &simd_fft).unwrap();
+        let mut ws = vec![0.0f32; req.total_f32];
+        let mut conv = HybridConvolver::prepare_with_tail_spreading(
+            &ir, cfg, &mut ws, backend, simd_fft, true,
+        )
+        .unwrap();
+        let mut out = vec![0.0f32; x.len()];
+        let mut pos = 0;
+        for hb in host_blocks(&mut rng, x.len(), 256) {
+            conv.process_block(&x[pos..pos + hb], &mut out[pos..pos + hb])
+                .unwrap();
+            pos += hb;
+        }
+        let (max_abs, snr) = compare(&reference, &out);
+        assert!(
+            snr > 100.0,
+            "large hybrid SPREAD ir_len={ir_len} B={b} max_abs={max_abs:e} snr={snr:.2} dB"
+        );
+    }
+
+    // 3. Multi-stage NonUniformConvolver up to 131_072 taps with stages up to B=8192 (N16384).
+    #[cfg(feature = "nonuniform")]
+    {
+        use rtconv_simd::{
+            NonUniformConfig, NonUniformConvolver, NonUniformPlan, NonUniformStageConfig,
+        };
+        let ir_len = 131_072usize;
+        let ir: Vec<f32> = (0..ir_len)
+            .map(|k| rng.next_f32() * 0.15 * (-(k as f32) * 5.0 / ir_len as f32).exp())
+            .collect();
+        // Process 140_000 samples (> ir_len) so every stage including the B=8192 tail fires
+        // multiple full blocks and aligns causally into the output stream.
+        let x = rng.vec(140_000, 0.8);
+        let reference = oracle_fast_f64(&ir, &x);
+
+        let stages = [
+            NonUniformStageConfig {
+                ir_offset: 0,
+                ir_len: 64,
+                block_size: 1,
+            },
+            NonUniformStageConfig {
+                ir_offset: 64,
+                ir_len: 192,
+                block_size: 64,
+            },
+            NonUniformStageConfig {
+                ir_offset: 256,
+                ir_len: 768,
+                block_size: 256,
+            },
+            NonUniformStageConfig {
+                ir_offset: 1024,
+                ir_len: 3072,
+                block_size: 1024,
+            },
+            NonUniformStageConfig {
+                ir_offset: 4096,
+                ir_len: 12_288,
+                block_size: 4096,
+            },
+            NonUniformStageConfig {
+                ir_offset: 16_384,
+                ir_len: ir_len - 16_384,
+                block_size: 8192,
+            },
+        ];
+        let plan = NonUniformPlan::validate(NonUniformConfig {
+            max_ir_len: ir_len,
+            host_block_max: 64,
+            stages: &stages,
+        })
+        .unwrap();
+        let req = NonUniformConvolver::memory_requirements(&plan, &simd_fft).unwrap();
+        let mut ws = vec![0.0f32; req.total_f32];
+        let mut conv = NonUniformConvolver::prepare(&ir, plan, &mut ws, backend, simd_fft).unwrap();
+        let mut out = vec![0.0f32; x.len()];
+        let mut pos = 0;
+        for hb in host_blocks(&mut rng, x.len(), 64) {
+            conv.process_block(&x[pos..pos + hb], &mut out[pos..pos + hb])
+                .unwrap();
+            pos += hb;
+        }
+        assert_eq!(conv.deadline_misses(), 0);
+        let (max_abs, snr) = compare(&reference, &out);
+        println!(
+            "adversarial NUPC 131_072 taps (up to N16384): max_abs={max_abs:.3e} snr={snr:.2} dB"
+        );
+        assert!(
+            snr > 100.0,
+            "large NUPC 131_072 taps max_abs={max_abs:e} snr={snr:.2} dB"
+        );
+    }
+}
+
 #[cfg(feature = "nonuniform")]
 mod nupc {
     use super::*;

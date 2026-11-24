@@ -132,3 +132,161 @@ fn nonuniform_flushes_inputs_and_coefficients() {
         y
     });
 }
+
+#[test]
+fn large_ffts_n512_to_n16384_flush_subnormals_on_simd_and_microfft() {
+    use rtconv_simd::MicroFftBackend;
+
+    let backend = SimdBackend::detect_or_baseline();
+    let simd_fft = SimdFixedFftBackend::new(backend);
+    let micro_fft = MicroFftBackend::new();
+
+    for &b in &[256usize, 512, 1024, 2048, 4096, 8192] {
+        // IR spans at least 2 partitions of size B and >= 1024 taps so deep_tail_ir reaches true subnormals
+        let ir_len = (b + 256).max(1024);
+        let ir = deep_tail_ir(ir_len);
+        assert!(ir.iter().any(|v| *v != 0.0 && v.abs() < f32::MIN_POSITIVE));
+        let ir_flushed: Vec<f32> = ir.iter().map(|&v| flush_tiny(v)).collect();
+
+        // Input has >= 3 blocks (and long enough to drain ir_len)
+        let x_len = (3 * b).max(ir_len + 2 * b + 1024).next_multiple_of(b);
+        let x = decaying_input(x_len);
+        let x_flushed: Vec<f32> = x.iter().map(|&v| flush_tiny(v)).collect();
+        let last_nz = x_flushed.iter().rposition(|v| *v != 0.0).unwrap();
+        let drained = (last_nz + ir_len + 2 * b + 1).min(x_len);
+
+        // PartitionedConvolver (SimdFixedFftBackend & MicroFftBackend)
+        let pcfg = PartitionedConfig {
+            block_size: b,
+            max_ir_len: ir_len,
+        };
+        for is_simd in [true, false] {
+            let run_p = |h: &[f32], inp: &[f32]| -> Vec<f32> {
+                let mut y = vec![0.0f32; inp.len()];
+                if is_simd {
+                    let req = PartitionedConvolver::memory_requirements(pcfg, &simd_fft).unwrap();
+                    let mut ws = vec![0.0f32; req.total_f32];
+                    let mut c =
+                        PartitionedConvolver::prepare(h, pcfg, &mut ws, backend, simd_fft).unwrap();
+                    for (xi, yo) in inp.chunks_exact(b).zip(y.chunks_exact_mut(b)) {
+                        c.process_block(xi, yo).unwrap();
+                    }
+                } else {
+                    let req = PartitionedConvolver::memory_requirements(pcfg, &micro_fft).unwrap();
+                    let mut ws = vec![0.0f32; req.total_f32];
+                    let mut c = PartitionedConvolver::prepare(h, pcfg, &mut ws, backend, micro_fft)
+                        .unwrap();
+                    for (xi, yo) in inp.chunks_exact(b).zip(y.chunks_exact_mut(b)) {
+                        c.process_block(xi, yo).unwrap();
+                    }
+                }
+                y
+            };
+            let y = run_p(&ir, &x);
+            let y_ref = run_p(&ir_flushed, &x_flushed);
+            assert_eq!(y, y_ref, "Partitioned B={b} simd={is_simd} mismatch");
+            assert_eq!(
+                y.iter().filter(|v| v.is_subnormal()).count(),
+                0,
+                "Partitioned B={b} simd={is_simd} emitted subnormal output"
+            );
+            assert!(y[drained..].iter().all(|v| *v == 0.0));
+        }
+
+        // HybridConvolver SPREAD for B = 256..=2048
+        if b <= 2048 {
+            let hcfg = HybridConfig {
+                head_len: b,
+                tail_block_size: b,
+                max_ir_len: ir_len,
+            };
+            let req = HybridConvolver::memory_requirements(hcfg, &simd_fft).unwrap();
+            let run_h = |h: &[f32], inp: &[f32]| -> Vec<f32> {
+                let mut ws = vec![0.0f32; req.total_f32];
+                let mut c = HybridConvolver::prepare_with_tail_spreading(
+                    h, hcfg, &mut ws, backend, simd_fft, true,
+                )
+                .unwrap();
+                let mut y = vec![0.0f32; inp.len()];
+                for (xi, yo) in inp.chunks(64).zip(y.chunks_mut(64)) {
+                    c.process_block(xi, yo).unwrap();
+                }
+                y
+            };
+            let y = run_h(&ir, &x);
+            let y_ref = run_h(&ir_flushed, &x_flushed);
+            assert_eq!(y, y_ref, "Hybrid SPREAD B={b} mismatch");
+            assert_eq!(y.iter().filter(|v| v.is_subnormal()).count(), 0);
+        }
+    }
+}
+
+#[cfg(feature = "nonuniform")]
+#[test]
+fn nonuniform_large_stages_up_to_n16384_flush_subnormals() {
+    use rtconv_simd::{
+        NonUniformConfig, NonUniformConvolver, NonUniformPlan, NonUniformStageConfig,
+    };
+
+    let backend = SimdBackend::detect_or_baseline();
+    let fft = SimdFixedFftBackend::new(backend);
+    let ir_len = 16_384;
+    let ir = deep_tail_ir(ir_len);
+    let ir_flushed: Vec<f32> = ir.iter().map(|&v| flush_tiny(v)).collect();
+    let x = decaying_input(20_480);
+    let x_flushed: Vec<f32> = x.iter().map(|&v| flush_tiny(v)).collect();
+
+    let stages = [
+        NonUniformStageConfig {
+            ir_offset: 0,
+            ir_len: 64,
+            block_size: 1,
+        },
+        NonUniformStageConfig {
+            ir_offset: 64,
+            ir_len: 192,
+            block_size: 64,
+        },
+        NonUniformStageConfig {
+            ir_offset: 256,
+            ir_len: 768,
+            block_size: 256,
+        },
+        NonUniformStageConfig {
+            ir_offset: 1024,
+            ir_len: 3072,
+            block_size: 1024,
+        },
+        NonUniformStageConfig {
+            ir_offset: 4096,
+            ir_len: 4096,
+            block_size: 4096,
+        },
+        NonUniformStageConfig {
+            ir_offset: 8192,
+            ir_len: 8192,
+            block_size: 8192,
+        },
+    ];
+    let plan = NonUniformPlan::validate(NonUniformConfig {
+        max_ir_len: ir_len,
+        host_block_max: 64,
+        stages: &stages,
+    })
+    .unwrap();
+    let req = NonUniformConvolver::memory_requirements(&plan, &fft).unwrap();
+
+    let run_nu = |h: &[f32], inp: &[f32]| -> Vec<f32> {
+        let mut ws = vec![0.0f32; req.total_f32];
+        let mut c = NonUniformConvolver::prepare(h, plan, &mut ws, backend, fft).unwrap();
+        let mut y = vec![0.0f32; inp.len()];
+        c.process_block(inp, &mut y).unwrap();
+        assert_eq!(c.deadline_misses(), 0);
+        y
+    };
+
+    let y = run_nu(&ir, &x);
+    let y_ref = run_nu(&ir_flushed, &x_flushed);
+    assert_eq!(y, y_ref, "NUPC large stages mismatch");
+    assert_eq!(y.iter().filter(|v| v.is_subnormal()).count(), 0);
+}

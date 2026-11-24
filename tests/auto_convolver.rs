@@ -54,7 +54,7 @@ fn actual_engine_len_q15(taps: usize) -> usize {
 
 #[test]
 fn const_sizing_matches_engine_requirements_exactly() {
-    for taps in (1..=4500).chain([8191, 8192, 16383, 65536]) {
+    for taps in (1..=4500).chain([8191, 8192, 9503, 9504, 16383, 35391, 35392, 65536, 131072]) {
         assert_eq!(
             engine_len_f32(taps),
             actual_engine_len_f32(taps),
@@ -70,7 +70,7 @@ fn const_sizing_matches_engine_requirements_exactly() {
 
 #[test]
 fn workspace_len_covers_every_shorter_ir() {
-    for max in [1usize, 50, 173, 174, 500, 900, 2000, 3000] {
+    for max in [1usize, 50, 173, 174, 500, 900, 2000, 3000, 10_000, 40_000] {
         let wf = workspace_len_f32(max);
         let wq = workspace_len_q15(max);
         for taps in 1..=max {
@@ -87,12 +87,31 @@ fn workspace_len_covers_every_shorter_ir() {
 }
 
 #[test]
+fn const_generic_workspace_len_evaluates_at_131072_taps() {
+    use rtconv_simd::auto::{AutoWorkspace, workspace_len};
+
+    // Compile-time evaluation of `workspace_len(131_072)` inside a const generic parameter.
+    struct CheckConst<const N: usize>;
+    let _check = CheckConst::<{ workspace_len(131_072) }>;
+    let _check_f32 = CheckConst::<{ workspace_len_f32(131_072) }>;
+    let _check_q15 = CheckConst::<{ workspace_len_q15(131_072) }>;
+    let _ = core::mem::size_of::<AutoWorkspace<{ workspace_len(131_072) }>>();
+
+    // Exhaustively verify O(1) analytical `worst_engine_len_f32` matches brute-force scan up to 131_072.
+    let brute_max = (1..=131_072usize).map(engine_len_f32).max().unwrap();
+    assert_eq!(workspace_len_f32(131_072), brute_max + 131_072);
+}
+
+#[test]
 fn selection_follows_cost_model() {
     assert_eq!(select_f32(1), AutoEngine::Direct);
     assert_eq!(select_f32(128), AutoEngine::Direct);
     assert_eq!(select_f32(512), AutoEngine::Hybrid { block_size: 32 });
     assert_eq!(select_f32(2048), AutoEngine::Hybrid { block_size: 64 });
-    assert_eq!(select_f32(16384), AutoEngine::Hybrid { block_size: 128 });
+    assert_eq!(select_f32(4096), AutoEngine::Hybrid { block_size: 128 });
+    assert_eq!(select_f32(16384), AutoEngine::Hybrid { block_size: 256 });
+    assert_eq!(select_f32(65536), AutoEngine::Hybrid { block_size: 512 });
+    assert_eq!(select_f32(262_144), AutoEngine::Hybrid { block_size: 1024 });
     assert_eq!(select_q15(128), AutoEngine::FixedDirect);
     assert_eq!(select_q15(129), AutoEngine::FixedNonUniform);
 }

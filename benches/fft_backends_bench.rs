@@ -22,6 +22,8 @@ const WARMUP: usize = 200;
 const ITERS: usize = 2000;
 
 struct Stats {
+    mean_us: f64,
+    u_exp_us: f64,
     med_us: f64,
     p99_us: f64,
     max_us: f64,
@@ -37,9 +39,21 @@ fn measure<F: FnMut()>(mut f: F, warmup: usize, iters: usize) -> Stats {
         f();
         times.push(t0.elapsed().as_nanos() as f64 / 1000.0);
     }
+    let mean_us = times.iter().sum::<f64>() / iters as f64;
+    let var = times
+        .iter()
+        .map(|&x| {
+            let d = x - mean_us;
+            d * d
+        })
+        .sum::<f64>()
+        / (iters - 1).max(1) as f64;
+    let u_exp_us = 2.0 * var.sqrt() / (iters as f64).sqrt();
     times.sort_by(|a, b| a.total_cmp(b));
     let idx = |q: f64| -> usize { ((iters as f64 - 1.0) * q).round() as usize };
     Stats {
+        mean_us,
+        u_exp_us,
         med_us: times[idx(0.50)],
         p99_us: times[idx(0.99)],
         max_us: times[iters - 1],
@@ -72,7 +86,16 @@ fn bench_fft_stages<F: FftBackend>(
     let mut out = vec![0.0f32; n];
     let mut scratch = vec![0.0f32; fft.scratch_len_f32(size)];
 
-    let reps = 32usize;
+    let reps = if n <= 512 {
+        32usize
+    } else if n <= 2048 {
+        8usize
+    } else {
+        2usize
+    };
+    let warmup = if n <= 2048 { WARMUP } else { 64 };
+    let iters = if n <= 2048 { ITERS } else { 512 };
+
     let st_fwd = measure(
         || {
             for _ in 0..reps {
@@ -81,10 +104,12 @@ fn bench_fft_stages<F: FftBackend>(
             }
             black_box(&re);
         },
-        WARMUP,
-        ITERS,
+        warmup,
+        iters,
     );
     let fwd_ns = st_fwd.med_us * 1000.0 / reps as f64;
+    let fwd_mean_ns = st_fwd.mean_us * 1000.0 / reps as f64;
+    let fwd_u_ns = st_fwd.u_exp_us * 1000.0 / reps as f64;
 
     let st_inv = measure(
         || {
@@ -94,23 +119,30 @@ fn bench_fft_stages<F: FftBackend>(
             }
             black_box(&out);
         },
-        WARMUP,
-        ITERS,
+        warmup,
+        iters,
     );
     let inv_ns = st_inv.med_us * 1000.0 / reps as f64;
+    let inv_mean_ns = st_inv.mean_us * 1000.0 / reps as f64;
+    let inv_u_ns = st_inv.u_exp_us * 1000.0 / reps as f64;
     let total_ns = fwd_ns + inv_ns;
+    let total_mean_ns = fwd_mean_ns + inv_mean_ns;
+    let total_u_ns = (fwd_u_ns * fwd_u_ns + inv_u_ns * inv_u_ns).sqrt();
     let speedup = match micro_rt_ns {
         Some(base) => format!("{:.2}x", base / total_ns),
         None => "1.00x".to_string(),
     };
 
     println!(
-        "{:<24} {:<6} {:<10.1} {:<10.1} {:<10.1} {:<10} {:<10}",
+        "{:<24} {:<6} {:<10.1} {:<10.1} {:<10.1} (mean={:<10.1}±{:<7.1} n={:<4}) {:<8} {:<10}",
         label,
         n,
         fwd_ns,
         inv_ns,
         total_ns,
+        total_mean_ns,
+        total_u_ns,
+        iters,
         speedup,
         fft.scratch_len_f32(size) * 4
     );
@@ -255,7 +287,7 @@ fn main() {
     #[cfg(feature = "phastft")]
     let phast = PhastFftBackend::new();
 
-    for &size in &[FftSize::N64, FftSize::N128, FftSize::N256] {
+    for size in FftSize::ALL {
         let base = bench_fft_stages("MicroFftBackend", &micro, size, None);
         bench_fft_stages("SimdFixedFft(Scalar)", &fixed_sc, size, Some(base));
         bench_fft_stages("SimdFixedFft(SSE2)", &fixed_sse2, size, Some(base));
@@ -263,6 +295,77 @@ fn main() {
         #[cfg(feature = "phastft")]
         bench_fft_stages("PhastFftBackend", &phast, size, Some(base));
         println!();
+    }
+
+    // 1b. Isolated kernel calibration (CMAC per bin, direct MAC per tap) for CostModel
+    println!("--- 1b. Isolated Kernel Timings (ns/call) for CostModel Calibration ---");
+    for &(label, b_simd) in &[
+        ("Scalar", SimdBackend::scalar()),
+        ("SSE2", sse2),
+        ("AVX2", avx2),
+    ] {
+        for &bins in &[33usize, 65, 129, 257, 513, 1025, 2049, 4097, 8193] {
+            let mut acc_r = vec![0.0f32; bins];
+            let mut acc_i = vec![0.0f32; bins];
+            let xr = make_signal(bins, 11);
+            let xi = make_signal(bins, 12);
+            let hr = make_signal(bins, 13);
+            let hi = make_signal(bins, 14);
+            let reps = if bins <= 257 { 64 } else { 8 };
+            let st = measure(
+                || {
+                    for _ in 0..reps {
+                        if b_simd.is_scalar() {
+                            rtconv_simd::simd_kernels::cmac_scalar(
+                                &mut acc_r, &mut acc_i, &xr, &xi, &hr, &hi,
+                            );
+                        } else {
+                            rtconv_simd::simd_kernels::cmac_simd(
+                                b_simd.level(),
+                                &mut acc_r,
+                                &mut acc_i,
+                                &xr,
+                                &xi,
+                                &hr,
+                                &hi,
+                            );
+                        }
+                    }
+                    black_box((&acc_r, &acc_i));
+                },
+                WARMUP / 2,
+                ITERS / 2,
+            );
+            let ns = st.med_us * 1000.0 / reps as f64;
+            println!(
+                "CMAC {label:<8} bins={bins:<5} med={ns:8.1} ns ({:.3} ns/bin)",
+                ns / bins as f64
+            );
+        }
+        let taps = 64usize;
+        let coeffs = make_signal(taps, 21);
+        let hist = make_signal(taps, 22);
+        let reps = 256usize;
+        let st = measure(
+            || {
+                let mut acc = 0.0f32;
+                for _ in 0..reps {
+                    acc += if b_simd.is_scalar() {
+                        rtconv_simd::simd_kernels::dot_product_scalar(&coeffs, &hist)
+                    } else {
+                        rtconv_simd::simd_kernels::dot_product_simd(b_simd.level(), &coeffs, &hist)
+                    };
+                }
+                black_box(acc);
+            },
+            WARMUP,
+            ITERS,
+        );
+        let ns = st.med_us * 1000.0 / reps as f64;
+        println!(
+            "DOT  {label:<8} taps={taps:<5} med={ns:8.1} ns ({:.3} ns/tap)\n",
+            ns / taps as f64
+        );
     }
 
     // 2. Full PartitionedConvolver Comparison (IR = 256, 2048, 16383; B = 32, 64, 128)

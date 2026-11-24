@@ -21,7 +21,10 @@ pub use direct::{
     FixedQ15DirectMemoryRequirements,
 };
 #[cfg(feature = "fixed-fft")]
-pub use fft_q15::{irfft_q15_bfp, rfft_q15_bfp};
+pub use fft_q15::{
+    MAX_FIXED_FFT, fixed_fft_rom_bytes, fixed_fft_scratch_len_i32, fixed_fft_supports_size,
+    irfft_q15_bfp, irfft_q15_bfp_with_scratch, rfft_q15_bfp, rfft_q15_bfp_with_scratch,
+};
 #[cfg(feature = "fixed-nonuniform")]
 pub use nonuniform::{
     FixedQ15NonUniformCapabilities, FixedQ15NonUniformConvolver,
@@ -34,5 +37,5 @@ pub use partitioned::{
 };
 pub use q15::{
     Q15_HALF, Q15_SCALE_F32, Q15_SCALE_F64, Q15_SHIFT, f32_to_q15, f64_to_q15, mul_q15, q15_to_f32,
-    q15_to_f64, round_sat_q15_from_i64, sat_i16_from_i32,
+    q15_to_f64, round_even_sat_q15_from_i64, round_sat_q15_from_i64, sat_i16_from_i32,
 };

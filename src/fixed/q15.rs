@@ -40,6 +40,27 @@ pub const fn round_sat_q15_from_i64(acc: i64) -> (i16, bool) {
     }
 }
 
+/// Scales a Q2.30 `i64` accumulator to Q1.15 with convergent rounding (round-to-nearest-even,
+/// zero DC bias) and symmetric saturation, returning `(result_q15, saturated)`.
+#[inline]
+pub const fn round_even_sat_q15_from_i64(acc: i64) -> (i16, bool) {
+    let mask = (1i64 << Q15_SHIFT) - 1;
+    let q = acc >> Q15_SHIFT;
+    let rem = acc & mask;
+    let rounded = if rem > Q15_HALF || (rem == Q15_HALF && (q & 1) != 0) {
+        q + 1
+    } else {
+        q
+    };
+    if rounded > i16::MAX as i64 {
+        (i16::MAX, true)
+    } else if rounded < i16::MIN as i64 {
+        (i16::MIN, true)
+    } else {
+        (rounded as i16, false)
+    }
+}
+
 /// Saturates an `i32` value directly into `i16` (`[i16::MIN, i16::MAX]`).
 #[inline]
 pub const fn sat_i16_from_i32(x: i32) -> i16 {

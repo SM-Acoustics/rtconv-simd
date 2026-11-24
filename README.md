@@ -56,7 +56,7 @@ Stereo artifacts use `AutoStereoConvolver` (planar `process_f32` / `process_i16`
 | Target | Example chips | Native domain | Engines selected |
 | :--- | :--- | :--- | :--- |
 | `riscv32imac-unknown-none-elf` | **ESP32-C6**, ESP32-H2 | Q1.15 / BFP (no FPU) | `FixedQ15Direct` (≤ 128 taps) or `FixedQ15NonUniform` |
-| `riscv32imafc-unknown-none-elf` | **ESP32-P4** | `f32` (hardware FPU, scalar) | `Direct` or `Hybrid` (`B` = 32/64/128) |
+| `riscv32imafc-unknown-none-elf` | **ESP32-P4** | `f32` (hardware FPU, scalar) | `Direct` or `Hybrid` (`B` = 32..=8192) |
 | `thumbv6m-none-eabi`, `thumbv7m-none-eabi` | Cortex-M0/M3 | Q1.15 / BFP | as ESP32-C6 |
 | `thumbv7em-none-eabihf` | Cortex-M4F/M7 | `f32` | as ESP32-P4 |
 | x86-64 / AArch64 / WASM | desktop, mobile, web | `f32` + SIMD | as ESP32-P4 |
@@ -72,17 +72,17 @@ All core engines are mono; use one instance per channel, or the `auto` stereo wr
 | Engine | Feature | Numeric format | Latency | Best for |
 | :--- | :--- | :--- | :---: | :--- |
 | **`AutoConvolver` / `AutoStereoConvolver`** | `auto` (default) | `f32` or Q1.15 (by target) | `0` | Loading FIR artifacts with zero configuration |
-| **`DirectConvolver`** | core | `f32` (SIMD / scalar) | `0` | Short FIRs (≲ 170 taps by the cost model), crossovers |
-| **`PartitionedConvolver`** | core | `f32` (uniform 50 % overlap-save FDL) | `0`¹ | Block-aligned FFT convolution |
-| **`HybridConvolver`** | core | `f32` (direct head + FDL tail, `SPREAD`) | `0` | Long IRs on desktop and FPU MCUs |
-| **`NonUniformConvolver`** | `nonuniform` | `f32` (up to 8 causal stages) | `0` | Multi-stage schedules with budget admission |
+| **`DirectConvolver`** | core | `f32` (SIMD / scalar) | `0` | Short FIRs (≲ 173 taps by the cost model), crossovers |
+| **`PartitionedConvolver`** | core | `f32` (uniform 50 % overlap-save FDL) | `0`¹ | Block-aligned FFT convolution (`B ∈ {32..=8192}`) |
+| **`HybridConvolver`** | core | `f32` (direct head + FDL tail, `SPREAD`) | `0` | Long IRs on desktop and FPU MCUs (`B ∈ {32..=8192}`) |
+| **`NonUniformConvolver`** | `nonuniform` | `f32` (up to 8 causal stages) | `0` | Multi-stage schedules (`B ∈ {32..=8192}`) with budget admission |
 | **`FixedQ15DirectConvolver`** | `fixed-q15` | Q1.15 (`i64` accumulator) | `0` | FPU-less MCUs, ≤ 1 LSB error, half the RAM of `f32` |
-| **`FixedQ15PartitionedConvolver`** | `fixed-fft` | Q1.15 + BFP FFT/FDL | `0`¹ | Medium/long FIRs on FPU-less MCUs |
-| **`FixedQ15NonUniformConvolver`** | `fixed-nonuniform` | Q1.15 + BFP NUPC | `0` | Zero-latency long FIRs on FPU-less MCUs |
+| **`FixedQ15PartitionedConvolver`** | `fixed-fft` | Q1.15 + BFP FFT/FDL | `0`¹ | Medium/long FIRs on FPU-less MCUs (`B ∈ {32..=1024}`) |
+| **`FixedQ15NonUniformConvolver`** | `fixed-nonuniform` | Q1.15 + BFP NUPC | `0` | Zero-latency long FIRs on FPU-less MCUs (`B ∈ {32..=1024}`) |
 
 ¹ The output for an input block is produced in the same call. A host that delivers fewer than `B` samples per callback adds `B` samples of framing delay, which is why the hybrid and NUPC engines exist.
 
-> **FFT ceiling**: every FFT backend supports `N ∈ {64, 128, 256}` (`B ∈ {32, 64, 128}`). Larger sizes are the next milestone ([`docs/ROADMAP.md`](./docs/ROADMAP.md)).
+> **FFT range**: every `f32` FFT backend supports `N ∈ {64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384}` (`B ∈ {32..=8192}`). `fft_q15` supports `N ∈ {64..=2048}` (`B ∈ {32..=1024}`). Cost-model partition optimization (#15) and time-distributed transforms (#16) are tracked in [`docs/ROADMAP.md`](./docs/ROADMAP.md).
 
 ---
 
@@ -108,10 +108,10 @@ Typed errors (`ArtifactError`) cover truncation, unsupported formats, non-finite
 | `native-q15` | Forces the Q1.15 auto domain on FPU targets (RAM savings, host testing) | No |
 | `nonuniform` | `NonUniformConvolver`, `NonUniformPlan`, `NonUniformBudget`, `NonUniformScheduler` | No |
 | `fixed-q15` | `FixedQ15DirectConvolver` and Q1.15 helpers | No |
-| `fixed-fft` | BFP `rfft_q15_bfp` / `irfft_q15_bfp` (512 B twiddle ROM) and `FixedQ15PartitionedConvolver` | No |
+| `fixed-fft` | BFP `rfft_q15_bfp_with_scratch` / `irfft_q15_bfp_with_scratch` (`N64..=N2048`, `1,026 B` ROM) and `FixedQ15PartitionedConvolver` | No |
 | `fixed-nonuniform` | `FixedQ15NonUniformConvolver` | No |
 | `std` | Runtime CPU detection (`SimdBackend::detect()`) | Yes |
-| `phastft` | Optional desktop `PhastFftBackend` (`phastft 0.4.1`) | Yes |
+| `phastft` | Optional desktop `PhastFftBackend` (`phastft 0.4.1`, `N64..=N16384`) | Yes |
 
 `--no-default-features` gives the minimal core (`Direct`, `Partitioned`, `Hybrid`, the FFT backends and `artifact`). Every feature except `std`/`phastft` is `no_std` with no `alloc`.
 
@@ -169,12 +169,12 @@ More: [`examples/`](./examples) (`direct_fir`, `hybrid_convolution`, `nonuniform
 
 ## FFT Backends
 
-| Backend | Feature | Precision | SIMD transform | External scratch (`N = 64/128/256`) | Peak stack |
-| :--- | :--- | :--- | :---: | :---: | :---: |
-| **`MicroFftBackend`** | core | `f32` | No (radix-2) | `0 B` | up to ~2.1 KiB (`N = 256`) |
-| **`SimdFixedFftBackend`** | core | `f32` | Yes (`fearless_simd`; scalar on RISC-V) | `256 / 512 / 1024 B` | `< 256 B` |
-| **`PhastFftBackend`** | `phastft` (`std`) | `f32` | Yes (`phastft 0.4.1`) | `256 / 512 / 1024 B` | `< 256 B` |
-| **`fft_q15` (BFP radix-2)** | `fixed-fft` | Q1.15 mantissa + `i8` exponent | No (FPU-free `i32` butterflies) | caller `&mut [i16]` (512 B ROM) | ~2 KiB per transform (+ 2 KiB `i64` accumulator in the fixed engines) |
+| Backend | Feature | Precision | Supported `N` | SIMD transform | External scratch | ROM / Peak stack |
+| :--- | :--- | :--- | :--- | :---: | :--- | :--- |
+| **`MicroFftBackend`** | core | `f32` | `64..=16384` | No (radix-2 + Hermitian inverse) | `N` `f32` (`256 B`–`64 KiB`) | `16,380 B` ROM / `< 256 B` stack |
+| **`SimdFixedFftBackend`** | core | `f32` | `64..=16384` | Yes (`fearless_simd`; scalar on RISC-V) | `N` `f32` (`256 B`–`64 KiB`) | `16,388 B` ROM / `< 256 B` stack |
+| **`PhastFftBackend`** | `phastft` (`std`) | `f32` | `64..=16384` | Yes (`phastft 0.4.1`) | `N` `f32` (`256 B`–`64 KiB`) | precomputed planner / `< 256 B` stack |
+| **`fft_q15` (BFP radix-2)** | `fixed-fft` | Q1.15 mantissa + `i8` exp | `64..=2048` | No (FPU-free `i32` butterflies) | `2N` `i32` / `4N` `i16` (`in ws`) | `1,026 B` ROM / `< 512 B` stack (engines) |
 
 ---
 
@@ -182,26 +182,31 @@ More: [`examples/`](./examples) (`direct_fir`, `hybrid_convolution`, `nonuniform
 
 ### Timing (`HOST_ONLY`)
 
-Measured on an AMD Ryzen 3 PRO 2300U (Windows 11, 48 kHz, 32-sample blocks, 666.67 µs budget). See [`docs/BENCHMARKS.md`](./docs/BENCHMARKS.md).
+Measured at 48 kHz, 32-sample blocks (`666.67 µs` budget); full GUM Type A uncertainty (`k = 2`) and tail percentile tables in [`docs/BENCHMARKS.md`](./docs/BENCHMARKS.md).
 
-- **SIMD FFT** (`RFFT + IFFT`, `SimdFixedFftBackend` vs `MicroFftBackend`): 2.08× at `N = 64` (SSE2), 2.85× at `N = 128` (AVX2), 2.51× at `N = 256` (AVX2).
-- **16,383 taps**: `Hybrid(H128/T128) SPREAD` worst-phase p99 = **5.20 µs (0.78 % of budget)**.
+- **Windows 11 / AMD Ryzen 3 PRO 2300U (`0.2.0` baseline, `N ≤ 256`)**: `Hybrid(H128/T128) SPREAD` at 16,383 taps worst-phase p99 = **5.20 µs (0.78 % of budget)**.
+- **Linux x86-64 / Intel Xeon 2.30 GHz (PR-A `#14`, `N64..=N16384`, `SimdFixedFftBackend`, `n = 4096`)**:
+  - `65,536` taps: `Hybrid(H512/T512) SPREAD` mean = **`9.15 ± 0.26 µs`** (SSE2) / **`6.72 ± 0.18 µs`** (AVX2+FMA); 6-stage `NUPC (D32..8k)` cuts mean latency `1.8×–2.3×` vs `default_profile` (`24.12 → 10.6 ± 1.4 µs` SSE2, **`p50 = 4.25 µs`**), while monolithic `N16384` bursts (`p99 = 105.08 µs`) motivate time-distributed transforms (#16).
+  - Isolated `RFFT + IFFT` (`N = 128..=8192`): `SimdFixedFft(AVX2)` reaches up to **`1.28×`** over zero-stack `MicroFftBackend` (`PhastFftBackend` reaches **`3.25×`**).
 
 ### Numerical accuracy (`HOST_TESTED`)
 
-Measured with `tests/adversarial_reference.rs` and `tests/auto_convolver.rs`.
+Measured with `tests/fft_backends_suite.rs`, `tests/adversarial_reference.rs`, `tests/aes17_audio_metrics.rs`, and `tests/auto_convolver.rs`.
 
-- **`f32` engines** (all backends, IR lengths 1–4097, random host fragmentation 1–3·`B`): SNR > 100 dB against an independent `f64` oracle.
+- **FFT `f64` DFT oracle (`N64..=N16384`, all `f32` backends)**: forward SNR **`132.5–143.0 dB`**, roundtrip SNR **`131.9–140.1 dB`** (`> 120 dB` gate).
+- **`f32` engines** (all backends, IR lengths `1..=131,072`, random host fragmentation `1..3·B`): SNR **`> 100 dB`** against an independent `f64` oracle (`131.77 dB` on 131,072-tap NUPC up to `N16384`).
+- **AES17 (`997 Hz` @ `48 kHz`)**:
+  - `f32` (`N512..=N16384`): SNR/THD+N **`127.9–135.9 dB`** across `−60 / −1 / 0 dBFS`, DR **`193.4–201.8 dB`** at `−60 dBFS`, zero overshoot.
+  - `Q1.15` (`N64..=N2048`): at `−60 dBFS`, input-block BFP preserves **`97.87–98.65 dB` DR** (`0.00 dB` loss vs Q1.15 ceiling); at `−1 dBFS`, 16-bit BFP radix-2 stages lose `~2.7 dB/stage` on unity impulse (`76.72 dB` at `N=64` → `63.21 dB` at `N=2048`; `81.56 dB` on Q1.15 NUPC up to `N2048`).
 - **`FixedQ15Partitioned` / `FixedQ15NonUniform`** (decaying 1,500-tap IR):
 
   | Input level | Partitioned | NonUniform | Q1.15 output-rounding ceiling |
   | :--- | ---: | ---: | ---: |
-  | 0 dBFS | 68.7 dB | 69.4 dB | 70.4 dB |
-  | −20 dBFS | 50.4 dB | 50.4 dB | 50.4 dB |
-  | −40 dBFS | 30.5 dB | 30.5 dB | 30.5 dB |
+  | 0 dBFS | 68.75 dB | 69.58 dB | 70.38 dB |
+  | −20 dBFS | 50.38 dB | 50.40 dB | 50.40 dB |
+  | −40 dBFS | 30.53 dB | 30.53 dB | 30.53 dB |
 
-  Before the BFP fix in the [review](./docs/REVIEW-2026-11-ADVERSARIAL.md), partitioned measured 47.8 / 46.0 / 30.5 dB and NonUniform 47.7 / 43.0 / 25.8 dB.
-- **4,096-tap linear-phase (rePhase-style) FIR, Q1.15 NUPC**: 70.4 dB with `prepare_q31` per-partition coefficient exponents, vs. 64.2 dB with Q1.15 taps (62.6 dB before the review). The Q1.15 FFT path tops out at about 70 dB (16-bit mantissas).
+- **4,096-tap linear-phase (rePhase-style) FIR, Q1.15 NUPC**: **`72.00 dB`** with `prepare_q31` per-partition coefficient exponents and convergent RNE rounding, vs. `64.56 dB` with Q1.15 taps. Reaching `> 90 dB` at large `N` in fixed point requires 32-bit BFP mantissas (#23).
 
 ---
 
@@ -209,15 +214,15 @@ Measured with `tests/adversarial_reference.rs` and `tests/auto_convolver.rs`.
 
 - **Verified invariants (`HOST_ONLY`)**:
   - `#![no_std]` and `#![forbid(unsafe_code)]`.
-  - 0 heap allocations or deallocations (standalone `harness = false` `GlobalAlloc` binary with a positive control), covering every `f32` and Q1.15 engine, artifact parsing, and `AutoConvolver`.
-  - No locks, threads or I/O; bounded loops; typed `ConvError` / `ArtifactError` rejections.
-  - **IEEE 754 subnormal guard.** Every `f32` engine flushes values below `simd_kernels::DENORMAL_GUARD = 2^-63` (≈ −379 dBFS) at its boundaries: inputs, coefficients, spectra, FDL slots, accumulators and outputs. Every non-zero product therefore stays a normal number.
+  - 0 heap allocations or deallocations (standalone `harness = false` `GlobalAlloc` binary with a positive control), covering every `f32` (`N64..=N16384`) and Q1.15 (`N64..=N2048`) engine, artifact parsing, and `AutoConvolver`.
+  - No locks, threads or I/O; bounded loops; typed `ConvError` / `ArtifactError` rejections; `< 512 B` peak stack across all engines.
+  - **IEEE 754 subnormal guard.** Every `f32` engine flushes values below `simd_kernels::DENORMAL_GUARD = 2^-63` (≈ −379 dBFS) at its boundaries: inputs, coefficients, spectra, FDL slots, accumulators and outputs (`tests/denormal_guard.rs`, up to `N16384`).
     - Without the guard, on x86 without FTZ/DAZ, decaying or near-silent signals made `DirectConvolver` up to 80× slower and `HybridConvolver` up to 50× slower, and an f64 FIR with a deep tail made it 15× slower permanently.
     - With the guard, every case runs at the normal-signal cost (`benches/denormal_bench.rs`, [`docs/ROADMAP.md` §4](./docs/ROADMAP.md)).
 - **Limits**:
   - Host benchmarks are not WCET certifications.
   - `NonUniformBudget` is an operation-count admission model, not a timing proof.
-  - `FixedQ15NonUniformConvolver` embeds about 17 KiB of `i64` accumulators in the struct itself. This is reported as `instance_bytes`; keep the struct in a `static` on MCUs.
+  - `FixedQ15NonUniformConvolver` now keeps its per-stage `i64` accumulators and FFT scratch inside the caller `&mut [i16]` workspace, keeping `instance_bytes` compact (`< 4 KiB`, still included in `NonUniformBudget` admission).
   - See [`docs/REALTIME_CONTRACT.md`](./docs/REALTIME_CONTRACT.md) and [`docs/MEMORY_MODEL.md`](./docs/MEMORY_MODEL.md).
 
 ---

@@ -4,7 +4,7 @@ Aligned with `SM-ENG-002` (*Proposed v1*): `prepare()` belongs to **Class B** (o
 
 ## Class A Invariants (`PROVEN`, `HOST_ONLY`)
 
-1. **Zero heap activity**: Verified via serialized `GlobalAlloc` (`tests/no_alloc_rt.rs`) for `DirectConvolver`, `PartitionedConvolver`, `HybridConvolver` (`BURST` and `SPREAD`), `MicroFftBackend`, `SimdFixedFftBackend`, and `PhastFftBackend` (with pre-initialized planner).
+1. **Zero heap activity**: Verified via serialized `GlobalAlloc` (`tests/no_alloc_rt.rs`) for `DirectConvolver`, `PartitionedConvolver` (`N64..=N16384`), `HybridConvolver` (`BURST` and `SPREAD`), `NonUniformConvolver` (up to `N16384`), `FixedQ15DirectConvolver`, `FixedQ15PartitionedConvolver` (`N64..=N2048`), `FixedQ15NonUniformConvolver` (up to `N2048`), `AutoConvolver`, `MicroFftBackend`, `SimdFixedFftBackend`, and `PhastFftBackend` (with pre-initialized planners up to `N16384`).
 2. **Zero blocking operations**: No mutexes, channels, threads, syscalls, file I/O, or logging in `src/`.
 3. **Zero runtime CPUID or FFT planning in callback**: `SimdBackend` and `PhastFftBackend` planners are resolved once prior to streaming.
 4. **Bounded per-callback work**:
@@ -25,7 +25,7 @@ Aligned with `SM-ENG-002` (*Proposed v1*): `prepare()` belongs to **Class B** (o
 - the spectral accumulators before the inverse FFT;
 - the output samples.
 
-Guarding both inputs and coefficients at `2^-63` means every non-zero product is `≥ 2^-126`, a normal number. The slot, accumulator and output flushes remove subnormal residues left by cancellation. A decaying input therefore drains to exact zeros (`tests/denormal_guard.rs`).
+Guarding both inputs and coefficients at `2^-63` means every non-zero product is `≥ 2^-126`, a normal number. The slot, accumulator and output flushes remove subnormal residues left by cancellation. A decaying input therefore drains to exact zeros (`tests/denormal_guard.rs`, covering all sizes up to `N16384`).
 
 Without the guard, on x86-64 without FTZ/DAZ, a 1024-tap `DirectConvolver` took 346 µs per 32-sample block for 1e-37 inputs instead of 4.3 µs, which is 52 % of a 666 µs budget. Hosts may still enable FTZ/DAZ in their audio thread for complete coverage. The crate cannot do it itself under `#![forbid(unsafe_code)]`. Q1.15 engines are integer-only and unaffected.
 
@@ -37,8 +37,8 @@ Without the guard, on x86-64 without FTZ/DAZ, a 1024-tap `DirectConvolver` took 
 - for each FDL stage, `ceil(H / B)` block triggers, each counted as an RFFT and an IFFT at `5·N·log2 N` operations, plus `4·(B+1)` real MACs per partition;
 - for SPREAD stages, one extra in-flight completion and the CMAC sub-steps that can fall inside the callback.
 
-Memory admission for `FixedQ15NonUniformConvolver` includes `instance_bytes` (the in-struct `i64` accumulators).
+Memory admission for `FixedQ15NonUniformConvolver` includes both workspace bytes (which hold the per-stage `i64` accumulators and packed FFT scratch) and `instance_bytes` (compact metadata/scheduler state, `< 4 KiB`).
 
 ## Empirical Measurements vs. Formal WCET
 
-Host benchmarks on Windows 11 Pro (`HOST_ONLY`) measure median, p95, p99, and observed maximum. Observed maxima are **not** formal WCET proofs (`TARGET_RT_VALIDATED = OPEN`). Formal hard-RT certification requires target-specific static timing analysis, cache/ISR modeling, and hardware-in-the-loop stress testing.
+Host benchmarks (`HOST_ONLY`) measure GUM Type A mean ± expanded uncertainty (`k = 2`), median (`p50`), `p95`, `p99`, and observed maximum. Observed maxima are **not** formal WCET proofs (`TARGET_RT_VALIDATED = OPEN`). Formal hard-RT certification requires target-specific static timing analysis, cache/ISR modeling, and hardware-in-the-loop stress testing.

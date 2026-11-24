@@ -6,7 +6,7 @@
 //! - `phastft 0.4.1` is configured with `default-features = false` (no `rayon`
 //!   thread pool). `Options` explicitly sets `multithreaded_bit_reversal = false`
 //!   and `smallest_parallel_chunk_size = usize::MAX`.
-//! - Planners (`PlannerR2c32`) for `N = 64, 128, 256` are created once in
+//! - Planners (`PlannerR2c32`) for `N = 64 ..= 16384` are created once in
 //!   [`PhastFftBackend::new()`] BEFORE audio processing.
 //! - Uses `r2c_fft_f32_with_planner_and_opts` and `c2r_fft_f32_with_planner_and_opts`
 //!   with caller-supplied reusable scratch (`N` floats = `N/2` re + `N/2` im),
@@ -21,17 +21,23 @@ use phastft::options::Options;
 use phastft::planner::PlannerR2c32;
 use phastft::{c2r_fft_f32_with_planner_and_opts, r2c_fft_f32_with_planner_and_opts};
 
-/// Desktop SIMD FFT backend backed by `phastft 0.4.1`.
+/// Desktop SIMD FFT backend backed by `phastft 0.4.1` supporting `N = 64 ..= 16384`.
 #[derive(Clone, Debug)]
 pub struct PhastFftBackend {
     plan_64: PlannerR2c32,
     plan_128: PlannerR2c32,
     plan_256: PlannerR2c32,
+    plan_512: PlannerR2c32,
+    plan_1024: PlannerR2c32,
+    plan_2048: PlannerR2c32,
+    plan_4096: PlannerR2c32,
+    plan_8192: PlannerR2c32,
+    plan_16384: PlannerR2c32,
     opts: Options,
 }
 
 impl PhastFftBackend {
-    /// Precomputes `PlannerR2c32` instances for `N = 64, 128, 256`.
+    /// Precomputes `PlannerR2c32` instances for `N = 64 ..= 16384`.
     ///
     /// Call once during initialization (outside the real-time audio callback).
     pub fn new() -> Self {
@@ -42,6 +48,12 @@ impl PhastFftBackend {
             plan_64: PlannerR2c32::new(64),
             plan_128: PlannerR2c32::new(128),
             plan_256: PlannerR2c32::new(256),
+            plan_512: PlannerR2c32::new(512),
+            plan_1024: PlannerR2c32::new(1024),
+            plan_2048: PlannerR2c32::new(2048),
+            plan_4096: PlannerR2c32::new(4096),
+            plan_8192: PlannerR2c32::new(8192),
+            plan_16384: PlannerR2c32::new(16384),
             opts,
         }
     }
@@ -52,6 +64,12 @@ impl PhastFftBackend {
             FftSize::N64 => &self.plan_64,
             FftSize::N128 => &self.plan_128,
             FftSize::N256 => &self.plan_256,
+            FftSize::N512 => &self.plan_512,
+            FftSize::N1024 => &self.plan_1024,
+            FftSize::N2048 => &self.plan_2048,
+            FftSize::N4096 => &self.plan_4096,
+            FftSize::N8192 => &self.plan_8192,
+            FftSize::N16384 => &self.plan_16384,
         }
     }
 }
@@ -74,8 +92,8 @@ impl FftBackend for PhastFftBackend {
     }
 
     #[inline]
-    fn supports_size(&self, size: FftSize) -> bool {
-        matches!(size, FftSize::N64 | FftSize::N128 | FftSize::N256)
+    fn supports_size(&self, _size: FftSize) -> bool {
+        true
     }
 
     #[inline]
