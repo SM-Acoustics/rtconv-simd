@@ -4,9 +4,9 @@ Aligned with `SM-ENG-002` (*Proposed v1*): `prepare()` belongs to **Class B** (o
 
 ## Class A Invariants (`PROVEN`, `HOST_ONLY`)
 
-1. **Zero heap activity**: Verified via serialized `GlobalAlloc` (`tests/no_alloc_rt.rs`) for `DirectConvolver`, `PartitionedConvolver` (`N64..=N16384`), `HybridConvolver` (`BURST` and `SPREAD`), `NonUniformConvolver` (up to `N16384`), `FixedQ15DirectConvolver`, `FixedQ15PartitionedConvolver` (`N64..=N2048`), `FixedQ15NonUniformConvolver` (up to `N2048`), `AutoConvolver`, `MicroFftBackend`, `SimdFixedFftBackend`, and `PhastFftBackend` (with pre-initialized planners up to `N16384`).
+1. **Zero heap activity**: Verified via serialized `GlobalAlloc` (`tests/no_alloc_rt.rs`) for `DirectConvolver`, `PartitionedConvolver` (`N64..=N16384`), `HybridConvolver` (`BURST` and `SPREAD`), `NonUniformConvolver` (up to `N16384`), `NonUniformPlan::optimize`, `optimize_block_mode`, `preset_esp32_*`, `FixedQ15DirectConvolver`, `FixedQ15PartitionedConvolver` (`N64..=N2048`), `FixedQ15NonUniformConvolver` (up to `N2048`), `AutoConvolver` (including `AutoEngine::NonUniform` in-place DP), `MicroFftBackend`, `SimdFixedFftBackend`, and `PhastFftBackend` (with pre-initialized planners up to `N16384`).
 2. **Zero blocking operations**: No mutexes, channels, threads, syscalls, file I/O, or logging in `src/`.
-3. **Zero runtime CPUID or FFT planning in callback**: `SimdBackend` and `PhastFftBackend` planners are resolved once prior to streaming.
+3. **Zero runtime CPUID, partition optimization, or FFT planning in callback**: `SimdBackend`, `NonUniformPlan::optimize` (Class B), and `PhastFftBackend` planners are resolved once prior to streaming.
 4. **Bounded per-callback work**:
    - `DirectConvolver`: `O(B · L)` multiply-adds per block of `B` samples and IR length `L`.
    - `PartitionedConvolver`: `1 RFFT(2B) + P · (B + 1)` CMACs `+ 1 IFFT(2B)` per `B`-sample block (`P = ceil(L / B)`).

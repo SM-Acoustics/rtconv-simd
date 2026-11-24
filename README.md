@@ -55,8 +55,8 @@ Stereo artifacts use `AutoStereoConvolver` (planar `process_f32` / `process_i16`
 
 | Target | Example chips | Native domain | Engines selected |
 | :--- | :--- | :--- | :--- |
-| `riscv32imac-unknown-none-elf` | **ESP32-C6**, ESP32-H2 | Q1.15 / BFP (no FPU) | `FixedQ15Direct` (≤ 128 taps) or `FixedQ15NonUniform` |
-| `riscv32imafc-unknown-none-elf` | **ESP32-P4** | `f32` (hardware FPU, scalar) | `Direct` or `Hybrid` (`B` = 32..=8192) |
+| `riscv32imac-unknown-none-elf` | **ESP32-C6**, ESP32-H2 | Q1.15 / BFP (no FPU) | `FixedQ15Direct` (≤ 128 taps) or cost-optimized `FixedQ15NonUniform` (`B ≤ 1024`) |
+| `riscv32imafc-unknown-none-elf` | **ESP32-P4** | `f32` (hardware FPU, scalar) | `Direct`, `Hybrid` (`B` = 32..=8192), or cost-optimized `NonUniform` |
 | `thumbv6m-none-eabi`, `thumbv7m-none-eabi` | Cortex-M0/M3 | Q1.15 / BFP | as ESP32-C6 |
 | `thumbv7em-none-eabihf` | Cortex-M4F/M7 | `f32` | as ESP32-P4 |
 | x86-64 / AArch64 / WASM | desktop, mobile, web | `f32` + SIMD | as ESP32-P4 |
@@ -72,17 +72,17 @@ All core engines are mono; use one instance per channel, or the `auto` stereo wr
 | Engine | Feature | Numeric format | Latency | Best for |
 | :--- | :--- | :--- | :---: | :--- |
 | **`AutoConvolver` / `AutoStereoConvolver`** | `auto` (default) | `f32` or Q1.15 (by target) | `0` | Loading FIR artifacts with zero configuration |
-| **`DirectConvolver`** | core | `f32` (SIMD / scalar) | `0` | Short FIRs (≲ 173 taps by the cost model), crossovers |
+| **`DirectConvolver`** | core | `f32` (SIMD / scalar) | `0` | Short FIRs (≲ 128 taps by the cost model), crossovers |
 | **`PartitionedConvolver`** | core | `f32` (uniform 50 % overlap-save FDL) | `0`¹ | Block-aligned FFT convolution (`B ∈ {32..=8192}`) |
-| **`HybridConvolver`** | core | `f32` (direct head + FDL tail, `SPREAD`) | `0` | Long IRs on desktop and FPU MCUs (`B ∈ {32..=8192}`) |
-| **`NonUniformConvolver`** | `nonuniform` | `f32` (up to 8 causal stages) | `0` | Multi-stage schedules (`B ∈ {32..=8192}`) with budget admission |
+| **`HybridConvolver`** | core | `f32` (direct head + FDL tail, `SPREAD`) | `0` | Medium/long IRs on desktop and FPU MCUs (`B ∈ {32..=8192}`) |
+| **`NonUniformConvolver`** | `nonuniform` | `f32` (up to 8 causal stages) | `0` | Long IRs with cost-optimized schedules (`NonUniformPlan::optimize`, `B ∈ {32..=8192}`) |
 | **`FixedQ15DirectConvolver`** | `fixed-q15` | Q1.15 (`i64` accumulator) | `0` | FPU-less MCUs, ≤ 1 LSB error, half the RAM of `f32` |
 | **`FixedQ15PartitionedConvolver`** | `fixed-fft` | Q1.15 + BFP FFT/FDL | `0`¹ | Medium/long FIRs on FPU-less MCUs (`B ∈ {32..=1024}`) |
 | **`FixedQ15NonUniformConvolver`** | `fixed-nonuniform` | Q1.15 + BFP NUPC | `0` | Zero-latency long FIRs on FPU-less MCUs (`B ∈ {32..=1024}`) |
 
 ¹ The output for an input block is produced in the same call. A host that delivers fewer than `B` samples per callback adds `B` samples of framing delay, which is why the hybrid and NUPC engines exist.
 
-> **FFT range**: every `f32` FFT backend supports `N ∈ {64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384}` (`B ∈ {32..=8192}`). `fft_q15` supports `N ∈ {64..=2048}` (`B ∈ {32..=1024}`). Cost-model partition optimization (#15) and time-distributed transforms (#16) are tracked in [`docs/ROADMAP.md`](./docs/ROADMAP.md).
+> **FFT range & partition optimizer**: every `f32` FFT backend supports `N ∈ {64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384}` (`B ∈ {32..=8192}`), `fft_q15` supports `N ∈ {64..=2048}` (`B ∈ {32..=1024}`), and `NonUniformPlan::optimize` finds globally optimal causal NUPC schedules under `CostModel` and `ClearancePolicy` with zero heap allocation (#14, #15). Time-distributed transforms (#16) are tracked in [`docs/ROADMAP.md`](./docs/ROADMAP.md).
 
 ---
 

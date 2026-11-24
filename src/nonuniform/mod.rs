@@ -10,12 +10,19 @@
 //! in sample time via [`NonUniformScheduler`].
 
 pub mod memory;
+pub mod optimizer;
 pub mod plan;
 pub mod scheduler;
 mod stages;
 
 pub use memory::{
     NonUniformCapabilities, NonUniformMemoryRequirements, compute_f32_memory_requirements,
+};
+pub use optimizer::{
+    BlockModePartition, BlockModePolicy, BlockModeSegment, ClearancePolicy, CostModel,
+    MAX_OPTIMIZER_FDL_STAGES, OPTIMIZER_BLOCK_SIZES, OptimizationReport, OptimizerScratchCell,
+    block_mode_scratch_len, optimize_block_mode, optimizer_scratch_len, preset_esp32_c6_q15,
+    preset_esp32_p4_f32,
 };
 pub use plan::{
     BudgetVerdict, MAX_NONUNIFORM_STAGES, NonUniformBudget, NonUniformConfig, NonUniformPlan,

@@ -94,3 +94,8 @@ required-features = ["nonuniform"]
 name = "fixed_q15_bench"
 harness = false
 required-features = ["fixed-q15"]
+
+[[bench]]
+name = "optimizer_prediction_bench"
+harness = false
+required-features = ["nonuniform"]

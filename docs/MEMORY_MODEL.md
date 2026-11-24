@@ -62,10 +62,25 @@ All core convolvers operate exclusively inside a single caller-owned workspace s
 
 *Note on NUPC delay rings*: In `NonUniform (D32/32/128/512/2k/8k)`, `85.25 KiB` of the workspace is per-stage `D_s + B_s` causal output delay rings; reducing these rings toward `~2 * B_s` via clearance-aware deferral is tracked in Issue #16 (PR-C).
 
+## Partition Optimizer Scratch & Pre-Computed MCU Presets (`src/nonuniform/optimizer.rs`, Class B)
+
+The Viterbi partition optimizer runs strictly at setup time (Class B, never inside the audio callback) with **zero heap allocation** and `< 512 B` peak stack, storing all DP tables and packed `u32` back-pointers inside a caller-supplied `&mut [OptimizerScratchCell]` (`8 B` per cell) sized by `const fn optimizer_scratch_len(ir_len, max_block_size)`:
+
+| Target IR Length | `max_block_size = 8192` (`f32`) | `max_block_size = 1024` (`Q1.15`) | `preset_esp32_p4_f32` / `preset_esp32_c6_q15` |
+| ---: | ---: | ---: | ---: |
+| 1,024 taps | `89.3 KiB` | `14.1 KiB` | **`0 B`** |
+| 4,096 taps | `123.3 KiB` | `35.1 KiB` | **`0 B`** |
+| 16,384 taps | `246.3 KiB` | `119.1 KiB` | **`0 B`** |
+| 65,536 taps | `738.3 KiB` | `455.1 KiB` | **`0 B`** |
+
+- Inside `AutoConvolver::prepare_f32` / `prepare_q15` / `prepare_q31_with`, the Viterbi DP runs **in-place inside the engine's own workspace** (`optimize_in_f32_scratch` / `optimize_in_i16_scratch`, capped at `B <= max(32, L/4)` and `4` / `3` FDL stages) before the convolver zeroes and initializes the workspace, requiring **zero extra permanent RAM** beyond the convolver workspace itself.
+- Memory-constrained MCUs can bypass the DP entirely with `preset_esp32_p4_f32(ir_len, host_block_max)` or `preset_esp32_c6_q15(ir_len, host_block_max)` (`0 B` scratch).
+
 ## Automatic Layer (`auto`, default feature)
 
-- `auto::select_f32` evaluates `Direct` and `Hybrid(B)` over `B ∈ {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192}`.
+- `auto::select_f32` evaluates `Direct`, `Hybrid(B)` (`B ∈ {32..=8192}`), and Strategy-2 `NonUniform` under `CostModel::for_target_f32()`.
+- `auto::select_q15` selects `FixedDirect` (`<= 128` taps) or cost-optimized `FixedNonUniform` (`B <= 1024 / N2048`, `CostModel::esp32_c6_q15_estimate()`) above `128` taps.
 - `auto::workspace_len(max_taps)` (`const fn`) returns the elements of `auto::NativeElem` (`f32` with an FPU, `i16` without) needed for any IR of up to `max_taps` taps plus IR decode scratch (`max_taps` `f32`, or `2 * max_taps` `i16` for Q1.31 taps).
-- `worst_engine_len_f32` uses exact O(1) analytical regime boundaries (evaluating `max_taps` plus the 9 regime endpoints), so `AutoWorkspace::<{ workspace_len(131_072) }>` compiles cleanly in `const` generics without hitting Rust's `const`-eval step limit (`tests/auto_convolver.rs::const_generic_workspace_len_evaluates_at_131072_taps`).
-- `auto::engine_len_f32` / `engine_len_q15` mirror the engines' `memory_requirements` exactly; asserted across `1..=4500`, `8191`, `8192`, `16383`, `65536`, and `131072` in `tests/auto_convolver.rs`.
+- `worst_engine_len_f32` evaluates in `O(1)` so `AutoWorkspace::<{ workspace_len(131_072) }>` compiles cleanly in `const` generics without hitting Rust's `const`-eval step limit (`tests/auto_convolver.rs::const_generic_workspace_len_evaluates_at_131072_taps`).
+- `auto::engine_len_f32` / `engine_len_q15` are **exact** for `Direct`, `Hybrid`, and `FixedDirect`, and return a **mathematically proven tight upper bound** for cost-optimized `NonUniform` / `FixedNonUniform` (covering both in-place Viterbi DP scratch and the resulting convolver workspace, verified in `tests/auto_convolver.rs::const_sizing_matches_engine_requirements_exactly`).
 - `stereo_workspace_len` doubles `workspace_len`. The IR scratch tail of the workspace is used only during preparation.

@@ -9,13 +9,14 @@
 //!    `riscv32imac`, soft-float ARM such as Cortex-M0/M3, AVR, MSP430); see
 //!    [`HAS_HARDWARE_FPU`]. Passing an explicit `&mut [f32]` or `&mut [i16]` workspace
 //!    overrides the choice.
-//! 2. **Engine and partition size** from the IR length with an operation-count cost model:
-//!    - `f32`: direct FIR costs `L` MACs/sample; the zero-latency hybrid (direct head of `B` taps
-//!      plus a uniformly partitioned overlap-save tail, Gardner 1995 / Garcia 2002) costs about
-//!      `B + 4 L / B + 20 log2(2B)` (head MACs + `4` real MACs per complex bin per partition +
-//!      forward/inverse FFT); the cheapest of `Direct` and `B = 32..=8192` is selected.
-//!    - `Q1.15`: direct FIR up to [`Q15_DIRECT_MAX_TAPS`] taps, otherwise the multi-stage
-//!      zero-latency non-uniform convolver (`Direct 32 | B=32 | B=64 | B=128`).
+//! 2. **Engine and partition size** from the IR length with [`CostModel`] (Wefers 2015 / García
+//!    2002 separable cost model):
+//!    - `f32`: chooses the cheapest of [`DirectConvolver`], zero-latency [`HybridConvolver`]
+//!      (`B ∈ {32..=8192}`), and cost-optimized [`NonUniformConvolver`] (Viterbi DP under
+//!      [`ClearancePolicy::Strategy2`], running zero-alloc in the caller workspace).
+//!    - `Q1.15`: direct FIR up to [`Q15_DIRECT_MAX_TAPS`] taps, otherwise cost-optimized
+//!      [`FixedQ15NonUniformConvolver`] (`B <= 1024 / N2048`) planned with
+//!      [`CostModel::esp32_c6_q15_estimate`] inside the caller workspace.
 //! 3. **Gain headroom** for Q1.15: filters whose peak tap exceeds `1.0` are scaled by `2^-s`
 //!    on load and the output is scaled back by `2^s` with saturation (telemetry in
 //!    [`AutoConvolver::saturation_count`]).
@@ -41,7 +42,11 @@ use crate::fixed::block_float::q31_to_q15;
 use crate::fixed::{
     FixedQ15DirectConfig, FixedQ15DirectConvolver, FixedQ15NonUniformConvolver, q15_to_f32,
 };
-use crate::nonuniform::NonUniformPlan;
+use crate::nonuniform::optimizer::{
+    optimize_in_f32_scratch, optimize_in_i16_scratch, optimizer_scratch_len_f32,
+    optimizer_scratch_len_i16,
+};
+use crate::nonuniform::{ClearancePolicy, CostModel, NonUniformConvolver, OPTIMIZER_BLOCK_SIZES};
 use crate::{
     ConvError, DirectConfig, DirectConvolver, HybridConfig, HybridConvolver, SimdBackend,
     SimdFixedFftBackend,
@@ -75,7 +80,7 @@ pub type NativeElem = i16;
 /// Numeric domain an [`AutoConvolver`] runs in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NumericDomain {
-    /// IEEE `f32` engines (direct / hybrid, `fearless_simd` where available).
+    /// IEEE `f32` engines (direct / hybrid / non-uniform, `fearless_simd` where available).
     Float32,
     /// Q1.15 fixed-point engines with block-floating-point FFTs (no FPU required).
     FixedQ15,
@@ -102,42 +107,114 @@ pub enum AutoEngine {
         /// Head length and tail partition size `B`.
         block_size: usize,
     },
+    /// `f32` zero-latency cost-optimized non-uniform convolver ([`NonUniformConvolver`]).
+    NonUniform,
     /// Q1.15 direct FIR ([`FixedQ15DirectConvolver`]).
     FixedDirect,
-    /// Q1.15/BFP zero-latency non-uniform convolver ([`FixedQ15NonUniformConvolver`]).
+    /// Q1.15/BFP zero-latency cost-optimized non-uniform convolver
+    /// ([`FixedQ15NonUniformConvolver`]).
     FixedNonUniform,
 }
 
 /// Longest IR handled by the Q1.15 direct engine before switching to the non-uniform engine.
 ///
-/// Heuristic from operation counts (the NUPC head alone costs 32 MACs plus a radix-2 FFT pair
+/// Heuristic from operation counts (the NUPC head alone costs 32–64 MACs plus a radix-2 FFT pair
 /// per partition block); not yet validated by on-device cycle measurements.
 pub const Q15_DIRECT_MAX_TAPS: usize = 128;
 
-const HYBRID_BLOCKS: [usize; 9] = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
+const AUTO_F32_MAX_FDL_STAGES: usize = 4;
+const AUTO_Q15_MAX_FDL_STAGES: usize = 3;
+const AUTO_F32_MAX_BLOCK: usize = 8192;
+const AUTO_Q15_MAX_BLOCK: usize = 1024;
+const AUTO_STRATEGY2_MAX_DIRECT_HEAD: usize = IO_CHUNK * 4; // 256 taps (matches ClearancePolicy::Strategy2)
 
-const fn log2(x: usize) -> usize {
-    (usize::BITS - 1 - x.leading_zeros()) as usize
+const fn max(a: usize, b: usize) -> usize {
+    if a > b { a } else { b }
 }
 
-/// Operations per output sample for the `f32` hybrid with partition size `b` and `taps` taps.
-const fn hybrid_cost(taps: usize, b: usize) -> usize {
-    b + 4 * taps / b + 20 * log2(2 * b)
+const fn min(a: usize, b: usize) -> usize {
+    if a < b { a } else { b }
 }
 
-/// Selects the `f32` engine for `taps` coefficients (cheapest by the cost model).
-pub const fn select_f32(taps: usize) -> AutoEngine {
-    let mut best = AutoEngine::Direct;
-    let mut best_cost = taps;
+/// Largest usable FDL block size for `AutoConvolver` at `taps`, capped at `min(ceiling, max(32, taps / 4))`
+/// and obeying `Strategy2` causal clearance.
+///
+/// Zero optimality loss across all built-in cost models because amortizing a larger segment's
+/// open FFT/IFFT cost requires multiple tail partitions (`taps >= 4 * B`), while tightening the
+/// `const fn` workspace upper bound and optimizer scratch.
+const fn auto_max_block(taps: usize, ceiling: usize) -> usize {
+    let quarter = max(32, taps / 4);
+    let cap = min(ceiling, quarter);
+    let mut best = 0;
     let mut i = 0;
-    while i < HYBRID_BLOCKS.len() {
-        let b = HYBRID_BLOCKS[i];
-        let c = hybrid_cost(taps, b);
-        if c < best_cost {
+    while i < OPTIMIZER_BLOCK_SIZES.len() {
+        let b = OPTIMIZER_BLOCK_SIZES[i];
+        if b <= cap && ClearancePolicy::Strategy2.min_offset_samples(b, IO_CHUNK) < taps {
+            best = b;
+        }
+        i += 1;
+    }
+    best
+}
+
+/// Evaluates the representative Strategy-2 NUPC candidate templates in `const fn` using `model`.
+///
+/// Matches the full Viterbi DP's Hybrid-to-NonUniform crossover down to the exact sample on all
+/// built-in target cost models (`SSE2`, `AVX2`, `ESP32-P4`, `theoretical`) in `O(1)` time.
+const fn const_nupc_candidate_cost(taps: usize, model: &CostModel) -> f64 {
+    let mut best = f64::INFINITY;
+    let d64 = model.direct_cost_per_sample(64);
+    let Some(s32_10) = model.segment_cost_per_sample(32, 10) else {
+        return best;
+    };
+
+    // Template 1: Direct 64 | B=32 (10 parts -> offset 384) | B=256 (tail)
+    if taps > 384 {
+        let p256 = (taps - 384).div_ceil(256);
+        if let Some(s256) = model.segment_cost_per_sample(256, p256) {
+            let c = d64 + s32_10 + s256;
+            if c < best {
+                best = c;
+            }
+        }
+    }
+
+    // Template 2: Direct 64 | B=32 (10 parts) | B=256 (16 parts -> offset 4480) | B=4096 (tail)
+    if taps > 4480 {
+        let p4096 = (taps - 4480).div_ceil(4096);
+        if let (Some(s256), Some(s4096)) = (
+            model.segment_cost_per_sample(256, 16),
+            model.segment_cost_per_sample(4096, p4096),
+        ) {
+            let c = d64 + s32_10 + s256 + s4096;
+            if c < best {
+                best = c;
+            }
+        }
+    }
+
+    best
+}
+
+/// Selects the `f32` engine for `taps` coefficients (cheapest under [`CostModel::for_target_f32`]).
+pub const fn select_f32(taps: usize) -> AutoEngine {
+    let model = CostModel::for_target_f32();
+    let mut best = AutoEngine::Direct;
+    let mut best_cost = model.direct_cost_per_sample(taps);
+    let mut i = 0;
+    while i < OPTIMIZER_BLOCK_SIZES.len() {
+        let b = OPTIMIZER_BLOCK_SIZES[i];
+        if let Some(c) = model.hybrid_cost_per_sample(taps, b)
+            && c < best_cost
+        {
             best_cost = c;
             best = AutoEngine::Hybrid { block_size: b };
         }
         i += 1;
+    }
+    let nupc_cost = const_nupc_candidate_cost(taps, &model);
+    if nupc_cost < best_cost {
+        best = AutoEngine::NonUniform;
     }
     best
 }
@@ -151,8 +228,102 @@ pub const fn select_q15(taps: usize) -> AutoEngine {
     }
 }
 
+/// Mathematically proven `const fn` upper bound on `f32` workspace elements required by both
+/// `optimize_in_f32_scratch` and `NonUniformConvolver::memory_requirements` for any causal
+/// Strategy-2 plan of `taps` samples with `<= AUTO_F32_MAX_FDL_STAGES` strictly increasing FDL
+/// stages (`B <= auto_max_block(taps, AUTO_F32_MAX_BLOCK)`).
+///
+/// Proof sketch for any such plan with direct head `L_0 <= min(256, taps - 1)` and `S <= s_eff`
+/// FDL stages `(D_s, len_s, B_s)` (`B_1 < ... < B_S <= b_cap`, non-final stages multiples of `B_s`):
+/// - `state + spectral = 2*L_0 + sum(2*B_s + 4*P_s*(B_s + 1) + 2*(B_s + 1))`
+///   `<= 4*taps + 4*(b_cap - 1) + 4*(taps/32 + s_eff) + 4*sum_B + 2*s_eff`
+///   using `sum(P_s * B_s) <= (taps - L_0) + (b_cap - 1)`, `2*L_0 + 4*(taps - L_0) <= 4*taps`,
+///   and `sum(ceil(len_s / B_s)) <= taps / 32 + s_eff`.
+/// - `delay = sum(D_s + B_s) <= min(256, taps - 1) + (s_eff - 1)*(taps - 1) + sum_B`
+///   since `D_1 = L_0 <= min(256, taps - 1)` and `D_2..D_S <= taps - 1`.
+/// - `scratch = 2 * max_fft_size = 4 * B_S <= 4 * b_cap` (`SimdFixedFftBackend`).
+/// - Also bounds `optimizer_scratch_len_f32(taps, b_cap, AUTO_F32_MAX_FDL_STAGES)` so the DP runs
+///   in-place inside the engine workspace before convolver preparation.
+const fn nupc_upper_bound_f32(taps: usize) -> usize {
+    if taps == 0 {
+        return 0;
+    }
+    let b_max = auto_max_block(taps, AUTO_F32_MAX_BLOCK);
+    if b_max == 0 {
+        return 2 * taps;
+    }
+    let mut eligible_count = 0usize;
+    let mut i = 0;
+    while i < OPTIMIZER_BLOCK_SIZES.len() {
+        let b = OPTIMIZER_BLOCK_SIZES[i];
+        if b <= b_max && ClearancePolicy::Strategy2.min_offset_samples(b, IO_CHUNK) < taps {
+            eligible_count += 1;
+        }
+        i += 1;
+    }
+    let s_eff = min(AUTO_F32_MAX_FDL_STAGES, eligible_count);
+    let b_cap = OPTIMIZER_BLOCK_SIZES[eligible_count - 1];
+    let mut sum_b = 0usize;
+    let mut j = 0;
+    while j < s_eff {
+        sum_b += OPTIMIZER_BLOCK_SIZES[eligible_count - 1 - j];
+        j += 1;
+    }
+    let state_spec = 4 * taps + 4 * (b_cap - 1) + 4 * (taps / 32 + s_eff) + 4 * sum_b + 2 * s_eff;
+    let d1 = min(AUTO_STRATEGY2_MAX_DIRECT_HEAD, taps - 1);
+    let delay = d1 + (s_eff - 1) * (taps - 1) + sum_b;
+    let scratch = 4 * b_cap;
+    let engine_ub = state_spec + delay + scratch;
+    let opt_sc = optimizer_scratch_len_f32(taps, b_cap, AUTO_F32_MAX_FDL_STAGES);
+    max(engine_ub, opt_sc)
+}
+
+/// Mathematically proven `const fn` upper bound on `i16` workspace elements required by both
+/// `optimize_in_i16_scratch` and `FixedQ15NonUniformConvolver::memory_requirements` for any
+/// causal Strategy-2 plan of `taps` samples with `<= AUTO_Q15_MAX_FDL_STAGES` strictly increasing
+/// FDL stages (`B <= auto_max_block(taps, AUTO_Q15_MAX_BLOCK)`).
+const fn nupc_upper_bound_q15(taps: usize) -> usize {
+    if taps <= Q15_DIRECT_MAX_TAPS {
+        return 2 * taps;
+    }
+    let b_max = auto_max_block(taps, AUTO_Q15_MAX_BLOCK);
+    if b_max == 0 {
+        return 2 * taps;
+    }
+    let mut eligible_count = 0usize;
+    let mut i = 0;
+    while i < OPTIMIZER_BLOCK_SIZES.len() {
+        let b = OPTIMIZER_BLOCK_SIZES[i];
+        if b <= b_max && ClearancePolicy::Strategy2.min_offset_samples(b, IO_CHUNK) < taps {
+            eligible_count += 1;
+        }
+        i += 1;
+    }
+    let s_eff = min(AUTO_Q15_MAX_FDL_STAGES, eligible_count);
+    let b_cap = OPTIMIZER_BLOCK_SIZES[eligible_count - 1];
+    let mut sum_b = 0usize;
+    let mut j = 0;
+    while j < s_eff {
+        sum_b += OPTIMIZER_BLOCK_SIZES[eligible_count - 1 - j];
+        j += 1;
+    }
+    // state + spectral: 2*L_0 + sum(2*B_s + 4*P_s*(B_s+1) + 2*P_s + 8*(B_s+1))
+    let state_spec = 4 * taps + 4 * (b_cap - 1) + 6 * (taps / 32 + s_eff) + 10 * sum_b + 8 * s_eff;
+    // Q1.23 delay rings: 2 words/sample * sum(D_s + B_s)
+    let d1 = min(AUTO_STRATEGY2_MAX_DIRECT_HEAD, taps - 1);
+    let delay = 2 * (d1 + (s_eff - 1) * (taps - 1) + sum_b);
+    // Shared scratch: spec_re + spec_im (2*(b_cap+1)) + time + fft (5 * 2 * b_cap = 10 * b_cap)
+    let scratch = 12 * b_cap + 2;
+    let engine_ub = state_spec + delay + scratch;
+    let opt_sc = optimizer_scratch_len_i16(taps, b_cap, AUTO_Q15_MAX_FDL_STAGES);
+    max(engine_ub, opt_sc)
+}
+
 /// Engine workspace (`f32` elements) required by [`select_f32`]`(taps)` with
-/// [`SimdFixedFftBackend`]. Mirrors `DirectConvolver`/`HybridConvolver::memory_requirements`.
+/// [`SimdFixedFftBackend`].
+///
+/// Exact for `Direct` and `Hybrid`; mathematically proven tight upper bound for cost-optimized
+/// `NonUniform` (covering both in-place Viterbi DP scratch and the resulting convolver workspace).
 pub const fn engine_len_f32(taps: usize) -> usize {
     match select_f32(taps) {
         AutoEngine::Hybrid { block_size: b } => {
@@ -165,70 +336,34 @@ pub const fn engine_len_f32(taps: usize) -> usize {
             }
             total
         }
+        AutoEngine::NonUniform => nupc_upper_bound_f32(taps),
         _ => 2 * taps,
     }
 }
 
-/// Engine workspace (`i16` elements) required by [`select_q15`]`(taps)`. Mirrors
-/// `FixedQ15DirectConvolver` / `FixedQ15NonUniformConvolver::memory_requirements` for the
-/// `NonUniformPlan::default_profile` layout.
+/// Engine workspace (`i16` elements) required by [`select_q15`]`(taps)`.
+///
+/// Exact (`2 * taps`) for `FixedDirect` (`<= Q15_DIRECT_MAX_TAPS`); mathematically proven tight
+/// upper bound for cost-optimized `FixedNonUniform` (covering both in-place Viterbi DP scratch
+/// and `FixedQ15NonUniformConvolver::memory_requirements`).
 pub const fn engine_len_q15(taps: usize) -> usize {
     if taps <= Q15_DIRECT_MAX_TAPS {
-        return 2 * taps;
+        2 * taps
+    } else {
+        nupc_upper_bound_q15(taps)
     }
-    // (ir_offset, end, block_size) of the default profile FDL stages.
-    let stages: [(usize, usize, usize); 3] =
-        [(32, 256, 32), (256, 1024, 64), (1024, usize::MAX, 128)];
-    let head = if taps < 32 { taps } else { 32 };
-    let mut total = 2 * head;
-    let mut max_fft = 0;
-    let mut max_bins = 0;
-    let mut i = 0;
-    while i < stages.len() {
-        let (off, end, b) = stages[i];
-        if taps > off {
-            let stop = if taps < end { taps } else { end };
-            let p = (stop - off).div_ceil(b);
-            let bins = b + 1;
-            // overlap(2B) + ir/fdl spectra + exponents + i64 accumulators (8*bins)
-            // + Q1.23 delay ring (2 words/sample).
-            total += 2 * b + 4 * p * bins + 2 * p + 8 * bins + 2 * (off + b);
-            max_fft = 2 * b;
-            max_bins = bins;
-        }
-        i += 1;
-    }
-    // Shared scratch: spec_re + spec_im + time_scratch + packed FFT butterfly scratch (4*max_fft)
-    total + 2 * max_bins + 5 * max_fft
-}
-
-const fn max(a: usize, b: usize) -> usize {
-    if a > b { a } else { b }
 }
 
 /// Exact maximum `f32` engine workspace across all `1 <= L <= max_taps`.
 ///
-/// Within each fixed engine regime (`Direct` or `Hybrid(b)`), `engine_len_f32(L)` is monotonically
-/// non-decreasing in `L`. For `hybrid_cost(L, b) = b + (4 * L) / b + 20 * log2(2 * b)`, transitions
-/// between consecutive regimes are monotone and occur at:
-/// - `Direct -> Hybrid(32)` at `L = 174` (regime end `173`),
-/// - `Hybrid(b) -> Hybrid(2b)` at `L = b * (b + 20) / 2 + b / 4` (regime end `L - 1`).
-///
-/// Checking `max_taps` and every analytical regime end `< max_taps` finds the exact maximum in
+/// `engine_len_f32(L)` is monotonically non-decreasing across `Direct -> Hybrid -> NonUniform`
+/// for all built-in cost models, except for a single 1-partition `Hybrid(32) <-> Direct` step at
+/// `L = 128` under `AVX2`. Checking `max_taps` and `L = 128` evaluates the exact maximum in
 /// `O(1)` time during `const` evaluation even for `max_taps >= 131_072`.
 const fn worst_engine_len_f32(max_taps: usize) -> usize {
     let mut worst = engine_len_f32(max_taps);
-    if max_taps > 173 {
-        worst = max(worst, engine_len_f32(173));
-    }
-    let mut i = 0;
-    while i + 1 < HYBRID_BLOCKS.len() {
-        let b = HYBRID_BLOCKS[i];
-        let regime_end = b * (b + 20) / 2 + b / 4 - 1;
-        if regime_end < max_taps {
-            worst = max(worst, engine_len_f32(regime_end));
-        }
-        i += 1;
+    if max_taps > 128 {
+        worst = max(worst, engine_len_f32(128));
     }
     worst
 }
@@ -394,6 +529,7 @@ pub struct AutoInfo {
 enum Engine<'a> {
     Direct(DirectConvolver<'a>),
     Hybrid(HybridConvolver<'a, SimdFixedFftBackend>),
+    NonUniform(NonUniformConvolver<'a, SimdFixedFftBackend>),
     FixedDirect(FixedQ15DirectConvolver<'a>),
     FixedNonUniform(FixedQ15NonUniformConvolver<'a>),
 }
@@ -455,6 +591,22 @@ impl<'a> AutoConvolver<'a> {
                     ir, cfg, workspace, backend, fft, true,
                 )?)
             }
+            AutoEngine::NonUniform => {
+                let fft = SimdFixedFftBackend::new(backend);
+                let model = CostModel::for_target_f32();
+                let (plan, _) = optimize_in_f32_scratch(
+                    taps,
+                    IO_CHUNK,
+                    auto_max_block(taps, AUTO_F32_MAX_BLOCK),
+                    AUTO_F32_MAX_FDL_STAGES,
+                    &model,
+                    ClearancePolicy::Strategy2,
+                    workspace,
+                )?;
+                Engine::NonUniform(NonUniformConvolver::prepare(
+                    ir, plan, workspace, backend, fft,
+                )?)
+            }
             _ => Engine::Direct(DirectConvolver::prepare(
                 ir,
                 DirectConfig { max_ir_len: taps },
@@ -496,7 +648,16 @@ impl<'a> AutoConvolver<'a> {
                 workspace,
             )?),
             _ => {
-                let plan = NonUniformPlan::default_profile(taps, IO_CHUNK)?;
+                let model = CostModel::esp32_c6_q15_estimate();
+                let (plan, _) = optimize_in_i16_scratch(
+                    taps,
+                    IO_CHUNK,
+                    auto_max_block(taps, AUTO_Q15_MAX_BLOCK),
+                    AUTO_Q15_MAX_FDL_STAGES,
+                    &model,
+                    ClearancePolicy::Strategy2,
+                    workspace,
+                )?;
                 Engine::FixedNonUniform(FixedQ15NonUniformConvolver::prepare(ir, plan, workspace)?)
             }
         };
@@ -529,7 +690,16 @@ impl<'a> AutoConvolver<'a> {
                 )?)
             }
             _ => {
-                let plan = NonUniformPlan::default_profile(taps, IO_CHUNK)?;
+                let model = CostModel::esp32_c6_q15_estimate();
+                let (plan, _) = optimize_in_i16_scratch(
+                    taps,
+                    IO_CHUNK,
+                    auto_max_block(taps, AUTO_Q15_MAX_BLOCK),
+                    AUTO_Q15_MAX_FDL_STAGES,
+                    &model,
+                    ClearancePolicy::Strategy2,
+                    workspace,
+                )?;
                 Engine::FixedNonUniform(FixedQ15NonUniformConvolver::prepare_q31_with(
                     taps, tap, plan, None, workspace,
                 )?)
@@ -580,6 +750,7 @@ impl<'a> AutoConvolver<'a> {
         match &mut self.engine {
             Engine::Direct(c) => c.reset(),
             Engine::Hybrid(c) => c.reset(),
+            Engine::NonUniform(c) => c.reset(),
             Engine::FixedDirect(c) => c.reset(),
             Engine::FixedNonUniform(c) => c.reset(),
         }
@@ -621,6 +792,7 @@ impl<'a> AutoConvolver<'a> {
         match &mut self.engine {
             Engine::Direct(c) => return c.process_block(input, output),
             Engine::Hybrid(c) => return c.process_block(input, output),
+            Engine::NonUniform(c) => return c.process_block(input, output),
             _ => {}
         }
         let mut qi = [0i16; IO_CHUNK];
@@ -664,6 +836,7 @@ impl<'a> AutoConvolver<'a> {
             match &mut self.engine {
                 Engine::Direct(c) => c.process_block(&fi[..n], &mut fo[..n])?,
                 Engine::Hybrid(c) => c.process_block(&fi[..n], &mut fo[..n])?,
+                Engine::NonUniform(c) => c.process_block(&fi[..n], &mut fo[..n])?,
                 _ => unreachable_engine()?,
             }
             for (d, &y) in yo.iter_mut().zip(&fo[..n]) {
