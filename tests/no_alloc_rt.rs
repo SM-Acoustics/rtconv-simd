@@ -531,6 +531,25 @@ fn verify_large_ffts_f32(backend: SimdBackend) {
                 .unwrap();
             black_box(&out);
         });
+        assert_zero_alloc("simdfixed_large::staged_steps", || {
+            let fwd_steps = simd.staged_forward_steps(size);
+            for step in 0..fwd_steps {
+                let t_in: &[f32] = if step == 0 { &x } else { &[] };
+                simd.rfft_forward_step(size, step, t_in, &mut re, &mut im, &mut [])
+                    .unwrap();
+            }
+            let inv_steps = simd.staged_inverse_steps(size);
+            for step in 0..inv_steps {
+                let t_out: &mut [f32] = if step + 1 == inv_steps {
+                    &mut out
+                } else {
+                    &mut []
+                };
+                simd.rfft_inverse_step(size, step, &mut re, &mut im, t_out, &mut [])
+                    .unwrap();
+            }
+            black_box(&out);
+        });
         #[cfg(feature = "phastft")]
         {
             let mut sc_phast = vec![0.0f32; phast.scratch_len_f32(size)];
@@ -638,7 +657,9 @@ fn verify_large_ffts_f32(backend: SimdBackend) {
 fn verify_large_ffts_q15() {
     use rtconv_simd::FftSize;
     use rtconv_simd::fixed::{
-        fixed_fft_scratch_len_i32, irfft_q15_bfp_with_scratch, rfft_q15_bfp_with_scratch,
+        FixedStagedFftState, fixed_fft_scratch_len_i32, fixed_fft_staged_steps,
+        irfft_q15_bfp_step_with_scratch, irfft_q15_bfp_with_scratch,
+        rfft_q15_bfp_step_with_scratch, rfft_q15_bfp_with_scratch,
     };
     use rtconv_simd::{FixedQ15PartitionedConfig, FixedQ15PartitionedConvolver};
 
@@ -653,6 +674,47 @@ fn verify_large_ffts_q15() {
         assert_zero_alloc("fixed_fft_large::rfft_irfft", || {
             let exp = rfft_q15_bfp_with_scratch(size, &x, &mut re, &mut im, &mut sc).unwrap();
             let sats = irfft_q15_bfp_with_scratch(size, &re, &im, exp, &mut out, &mut sc).unwrap();
+            black_box((sats, &out));
+        });
+        assert_zero_alloc("fixed_fft_large::staged_steps", || {
+            let steps = fixed_fft_staged_steps(size);
+            let mut fstate = FixedStagedFftState::new();
+            let mut exp = 0i8;
+            for step in 0..steps {
+                let t_in: &[i16] = if step == 0 { &x } else { &[] };
+                if let Some(e) = rfft_q15_bfp_step_with_scratch(
+                    size,
+                    step,
+                    t_in,
+                    &mut re,
+                    &mut im,
+                    &mut sc,
+                    &mut fstate,
+                )
+                .unwrap()
+                {
+                    exp = e;
+                }
+            }
+            let mut istate = FixedStagedFftState::new();
+            let mut sats = 0u64;
+            for step in 0..steps {
+                let t_out: &mut [i16] = if step + 1 == steps { &mut out } else { &mut [] };
+                if let Some(s) = irfft_q15_bfp_step_with_scratch(
+                    size,
+                    step,
+                    &re,
+                    &im,
+                    exp,
+                    t_out,
+                    &mut sc,
+                    &mut istate,
+                )
+                .unwrap()
+                {
+                    sats = s;
+                }
+            }
             black_box((sats, &out));
         });
     }

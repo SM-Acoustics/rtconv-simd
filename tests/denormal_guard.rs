@@ -290,3 +290,42 @@ fn nonuniform_large_stages_up_to_n16384_flush_subnormals() {
     assert_eq!(y, y_ref, "NUPC large stages mismatch");
     assert_eq!(y.iter().filter(|v| v.is_subnormal()).count(), 0);
 }
+
+#[cfg(feature = "nonuniform")]
+#[test]
+fn nonuniform_time_distributed_strategy1_flushes_subnormals() {
+    use rtconv_simd::{
+        ClearancePolicy, CostModel, NonUniformConvolver, NonUniformPlan, OptimizerScratchCell,
+        optimizer_scratch_len,
+    };
+
+    let backend = SimdBackend::detect_or_baseline();
+    let fft = SimdFixedFftBackend::new(backend);
+    let model = CostModel::for_backend_f32(backend);
+    let ir_len = 8_192usize;
+    let mut sc = vec![OptimizerScratchCell::ZERO; optimizer_scratch_len(ir_len, 8192)];
+    let (plan, _) =
+        NonUniformPlan::optimize(ir_len, 64, &model, ClearancePolicy::Strategy1, &mut sc).unwrap();
+    let req = NonUniformConvolver::memory_requirements(&plan, &fft).unwrap();
+
+    let ir = deep_tail_ir(ir_len);
+    let ir_flushed: Vec<f32> = ir.iter().map(|&v| flush_tiny(v)).collect();
+    let x = decaying_input(12_288);
+    let x_flushed: Vec<f32> = x.iter().map(|&v| flush_tiny(v)).collect();
+
+    let run_s1 = |h: &[f32], inp: &[f32]| -> Vec<f32> {
+        let mut ws = vec![0.0f32; req.total_f32];
+        let mut c = NonUniformConvolver::prepare(h, plan, &mut ws, backend, fft).unwrap();
+        let mut y = vec![0.0f32; inp.len()];
+        for (xi, yo) in inp.chunks(64).zip(y.chunks_mut(64)) {
+            c.process_block(xi, yo).unwrap();
+        }
+        assert_eq!(c.deadline_misses(), 0);
+        y
+    };
+
+    let y = run_s1(&ir, &x);
+    let y_ref = run_s1(&ir_flushed, &x_flushed);
+    assert_eq!(y, y_ref, "NUPC Strategy-1 staged subnormal mismatch");
+    assert_eq!(y.iter().filter(|v| v.is_subnormal()).count(), 0);
+}

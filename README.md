@@ -82,7 +82,7 @@ All core engines are mono; use one instance per channel, or the `auto` stereo wr
 
 ¹ The output for an input block is produced in the same call. A host that delivers fewer than `B` samples per callback adds `B` samples of framing delay, which is why the hybrid and NUPC engines exist.
 
-> **FFT range & partition optimizer**: every `f32` FFT backend supports `N ∈ {64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384}` (`B ∈ {32..=8192}`), `fft_q15` supports `N ∈ {64..=2048}` (`B ∈ {32..=1024}`), and `NonUniformPlan::optimize` finds globally optimal causal NUPC schedules under `CostModel` and `ClearancePolicy` with zero heap allocation (#14, #15). Time-distributed transforms (#16) are tracked in [`docs/ROADMAP.md`](./docs/ROADMAP.md).
+> **Large FFTs, Viterbi optimizer & time-distributed transforms (#14, #15, #16)**: every `f32` FFT backend supports `N ∈ {64..=16384}` (`B ∈ {32..=8192}`), `fft_q15` supports `N ∈ {64..=2048}` (`B ∈ {32..=1024}`), `NonUniformPlan::optimize` finds globally optimal causal NUPC schedules under `CostModel` and `ClearancePolicy` with zero heap allocation, and `SimdFixedFftBackend` / `fft_q15` time-distribute RFFT/CMAC/IFFT across each stage's causal clearance with power-of-two `2 * B_s` output delay rings. Remaining roadmap tracks (#17–#24) are documented in [`docs/ROADMAP.md`](./docs/ROADMAP.md).
 
 ---
 
@@ -185,8 +185,9 @@ More: [`examples/`](./examples) (`direct_fir`, `hybrid_convolution`, `nonuniform
 Measured at 48 kHz, 32-sample blocks (`666.67 µs` budget); full GUM Type A uncertainty (`k = 2`) and tail percentile tables in [`docs/BENCHMARKS.md`](./docs/BENCHMARKS.md).
 
 - **Windows 11 / AMD Ryzen 3 PRO 2300U (`0.2.0` baseline, `N ≤ 256`)**: `Hybrid(H128/T128) SPREAD` at 16,383 taps worst-phase p99 = **5.20 µs (0.78 % of budget)**.
-- **Linux x86-64 / Intel Xeon 2.30 GHz (PR-A `#14`, `N64..=N16384`, `SimdFixedFftBackend`, `n = 4096`)**:
-  - `65,536` taps: `Hybrid(H512/T512) SPREAD` mean = **`9.15 ± 0.26 µs`** (SSE2) / **`6.72 ± 0.18 µs`** (AVX2+FMA); 6-stage `NUPC (D32..8k)` cuts mean latency `1.8×–2.3×` vs `default_profile` (`24.12 → 10.6 ± 1.4 µs` SSE2, **`p50 = 4.25 µs`**), while monolithic `N16384` bursts (`p99 = 105.08 µs`) motivate time-distributed transforms (#16).
+- **Linux x86-64 / Intel Xeon 2.30 GHz (PR-A/B/C `#14`–`#16`, `N64..=N16384`, `SimdFixedFftBackend`, `n = 4096`)**:
+  - `65,536` taps (`H = 32`, time-distributed NUPC): `NUPC optimized (Strategy1)` achieves **`8.78 ± 0.30 µs`** (`p95 = 15.12 µs`, `p99 = 39.79 µs` = `5.97%` of budget) on SSE2 — beating `Hybrid(H512/T512) SPREAD` (`8.84 ± 0.20 µs`, `p95 = 17.59 µs`) — and **`9.75 ± 0.38 µs`** (`p99 = 48.02 µs`) on AVX2+FMA; at `16,384` taps AVX2+FMA, `NUPC Strategy1` achieves **`p99 = 15.25 µs`** (`2.29%` of budget, beating `Hybrid(H512)` `15.62 µs`).
+  - Deterministic sliding-window op-trace (`tests/time_distributed_fft.rs`): `Strategy1` peak/mean op ratio stays **`1.21×–1.76×`** across `4k–64k` taps (`2.69×` lower peak ops than monolithic at `64k`), while `2 * B_s` bitmask rings save `−21` to `−37 KiB` on large `f32` plans and `−16 KiB` scratch + `−75%` delay rings on high-offset `Q1.15` plans.
   - Isolated `RFFT + IFFT` (`N = 128..=8192`): `SimdFixedFft(AVX2)` reaches up to **`1.28×`** over zero-stack `MicroFftBackend` (`PhastFftBackend` reaches **`3.25×`**).
 
 ### Numerical accuracy (`HOST_TESTED`)

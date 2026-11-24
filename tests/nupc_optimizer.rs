@@ -428,10 +428,13 @@ fn formal_sample_time_clearance_c_equals_1_boundary() {
         // - Delay ring commits at `t = 2*B - 2`, right before sample `t = 2*B - 1 = D_s` is read!
         // - Zero overlap with Block 1 arriving at `t = 2*B - 1` (`deadline_misses() == 0`).
         let d_valid = 2 * b - 1;
-        // With `host_block_max = 1` and 2 partitions (`spread_steps = 2`), `step_interval`
-        // equals `effective_window` exactly, so the final step fires at `t = (B - 1) + W_eff`.
+        // Choose `num_partitions = B - 2 * log2(B)` so `total_units = R + P + I == B` exactly:
+        // with `span = B` (`D_s = 2B - 1`), every sample in `[B - 1 ..= 2B - 2]` runs 1 unit,
+        // whereas with `span = B - 1` (`D_s = 2B - 2`), slot 0 is forced to run 2 units.
+        let r_steps = b.trailing_zeros() as usize;
+        let parts = b - 2 * r_steps;
         let plan_valid = NonUniformPlan::validate(NonUniformConfig {
-            max_ir_len: d_valid + 2 * b,
+            max_ir_len: d_valid + parts * b,
             host_block_max: 1,
             stages: &[
                 NonUniformStageConfig {
@@ -441,7 +444,7 @@ fn formal_sample_time_clearance_c_equals_1_boundary() {
                 },
                 NonUniformStageConfig {
                     ir_offset: d_valid,
-                    ir_len: 2 * b,
+                    ir_len: parts * b,
                     block_size: b,
                 },
             ],
@@ -452,22 +455,17 @@ fn formal_sample_time_clearance_c_equals_1_boundary() {
         let mut start_t = None;
         let mut finish_t = None;
         for t in 0..(2 * b) {
-            match sched.on_fdl_sample(1, &plan_valid) {
-                StageWorkItem::StartBlockAndCmac { finish_ifft, .. } => {
-                    if start_t.is_none() {
-                        start_t = Some(t);
-                    }
-                    if finish_ifft && finish_t.is_none() {
-                        finish_t = Some(t);
-                    }
-                }
-                StageWorkItem::ContinueCmac { finish_ifft, .. }
-                    if finish_ifft && finish_t.is_none() =>
-                {
-                    finish_t = Some(t);
-                }
-                _ => {}
+            let item = sched.on_fdl_sample(1, &plan_valid);
+            if item.starts_block() && start_t.is_none() {
+                start_t = Some(t);
             }
+            if item.commits_output() && finish_t.is_none() {
+                finish_t = Some(t);
+            }
+            assert!(
+                !matches!(item, StageWorkItem::CombinedSlice { .. }),
+                "D_s = 2B - 1 with U = B must execute strictly 1 pure unit per sample"
+            );
         }
         assert_eq!(start_t, Some(b - 1));
         assert_eq!(finish_t, Some(2 * b - 2));
@@ -502,7 +500,7 @@ fn formal_sample_time_clearance_c_equals_1_boundary() {
         // Total inclusive span drops to `B - 1 < B`, proving `c = 1` is tight!
         let d_short = 2 * b - 2;
         let plan_short = NonUniformPlan::validate(NonUniformConfig {
-            max_ir_len: d_short + 2 * b,
+            max_ir_len: d_short + parts * b,
             host_block_max: 1,
             stages: &[
                 NonUniformStageConfig {
@@ -512,7 +510,7 @@ fn formal_sample_time_clearance_c_equals_1_boundary() {
                 },
                 NonUniformStageConfig {
                     ir_offset: d_short,
-                    ir_len: 2 * b,
+                    ir_len: parts * b,
                     block_size: b,
                 },
             ],
@@ -521,20 +519,23 @@ fn formal_sample_time_clearance_c_equals_1_boundary() {
         let mut sched_short = NonUniformScheduler::new(&plan_short);
         let mut s_t = None;
         let mut f_t = None;
+        let mut saw_double_unit = false;
         for t in 0..(2 * b) {
-            match sched_short.on_fdl_sample(1, &plan_short) {
-                StageWorkItem::StartBlockAndCmac { finish_ifft, .. } => {
-                    if s_t.is_none() {
-                        s_t = Some(t);
-                    }
-                    if finish_ifft && f_t.is_none() {
-                        f_t = Some(t);
-                    }
-                }
-                StageWorkItem::ContinueCmac { finish_ifft, .. } if finish_ifft && f_t.is_none() => {
-                    f_t = Some(t);
-                }
-                _ => {}
+            let item = sched_short.on_fdl_sample(1, &plan_short);
+            if item.starts_block() && s_t.is_none() {
+                s_t = Some(t);
+            }
+            if item.commits_output() && f_t.is_none() {
+                f_t = Some(t);
+            }
+            if let StageWorkItem::RfftSteps {
+                step_start,
+                step_end,
+                ..
+            } = item
+                && step_end - step_start >= 2
+            {
+                saw_double_unit = true;
             }
         }
         let span_short = f_t.unwrap() - s_t.unwrap() + 1;
@@ -542,6 +543,10 @@ fn formal_sample_time_clearance_c_equals_1_boundary() {
             span_short,
             b - 1,
             "D_s = 2B - 2 yields only B - 1 < B samples, proving c = 1 is tight"
+        );
+        assert!(
+            saw_double_unit,
+            "D_s = 2B - 2 with U = B must double-schedule slot 0"
         );
     }
 }

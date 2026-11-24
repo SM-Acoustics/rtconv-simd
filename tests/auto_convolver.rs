@@ -94,9 +94,9 @@ fn actual_engine_len_q15(taps: usize) -> usize {
 #[test]
 fn const_sizing_matches_engine_requirements_exactly() {
     // Exact equality for Direct / Hybrid / FixedDirect, and mathematically proven upper bound
-    // (`>= actual` with explicit documented upper-margin ceiling) for cost-optimized NUPC engines.
-    // Note: in PR-B delay rings are `D_s + B_s` (bounded by `(S_eff - 1) * L`), giving <= 3.5x
-    // upper margin on large NUPC plans (tightened further in PR-C when delay rings shrink to 2*B_s).
+    // (`>= actual` with tight documented upper-margin ceiling) for cost-optimized NUPC engines.
+    // With PR-C shared real input ring + power-of-two `2 * B_s` output rings, the static
+    // `const fn` upper bound stays within ~1.4x–2.0x of the exact post-DP workspace requirement.
     for taps in (1..=600).chain([
         700, 1024, 1500, 2048, 3000, 4096, 5120, 5121, 8191, 8192, 9503, 9504, 16383, 16384, 35391,
         35392, 65536, 131072,
@@ -110,7 +110,7 @@ fn const_sizing_matches_engine_requirements_exactly() {
                     "f32 NUPC bound underflow taps={taps}: bound={f32_len} < actual={f32_actual}"
                 );
                 assert!(
-                    f32_len <= f32_actual * 4 + 4096,
+                    f32_len <= f32_actual * 2 + 8192,
                     "f32 NUPC bound unexpectedly loose taps={taps}: bound={f32_len} actual={f32_actual}"
                 );
             }
@@ -127,7 +127,7 @@ fn const_sizing_matches_engine_requirements_exactly() {
                     "q15 NUPC bound underflow taps={taps}: bound={q15_len} < actual={q15_actual}"
                 );
                 assert!(
-                    q15_len <= q15_actual * 4 + 2048,
+                    q15_len <= q15_actual * 3 + 2048,
                     "q15 NUPC bound unexpectedly loose taps={taps}: bound={q15_len} actual={q15_actual}"
                 );
             }

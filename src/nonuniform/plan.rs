@@ -4,7 +4,7 @@
 //! Validates causal zero-latency stage alignment (`ir_offset >= block_size` for FDL stages),
 //! contiguity, FFT block sizes, slack windows, and admission-control budgets before streaming.
 
-use crate::{ConvError, FftSize};
+use crate::{ConvError, FftBackend, FftSize};
 
 /// Maximum number of stages supported in a single [`NonUniformPlan`] (stack-allocated, zero heap).
 pub const MAX_NONUNIFORM_STAGES: usize = 8;
@@ -120,25 +120,15 @@ pub struct NonUniformPlan {
     estimated_worst_ops_per_callback: usize,
 }
 
-/// Conservative upper bound on real multiply-accumulate-equivalent operations that one FDL
-/// stage can execute inside a single host callback of `host_block` samples.
-///
-/// Model (operations, not cycles):
-/// - A complex multiply-accumulate (CMAC) costs 4 real MACs; one partition costs `4 * (B + 1)`.
-/// - One `N`-point real transform is bounded by `5 * N * log2(N)` (Cooley–Tukey radix-2
-///   operation count, conservative for the half-length complex FFT used for real data).
-/// - A callback of `H` samples contains at most `t = ceil(H / B)` block triggers, each running
-///   one forward RFFT and (unless spread) one IFFT plus all `P` partitions.
-/// - A spread stage may additionally finish one in-flight block (one IFFT) and run at most
-///   `min(steps, ceil(H / step_interval) + 1)` CMAC sub-steps of `ceil(P / steps)` partitions for
-///   each of the `t + 1` blocks overlapping the callback, never more than `(t + 1) * P` partitions.
-fn fdl_stage_worst_ops(
+/// Operation count model constants for one FDL stage of block size `B` (`N = 2 * B`):
+/// - One `N`-point real transform is bounded by `5 * N * log2(N)`.
+/// - One CMAC partition costs `4 * (B + 1)` real multiply-accumulate equivalents.
+#[inline]
+pub(crate) fn fdl_stage_op_weights(
     block_size: usize,
-    num_partitions: usize,
-    slack_samples: usize,
-    spread_steps: usize,
-    host_block: usize,
-) -> Result<usize, ConvError> {
+    rfft_steps: usize,
+    ifft_steps: usize,
+) -> Result<(usize, usize, usize), ConvError> {
     let overflow = ConvError::ArithmeticOverflow;
     let n = block_size.checked_mul(2).ok_or(overflow)?;
     let log2_n = n.trailing_zeros() as usize;
@@ -146,40 +136,116 @@ fn fdl_stage_worst_ops(
         .checked_mul(log2_n)
         .and_then(|v| v.checked_mul(5))
         .ok_or(overflow)?;
-    let partition_ops = (block_size + 1).checked_mul(4).ok_or(overflow)?;
-    let triggers = host_block.div_ceil(block_size).max(1);
+    let r = rfft_steps.max(1);
+    let i = ifft_steps.max(1);
+    let rfft_step_ops = transform_ops.div_ceil(r);
+    let ifft_step_ops = transform_ops.div_ceil(i);
+    let partition_ops = block_size
+        .checked_add(1)
+        .and_then(|v| v.checked_mul(4))
+        .ok_or(overflow)?;
+    Ok((rfft_step_ops, ifft_step_ops, partition_ops))
+}
 
-    let spread = spread_steps > 1 && slack_samples > 0;
-    let (transforms, partitions) = if !spread {
-        (
-            triggers.checked_mul(2).ok_or(overflow)?,
-            triggers.checked_mul(num_partitions).ok_or(overflow)?,
-        )
+/// Exact, alignment-independent upper bound on real multiply-accumulate-equivalent operations
+/// that one time-distributed FDL stage can execute inside ANY contiguous `host_block`-sample
+/// callback under the periodic floor schedule `target(slot) = ((slot + 1) * U) / span`.
+///
+/// Proof of soundness (all `H >= 1`, `B >= 1`, `1 <= span <= B`, `U = R + P + I`):
+/// - Write `H = q * B + rem` (`q = H / B`, `rem = H % B`).
+/// - Every `B` consecutive samples execute exactly `U` units (`full_block_ops`).
+/// - Over the remaining `rem` samples (whether inside one active window or straddling the tail
+///   of block `k` and the head of block `k + 1`), the schedule executes at most
+///   `u_rem = min(U, ceil(rem * U / span))` units because
+///   `ceil(L_1 * U / span) + floor(L_2 * U / span) <= ceil((L_1 + L_2) * U / span)`.
+/// - Assigning those `u_rem` units to the highest-cost unit types first (RFFT/IFFT steps before
+///   CMAC partitions) produces an airtight upper bound on actual callback operations.
+pub(crate) fn fdl_stage_worst_ops_for_steps(
+    block_size: usize,
+    num_partitions: usize,
+    slack_samples: usize,
+    host_block: usize,
+    rfft_steps: usize,
+    ifft_steps: usize,
+) -> Result<usize, ConvError> {
+    let overflow = ConvError::ArithmeticOverflow;
+    let r = rfft_steps.max(1);
+    let i = ifft_steps.max(1);
+    let (rfft_step_ops, ifft_step_ops, partition_ops) = fdl_stage_op_weights(block_size, r, i)?;
+
+    let total_units = r
+        .checked_add(num_partitions)
+        .and_then(|v| v.checked_add(i))
+        .ok_or(overflow)?;
+    let full_block_ops = r
+        .checked_mul(rfft_step_ops)
+        .and_then(|v| v.checked_add(i.checked_mul(ifft_step_ops)?))
+        .and_then(|v| v.checked_add(num_partitions.checked_mul(partition_ops)?))
+        .ok_or(overflow)?;
+
+    let w_eff = slack_samples.min(block_size.saturating_sub(1));
+    let span = w_eff.checked_add(1).ok_or(overflow)?;
+
+    let full_periods = host_block / block_size;
+    let rem = host_block % block_size;
+
+    let rem_ops = if rem == 0 {
+        0
     } else {
-        let blocks = triggers.checked_add(1).ok_or(overflow)?;
-        let effective_window = slack_samples.min(block_size - 1).max(1);
-        let step_interval = (effective_window / (spread_steps - 1)).max(1);
-        let steps_per_block = spread_steps.min(host_block.div_ceil(step_interval) + 1);
-        let parts_per_step = num_partitions.div_ceil(spread_steps);
-        let by_steps = blocks
-            .checked_mul(steps_per_block)
-            .and_then(|v| v.checked_mul(parts_per_step))
-            .ok_or(overflow)?;
-        let by_total = blocks.checked_mul(num_partitions).ok_or(overflow)?;
-        (
-            triggers.checked_mul(2).ok_or(overflow)? + 1,
-            by_steps.min(by_total),
-        )
+        let u_rem = rem
+            .checked_mul(total_units)
+            .ok_or(overflow)?
+            .div_ceil(span)
+            .min(total_units);
+        let (hi_ops, hi_cnt, lo_ops, lo_cnt) = if rfft_step_ops >= ifft_step_ops {
+            (rfft_step_ops, r, ifft_step_ops, i)
+        } else {
+            (ifft_step_ops, i, rfft_step_ops, r)
+        };
+        let take_hi = u_rem.min(hi_cnt);
+        let after_hi = u_rem - take_hi;
+        let take_lo = after_hi.min(lo_cnt);
+        let take_cmac = after_hi - take_lo;
+        take_hi
+            .checked_mul(hi_ops)
+            .and_then(|v| v.checked_add(take_lo.checked_mul(lo_ops)?))
+            .and_then(|v| v.checked_add(take_cmac.checked_mul(partition_ops)?))
+            .ok_or(overflow)?
     };
 
-    transforms
-        .checked_mul(transform_ops)
-        .and_then(|t| {
-            partitions
-                .checked_mul(partition_ops)
-                .and_then(|c| t.checked_add(c))
-        })
+    full_periods
+        .checked_mul(full_block_ops)
+        .and_then(|v| v.checked_add(rem_ops))
         .ok_or(overflow)
+}
+
+/// Conservative time-distributed upper bound across both native staged engines:
+/// `f32` (`SimdFixedFftBackend`: `log2(B)` steps) and `Q1.15` (`fft_q15`: `log2(2*B)` steps).
+fn fdl_stage_worst_ops(
+    block_size: usize,
+    num_partitions: usize,
+    slack_samples: usize,
+    host_block: usize,
+) -> Result<usize, ConvError> {
+    let f32_steps = block_size.trailing_zeros() as usize;
+    let q15_steps = f32_steps + 1;
+    let ops_f32 = fdl_stage_worst_ops_for_steps(
+        block_size,
+        num_partitions,
+        slack_samples,
+        host_block,
+        f32_steps,
+        f32_steps,
+    )?;
+    let ops_q15 = fdl_stage_worst_ops_for_steps(
+        block_size,
+        num_partitions,
+        slack_samples,
+        host_block,
+        q15_steps,
+        q15_steps,
+    )?;
+    Ok(ops_f32.max(ops_q15))
 }
 
 impl NonUniformPlan {
@@ -245,22 +311,23 @@ impl NonUniformPlan {
                 let num_partitions = st.ir_len.div_ceil(st.block_size);
                 let slack_samples = st.ir_offset - st.block_size;
 
-                // Spread partitions across available slack when slack >= host_block_max.
-                // Bounded by `num_partitions` and by 8 sub-steps.
-                let spread_steps =
-                    if slack_samples >= config.host_block_max && config.host_block_max > 0 {
-                        let max_slots = (slack_samples / config.host_block_max).max(1);
-                        max_slots.min(num_partitions.max(1)).min(8)
-                    } else {
-                        1
-                    };
+                // Active time-distributed work slots per block across `W_eff + 1` samples
+                // (`1` when `slack == 0`, up to `min(2 * log2(B) + P, W_eff + 1)` otherwise).
+                let w_eff = slack_samples.min(st.block_size.saturating_sub(1));
+                let span = w_eff + 1;
+                let r_steps = st.block_size.trailing_zeros() as usize;
+                let total_units = 2 * r_steps + num_partitions;
+                let spread_steps = if slack_samples > 0 {
+                    total_units.min(span).max(1)
+                } else {
+                    1
+                };
 
                 worst_ops = worst_ops
                     .checked_add(fdl_stage_worst_ops(
                         st.block_size,
                         num_partitions,
                         slack_samples,
-                        spread_steps,
                         config.host_block_max,
                     )?)
                     .ok_or(ConvError::ArithmeticOverflow)?;
@@ -374,17 +441,73 @@ impl NonUniformPlan {
         self.host_block_max
     }
 
+    /// Direct FIR multiply-accumulate operations executed per input sample (`0` if no direct stage).
+    #[inline]
+    pub const fn direct_sample_ops(&self) -> usize {
+        if self.stage_count > 0 && matches!(self.stages[0].kind, NonUniformStageKind::Direct) {
+            self.stages[0].ir_len
+        } else {
+            0
+        }
+    }
+
     /// Conservative upper-bound estimate of real multiply-accumulate-equivalent operations
-    /// (direct MACs, FFT/IFFT operation counts and 4 MACs per complex MAC) that a single host
-    /// callback of up to `host_block_max` samples can execute. This is an operation count, not a
-    /// cycle count or a WCET proof.
+    /// (direct MACs, time-distributed FFT/IFFT stage operations and 4 MACs per complex MAC)
+    /// that a single host callback of up to `host_block_max` samples can execute on the native
+    /// staged engines ([`crate::SimdFixedFftBackend`] and `FixedQ15NonUniformConvolver`).
+    /// This is an operation count, not a cycle count or a WCET proof.
     #[inline]
     pub const fn estimated_worst_ops_per_callback(&self) -> usize {
         self.estimated_worst_ops_per_callback
     }
 
-    /// Evaluates this plan and a computed workspace size in bytes against a [`NonUniformBudget`].
-    pub fn check_budget(&self, budget: NonUniformBudget, workspace_bytes: usize) -> BudgetVerdict {
+    /// Exact alignment-independent worst-case per-callback operation bound for a specific
+    /// [`FftBackend`] (reflecting its actual [`FftBackend::staged_forward_steps`] and
+    /// [`FftBackend::staged_inverse_steps`], including `1` for monolithic backends such as
+    /// [`crate::MicroFftBackend`]).
+    pub fn estimated_worst_ops_for_backend<F: FftBackend>(
+        &self,
+        fft: &F,
+    ) -> Result<usize, ConvError> {
+        let mut worst_ops = 0usize;
+        for st in self.stages() {
+            match st.kind {
+                NonUniformStageKind::Direct => {
+                    let ops = st
+                        .ir_len
+                        .checked_mul(self.host_block_max)
+                        .ok_or(ConvError::ArithmeticOverflow)?;
+                    worst_ops = worst_ops
+                        .checked_add(ops)
+                        .ok_or(ConvError::ArithmeticOverflow)?;
+                }
+                NonUniformStageKind::Fdl => {
+                    let fft_enum = FftSize::from_len(st.fft_size)?;
+                    let r_steps = fft.staged_forward_steps(fft_enum);
+                    let i_steps = fft.staged_inverse_steps(fft_enum);
+                    let stage_ops = fdl_stage_worst_ops_for_steps(
+                        st.block_size,
+                        st.num_partitions,
+                        st.slack_samples,
+                        self.host_block_max,
+                        r_steps,
+                        i_steps,
+                    )?;
+                    worst_ops = worst_ops
+                        .checked_add(stage_ops)
+                        .ok_or(ConvError::ArithmeticOverflow)?;
+                }
+            }
+        }
+        Ok(worst_ops)
+    }
+
+    fn check_budget_with_ops(
+        &self,
+        budget: NonUniformBudget,
+        workspace_bytes: usize,
+        worst_ops: usize,
+    ) -> BudgetVerdict {
         if budget.safety_margin_percent > 90
             || budget.sample_rate_hz == 0
             || budget.max_frames_per_callback == 0
@@ -407,7 +530,7 @@ impl NonUniformPlan {
                 .max_ops_per_callback
                 .saturating_mul(100 - budget.safety_margin_percent as usize)
                 / 100;
-            if self.estimated_worst_ops_per_callback > usable {
+            if worst_ops > usable {
                 return BudgetVerdict::Exceeded;
             }
         }
@@ -416,5 +539,26 @@ impl NonUniformPlan {
         } else {
             BudgetVerdict::Unverified
         }
+    }
+
+    /// Evaluates this plan and a computed workspace size in bytes against a [`NonUniformBudget`].
+    pub fn check_budget(&self, budget: NonUniformBudget, workspace_bytes: usize) -> BudgetVerdict {
+        self.check_budget_with_ops(
+            budget,
+            workspace_bytes,
+            self.estimated_worst_ops_per_callback,
+        )
+    }
+
+    /// Evaluates this plan against a [`NonUniformBudget`] using the exact worst-case operation
+    /// bound for `fft` (accounting for monolithic vs. time-distributed transform backends).
+    pub fn check_budget_for_backend<F: FftBackend>(
+        &self,
+        budget: NonUniformBudget,
+        workspace_bytes: usize,
+        fft: &F,
+    ) -> Result<BudgetVerdict, ConvError> {
+        let worst_ops = self.estimated_worst_ops_for_backend(fft)?;
+        Ok(self.check_budget_with_ops(budget, workspace_bytes, worst_ops))
     }
 }

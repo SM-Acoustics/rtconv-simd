@@ -6,11 +6,12 @@ use crate::{ConvError, FftBackend, FftSize};
 /// Explicit memory breakdown for [`crate::NonUniformConvolver`] in `f32` elements and bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NonUniformMemoryRequirements {
-    /// Time-domain state buffers (direct FIR history + coefficients, FDL input overlap buffers).
+    /// Time-domain state buffers (direct FIR history + coefficients, plus the single shared
+    /// real input history ring for all FDL stages).
     pub state_f32: usize,
     /// Frequency-domain buffers (FDL ring spectra + pre-transformed IR partition spectra + accumulators).
     pub spectral_f32: usize,
-    /// Per-stage causal output delay ring buffers.
+    /// Per-stage power-of-two causal output delay ring buffers (`2 * B_s` per FDL stage).
     pub delay_f32: usize,
     /// Shared FFT/IFFT scratch memory (sized for the largest FFT stage in the plan).
     pub scratch_f32: usize,
@@ -43,17 +44,48 @@ pub struct NonUniformCapabilities {
     pub budget_verdict: BudgetVerdict,
 }
 
-/// Computes the ring capacity for an FDL stage's causal output delay buffer:
-/// `ir_offset + block_size` (always `>= 2 * block_size`), guaranteeing zero overwrite
-/// between `delay_write_pos` and `delay_read_pos`.
+/// Computes the power-of-two output ring capacity for an FDL stage: `2 * block_size`.
+///
+/// With deferred scheduling (`defer_s = slack_s.saturating_sub(block_size - 1)`), block `k`
+/// starts at `t_start(k) = (k + 1) * B_s - 1 + defer_s` and commits `B_s` samples at
+/// `[k * B_s + D_s .. (k + 1) * B_s + D_s)` on or before `t_fin(k) = k * B_s + D_s - 1`.
+/// Even if block `k` commits immediately at `t_start(k)`, the live unread + written span is
+/// `<= B_s + min(slack_s, B_s - 1) <= 2 * B_s - 1 < 2 * B_s`, guaranteeing zero overwrite
+/// with branchless bitmask indexing (`pos & (2 * B_s - 1)`).
 #[inline]
-pub(crate) fn stage_delay_ring_len(
-    ir_offset: usize,
-    block_size: usize,
-) -> Result<usize, ConvError> {
-    ir_offset
-        .checked_add(block_size)
+pub(crate) fn stage_delay_ring_len(block_size: usize) -> Result<usize, ConvError> {
+    block_size
+        .checked_mul(2)
         .ok_or(ConvError::ArithmeticOverflow)
+}
+
+/// Computes the exact capacity of the single shared real input history ring for all FDL stages:
+/// `0` if the plan has no FDL stages, otherwise `max_s(max(2 * B_s, D_s + 1))`.
+///
+/// At `t_start(k) = (k + 1) * B_s - 1 + defer_s`, stage `s` captures the `2 * B_s` overlap-save
+/// window ending at `x[(k + 1) * B_s - 1]`. The oldest sample needed has age
+/// `2 * B_s - 1 + defer_s = max(2 * B_s - 1, D_s)`, so `max(2 * B_s, D_s + 1)` samples
+/// guarantees exact preservation of both initial zero padding (at `k = 0`) and prior input
+/// history (for all `k >= 1`).
+pub(crate) fn shared_input_ring_len(plan: &NonUniformPlan) -> Result<usize, ConvError> {
+    let mut len = 0usize;
+    for st in plan.stages() {
+        if st.kind == NonUniformStageKind::Fdl {
+            let two_b = st
+                .block_size
+                .checked_mul(2)
+                .ok_or(ConvError::ArithmeticOverflow)?;
+            let offset_plus_one = st
+                .ir_offset
+                .checked_add(1)
+                .ok_or(ConvError::ArithmeticOverflow)?;
+            let req = two_b.max(offset_plus_one);
+            if req > len {
+                len = req;
+            }
+        }
+    }
+    Ok(len)
 }
 
 /// Computes the exact workspace requirements for a validated [`NonUniformPlan`] and `FftBackend`.
@@ -61,7 +93,7 @@ pub fn compute_f32_memory_requirements<F: FftBackend>(
     plan: &NonUniformPlan,
     fft: &F,
 ) -> Result<NonUniformMemoryRequirements, ConvError> {
-    let mut state_f32 = 0usize;
+    let mut state_f32 = shared_input_ring_len(plan)?;
     let mut spectral_f32 = 0usize;
     let mut delay_f32 = 0usize;
     let mut max_fft_size = 0usize;
@@ -87,14 +119,10 @@ pub fn compute_f32_memory_requirements<F: FftBackend>(
                     });
                 }
                 let bins = st.block_size + 1;
-                // State: overlap_in (fft_size = 2 * B)
-                state_f32 = state_f32
-                    .checked_add(st.fft_size)
-                    .ok_or(ConvError::ArithmeticOverflow)?;
                 // Spectral:
                 // - ir_re + ir_im: 2 * P * bins
-                // - fdl_re + fdl_im: 2 * P * bins
-                // - acc_re + acc_im: 2 * bins
+                // - fdl_re + fdl_im: 2 * P * bins (newest slot also holds in-place staged RFFT)
+                // - acc_re + acc_im: 2 * bins (also holds in-place staged IFFT)
                 let part_bins = st
                     .num_partitions
                     .checked_mul(bins)
@@ -107,8 +135,8 @@ pub fn compute_f32_memory_requirements<F: FftBackend>(
                     .checked_add(stage_spec)
                     .ok_or(ConvError::ArithmeticOverflow)?;
 
-                // Delay output ring: ir_offset + block_size
-                let dlen = stage_delay_ring_len(st.ir_offset, st.block_size)?;
+                // Power-of-two output ring: 2 * block_size
+                let dlen = stage_delay_ring_len(st.block_size)?;
                 delay_f32 = delay_f32
                     .checked_add(dlen)
                     .ok_or(ConvError::ArithmeticOverflow)?;

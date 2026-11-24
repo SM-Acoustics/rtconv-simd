@@ -16,6 +16,7 @@ Evolution plan for `rtconv-simd` after `0.2.0`. Status labels keep three things 
 | IEEE 754 subnormal guard (`simd_kernels::DENORMAL_GUARD = 2^-63`) | Implemented. Measured on x86 without FTZ/DAZ: up to 80× slowdown removed |
 | FFT sizes | `N64..=N16384` (`B = 32..=8192`) in all `f32` backends; `N64..=N2048` (`B = 32..=1024`) in `fft_q15` (R1 / #14, `HOST_TESTED`, `CROSS_COMPILE_VERIFIED`, `DEVICE_VERIFIED = NO`) |
 | NUPC partition optimizer | Zero-alloc `#![no_std]` Viterbi DP (`CostModel`, `ClearancePolicy`, `NonUniformPlan::optimize`, block-mode Wefers validation, MCU presets; R2 / #15, `HOST_TESTED`, `CROSS_COMPILE_VERIFIED`, `DEVICE_VERIFIED = NO`) |
+| Time-distributed FFT/IFFT & clearance deferral | In-place staged RFFT/IFFT (`SimdFixedFftBackend` `N64..=N16384`, `fft_q15` `N64..=N2048`), periodic ceiling scheduler, single shared real input ring, power-of-two `2 * B_s` output rings (R3 / #16, `HOST_TESTED`, `CROSS_COMPILE_VERIFIED`, `DEVICE_VERIFIED = NO`) |
 | Device execution (ESP32-C6 / ESP32-P4) | `CROSS_COMPILE_VERIFIED`, `DEVICE_VERIFIED = NO` |
 
 ---
@@ -26,7 +27,7 @@ Evolution plan for `rtconv-simd` after `0.2.0`. Status labels keep three things 
 | :-: | :--- | :--- | :---: | :---: | :---: |
 | R1 | **FFT sizes `N512`–`N16384`** (f32), up to `N2048` in `fft_q15` | §8.2: non-uniform partitions pay off for `N > 20·B`. §6.12: 88,200 taps at B=128 cost 240 vs 2,018 cycles/sample (8.4×) | [#14](https://github.com/SM-Acoustics/rtconv-simd/issues/14) | `VERIFIED (HOST_ONLY)` / `CROSS_COMPILE_VERIFIED` | — |
 | R2 | **Partition optimizer**: García DAG + Viterbi with minimum-clearance restrictions and a benchmark-calibrated `CostModel` | §6.5.2 states/weights (Eq. 6.41–6.45); §6.5.3 minimal-load partitions are impractical (zero clearance); §6.5.4 strategies 1–2; Ch. 7 cost models | [#15](https://github.com/SM-Acoustics/rtconv-simd/issues/15) | `VERIFIED (HOST_ONLY)` / `CROSS_COMPILE_VERIFIED` | R1 |
-| R3 | **Time-distributed FFT/IFFT** and even per-callback load on single-core MCUs | §6.8 manual preemption and subdivision of transforms (Hurchalla); §6.4.6 Gardner time spans | [#16](https://github.com/SM-Acoustics/rtconv-simd/issues/16) | Open | R1 |
+| R3 | **Time-distributed FFT/IFFT** and even per-callback load on single-core MCUs | §6.8 manual preemption and subdivision of transforms (Hurchalla); §6.4.6 Gardner time spans | [#16](https://github.com/SM-Acoustics/rtconv-simd/issues/16) | `VERIFIED (HOST_ONLY)` / `CROSS_COMPILE_VERIFIED` | R1 |
 | R4 | **Glitch-free filter exchange**: FD crossfade (UPOLS) and coherent / asynchronous NUPC exchange | §4.4.1 TD crossfade (+50–60 %); §4.4.2 FD crossfade, 3-coefficient operator (+17–34 %); §6.11 Müller-Tomfelde strategies | [#17](https://github.com/SM-Acoustics/rtconv-simd/issues/17) | Open | — |
 | R5 | **Frequency-domain MIMO**: shared input spectra, crossover networks, true stereo, dual-channel complex FFT | §4.2 / §5.5 transform once per input and output; §4.3 parallel assemblies (2.0–4.1×); §4.2.1 complex-FFT dual channel (1.56× at ≤ 128 taps); §6.9 NUPC MIMO | [#18](https://github.com/SM-Acoustics/rtconv-simd/issues/18) | Open | — |
 | R6 | **Opt-in perceptual spectral pruning** (lossy, research) | §6.13 Lee et al. / Primavera et al. (~30 % speed-up) | [#22](https://github.com/SM-Acoustics/rtconv-simd/issues/22) | Open | S2 (optional) |

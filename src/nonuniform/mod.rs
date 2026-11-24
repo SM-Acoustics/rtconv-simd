@@ -6,8 +6,10 @@
 //! `y[n] = sum_{s=0}^{S-1} (x * h_s)[n - D_s]`
 //!
 //! where each FDL stage satisfies the strict causal zero-latency bound `D_s >= B_s`, and
-//! stages with positive slack (`D_s > B_s`) spread their FDL CMAC work deterministically
-//! in sample time via [`NonUniformScheduler`].
+//! stages with positive slack (`D_s > B_s`) distribute forward RFFT stages, spectral CMAC
+//! partitions, and inverse IFFT stages deterministically in sample time via
+//! [`NonUniformScheduler`], with deferred execution shrinking each stage's output delay ring
+//! to power-of-two `2 * B_s`.
 
 pub mod memory;
 pub mod optimizer;
@@ -28,11 +30,11 @@ pub use plan::{
     BudgetVerdict, MAX_NONUNIFORM_STAGES, NonUniformBudget, NonUniformConfig, NonUniformPlan,
     NonUniformStageConfig, NonUniformStageKind, NonUniformStagePlan,
 };
-pub use scheduler::{NonUniformScheduler, StageScheduleState, StageWorkItem};
+pub use scheduler::{NonUniformScheduler, StageScheduleState, StageWorkItem, stage_work_item_ops};
 
 use crate::nonuniform::stages::{
-    WorkspaceLayout, direct_stage_process_sample, fdl_stage_cmac_and_maybe_ifft,
-    fdl_stage_start_block,
+    WorkspaceLayout, direct_stage_process_sample, fdl_stage_run_cmac, fdl_stage_run_ifft_steps,
+    fdl_stage_run_rfft_steps,
 };
 use crate::{ConvError, FftBackend, FftSize, SimdBackend};
 
@@ -100,7 +102,7 @@ impl<'a, F: FftBackend> NonUniformConvolver<'a, F> {
         let req = compute_f32_memory_requirements(&plan, &fft)?;
         let budget_verdict = match budget {
             Some(b) => {
-                let verdict = plan.check_budget(b, req.total_bytes);
+                let verdict = plan.check_budget_for_backend(b, req.total_bytes, &fft)?;
                 if verdict == BudgetVerdict::Exceeded {
                     return Err(ConvError::InvalidNonUniformConfig);
                 }
@@ -220,8 +222,18 @@ impl<'a, F: FftBackend> NonUniformConvolver<'a, F> {
     #[inline]
     fn process_sample_inner(&mut self, x: f32) -> Result<f32, ConvError> {
         let x = crate::simd_kernels::flush_tiny(x);
+        let shared_in_off = self.layout.shared_in_off;
+        let shared_in_len = self.layout.shared_in_len;
+        let in_write_pos = self.layout.shared_in_write_pos;
+        if shared_in_len > 0 {
+            self.workspace[shared_in_off + in_write_pos] = x;
+        }
+
         let mut sum = 0.0f32;
         let stage_count = self.layout.stage_count;
+        let time_scratch_off = self.layout.time_scratch_off;
+        let fft_scratch_off = self.layout.fft_scratch_off;
+        let max_fft_scratch = self.layout.max_fft_scratch;
 
         for idx in 0..stage_count {
             if self.layout.stages[idx].kind == 0 {
@@ -229,76 +241,160 @@ impl<'a, F: FftBackend> NonUniformConvolver<'a, F> {
                 sum += direct_stage_process_sample(self.workspace, st, x, self.backend);
             } else {
                 let st = &mut self.layout.stages[idx];
-                let b = st.block_size;
-                let fill_before = self.scheduler.stage_state(idx).input_fill;
-                // Write incoming sample into overlap-save second half (`overlap_in[B + fill]`).
-                self.workspace[st.overlap_in_off + b + fill_before] = x;
 
-                // Read causally aligned delayed contribution for current sample.
+                // Read causally aligned delayed contribution (power-of-two bitmask, zero division).
                 let read_pos = self.scheduler.stage_state(idx).delay_read_pos;
-                let ring_idx = read_pos % st.delay_ring_len;
+                let ring_idx = read_pos & st.delay_ring_mask;
                 let y_stage = self.workspace[st.delay_ring_off + ring_idx];
                 self.workspace[st.delay_ring_off + ring_idx] = 0.0;
                 self.scheduler.stage_state_mut(idx).delay_read_pos = read_pos + 1;
                 sum += y_stage;
 
                 // Advance sample-time scheduler and execute any FDL work due at this boundary.
-                let work = self.scheduler.on_fdl_sample(idx, &self.plan);
+                let work = self.scheduler.on_fdl_sample_with_steps(
+                    idx,
+                    &self.plan,
+                    st.rfft_steps,
+                    st.ifft_steps,
+                );
                 match work {
                     StageWorkItem::None => {}
-                    StageWorkItem::StartBlockAndCmac {
-                        part_start,
-                        part_end,
-                        finish_ifft,
+                    StageWorkItem::RfftSteps {
+                        step_start,
+                        step_end,
+                        finish_rfft,
                     } => {
-                        let mut write_pos = self.scheduler.stage_state(idx).delay_write_pos;
-                        fdl_stage_start_block(
+                        fdl_stage_run_rfft_steps(
                             self.workspace,
                             st,
-                            self.layout.time_scratch_off,
-                            self.layout.fft_scratch_off,
-                            self.layout.max_fft_scratch,
-                            part_start,
-                            part_end,
-                            finish_ifft,
-                            &mut write_pos,
-                            self.backend,
+                            shared_in_off,
+                            shared_in_len,
+                            in_write_pos,
+                            time_scratch_off,
+                            fft_scratch_off,
+                            max_fft_scratch,
+                            step_start,
+                            step_end,
+                            finish_rfft,
                             &self.fft,
                         )?;
-                        self.scheduler.stage_state_mut(idx).delay_write_pos = write_pos;
                     }
                     StageWorkItem::ContinueCmac {
                         part_start,
                         part_end,
                         finish_ifft,
                     } => {
+                        fdl_stage_run_cmac(self.workspace, st, part_start, part_end, self.backend);
+                        if finish_ifft {
+                            let mut write_pos = self.scheduler.stage_state(idx).delay_write_pos;
+                            fdl_stage_run_ifft_steps(
+                                self.workspace,
+                                st,
+                                time_scratch_off,
+                                fft_scratch_off,
+                                max_fft_scratch,
+                                0,
+                                st.ifft_steps,
+                                true,
+                                &mut write_pos,
+                                &self.fft,
+                            )?;
+                            self.scheduler.stage_state_mut(idx).delay_write_pos = write_pos;
+                        }
+                    }
+                    StageWorkItem::IfftSteps {
+                        step_start,
+                        step_end,
+                        commit_output,
+                    } => {
                         let mut write_pos = self.scheduler.stage_state(idx).delay_write_pos;
-                        fdl_stage_cmac_and_maybe_ifft(
+                        fdl_stage_run_ifft_steps(
                             self.workspace,
                             st,
-                            self.layout.time_scratch_off,
-                            self.layout.fft_scratch_off,
-                            self.layout.max_fft_scratch,
-                            part_start,
-                            part_end,
-                            finish_ifft,
+                            time_scratch_off,
+                            fft_scratch_off,
+                            max_fft_scratch,
+                            step_start,
+                            step_end,
+                            commit_output,
                             &mut write_pos,
-                            self.backend,
                             &self.fft,
                         )?;
                         self.scheduler.stage_state_mut(idx).delay_write_pos = write_pos;
+                    }
+                    StageWorkItem::CombinedSlice {
+                        rfft_start,
+                        rfft_end,
+                        finish_rfft,
+                        cmac_start,
+                        cmac_end,
+                        ifft_start,
+                        ifft_end,
+                        commit_output,
+                    } => {
+                        if rfft_start < rfft_end {
+                            fdl_stage_run_rfft_steps(
+                                self.workspace,
+                                st,
+                                shared_in_off,
+                                shared_in_len,
+                                in_write_pos,
+                                time_scratch_off,
+                                fft_scratch_off,
+                                max_fft_scratch,
+                                rfft_start,
+                                rfft_end,
+                                finish_rfft,
+                                &self.fft,
+                            )?;
+                        }
+                        if cmac_start < cmac_end {
+                            fdl_stage_run_cmac(
+                                self.workspace,
+                                st,
+                                cmac_start,
+                                cmac_end,
+                                self.backend,
+                            );
+                        }
+                        if ifft_start < ifft_end {
+                            let mut write_pos = self.scheduler.stage_state(idx).delay_write_pos;
+                            fdl_stage_run_ifft_steps(
+                                self.workspace,
+                                st,
+                                time_scratch_off,
+                                fft_scratch_off,
+                                max_fft_scratch,
+                                ifft_start,
+                                ifft_end,
+                                commit_output,
+                                &mut write_pos,
+                                &self.fft,
+                            )?;
+                            self.scheduler.stage_state_mut(idx).delay_write_pos = write_pos;
+                        }
                     }
                 }
             }
         }
 
+        if shared_in_len > 0 {
+            let next = in_write_pos + 1;
+            self.layout.shared_in_write_pos = if next == shared_in_len { 0 } else { next };
+        }
         self.scheduler.advance_sample();
         Ok(crate::simd_kernels::flush_tiny(sum))
     }
 
-    /// Deterministically resets all delay lines, FDL rings, and scheduler cursors while
-    /// preserving the pre-transformed impulse response spectra.
+    /// Deterministically resets all delay lines, FDL rings, shared input history, and scheduler
+    /// cursors while preserving the pre-transformed impulse response spectra.
     pub fn reset(&mut self) {
+        if self.layout.shared_in_len > 0 {
+            self.workspace
+                [self.layout.shared_in_off..self.layout.shared_in_off + self.layout.shared_in_len]
+                .fill(0.0);
+            self.layout.shared_in_write_pos = 0;
+        }
         for idx in 0..self.layout.stage_count {
             let st = &mut self.layout.stages[idx];
             if st.kind == 0 {
@@ -306,7 +402,6 @@ impl<'a, F: FftBackend> NonUniformConvolver<'a, F> {
                 st.direct_head = 0;
             } else {
                 let part_bins = st.num_partitions * st.bins;
-                self.workspace[st.overlap_in_off..st.overlap_in_off + st.fft_size].fill(0.0);
                 self.workspace[st.fdl_re_off..st.fdl_re_off + part_bins].fill(0.0);
                 self.workspace[st.fdl_im_off..st.fdl_im_off + part_bins].fill(0.0);
                 self.workspace[st.acc_re_off..st.acc_re_off + st.bins].fill(0.0);

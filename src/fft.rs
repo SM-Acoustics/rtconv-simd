@@ -158,6 +158,71 @@ pub trait FftBackend {
         time_out: &mut [f32],
         scratch: &mut [f32],
     ) -> Result<(), ConvError>;
+
+    /// Returns `true` if this backend supports zero-extra-RAM, in-place time-distributed
+    /// transform subdivision via [`Self::rfft_forward_step`] and [`Self::rfft_inverse_step`].
+    #[inline]
+    fn supports_staged_fft(&self) -> bool {
+        false
+    }
+
+    /// Number of bounded-cost forward RFFT steps for `size` (`1` for monolithic backends).
+    #[inline]
+    fn staged_forward_steps(&self, _size: FftSize) -> usize {
+        1
+    }
+
+    /// Number of bounded-cost inverse C2R IFFT steps for `size` (`1` for monolithic backends).
+    #[inline]
+    fn staged_inverse_steps(&self, _size: FftSize) -> usize {
+        1
+    }
+
+    /// Executes one bounded-cost forward RFFT step (`step` in `0..self.staged_forward_steps(size)`).
+    ///
+    /// - `time_in` (`len == N`) is read on `step == 0` (unused on subsequent steps for staged backends).
+    /// - `spec_re` and `spec_im` (`len >= N / 2 + 1`) carry the in-place transform state across
+    ///   steps and hold the completed split-complex spectrum after the final step.
+    /// - Backends with `supports_staged_fft() == false` fall back to [`Self::rfft_forward`] on `step == 0`.
+    fn rfft_forward_step(
+        &self,
+        size: FftSize,
+        step: usize,
+        time_in: &[f32],
+        spec_re: &mut [f32],
+        spec_im: &mut [f32],
+        scratch: &mut [f32],
+    ) -> Result<(), ConvError> {
+        if step == 0 {
+            self.rfft_forward(size, time_in, spec_re, spec_im, scratch)
+        } else {
+            Err(ConvError::InvalidStateTransition)
+        }
+    }
+
+    /// Executes one bounded-cost normalized inverse C2R IFFT step
+    /// (`step` in `0..self.staged_inverse_steps(size)`).
+    ///
+    /// - `spec_re` and `spec_im` (`len >= N / 2 + 1`) hold the input spectrum on `step == 0`
+    ///   and are transformed in-place across steps.
+    /// - `time_out` (`len == N`) is written on the final step
+    ///   (`step + 1 == self.staged_inverse_steps(size)`).
+    /// - Backends with `supports_staged_fft() == false` fall back to [`Self::rfft_inverse`] on `step == 0`.
+    fn rfft_inverse_step(
+        &self,
+        size: FftSize,
+        step: usize,
+        spec_re: &mut [f32],
+        spec_im: &mut [f32],
+        time_out: &mut [f32],
+        scratch: &mut [f32],
+    ) -> Result<(), ConvError> {
+        if step == 0 {
+            self.rfft_inverse(size, spec_re, spec_im, time_out, scratch)
+        } else {
+            Err(ConvError::InvalidStateTransition)
+        }
+    }
 }
 
 /// Primary `no_std`, allocation-free scalar FFT backend backed by `microfft 0.6.0`.

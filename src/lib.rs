@@ -86,6 +86,7 @@ pub use nonuniform::{
     NonUniformPlan, NonUniformStageConfig, NonUniformStageKind, NonUniformStagePlan,
     OPTIMIZER_BLOCK_SIZES, OptimizationReport, OptimizerScratchCell, block_mode_scratch_len,
     optimize_block_mode, optimizer_scratch_len, preset_esp32_c6_q15, preset_esp32_p4_f32,
+    stage_work_item_ops,
 };
 pub use partitioned::{PartitionedConfig, PartitionedConvolver, PartitionedMemoryRequirements};
 #[cfg(feature = "phastft")]

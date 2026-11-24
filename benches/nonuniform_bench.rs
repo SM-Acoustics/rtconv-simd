@@ -142,7 +142,7 @@ fn main() {
     let fft = SimdFixedFftBackend::new(backend);
 
     println!(
-        "=== PR-A (#14) NUPC (Large FFTs up to N16384) vs Hybrid Benchmark (48 kHz, block={HOST_BLOCK}, budget=666.67 us, backend={}, warmup={WARMUP_ITERS}, n={MEAS_ITERS}, k=2) ===",
+        "=== NUPC (Large FFTs + Optimizer + Time-Distributed FFT) vs Hybrid Benchmark (48 kHz, block={HOST_BLOCK}, budget=666.67 us, backend={}, warmup={WARMUP_ITERS}, n={MEAS_ITERS}, k=2) ===",
         backend.name()
     );
     println!("Provenance: HOST_ONLY (empirical timing; NOT a formal WCET proof).");
@@ -262,7 +262,17 @@ fn main() {
 
         let model = CostModel::for_backend_f32(backend);
         let mut sc = vec![OptimizerScratchCell::ZERO; optimizer_scratch_len(ir_len, 8192)];
-        let (opt_plan, _rep) = NonUniformPlan::optimize(
+        let (opt_s1, _) = NonUniformPlan::optimize(
+            ir_len,
+            HOST_BLOCK,
+            &model,
+            ClearancePolicy::Strategy1,
+            &mut sc,
+        )
+        .unwrap();
+        bench_nupc("NUPC optimized (Strategy1)", &ir, opt_s1, backend, fft);
+
+        let (opt_s2, _) = NonUniformPlan::optimize(
             ir_len,
             HOST_BLOCK,
             &model,
@@ -270,6 +280,6 @@ fn main() {
             &mut sc,
         )
         .unwrap();
-        bench_nupc("NUPC optimized (Strategy2)", &ir, opt_plan, backend, fft);
+        bench_nupc("NUPC optimized (Strategy2)", &ir, opt_s2, backend, fft);
     }
 }
