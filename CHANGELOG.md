@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Planned work is tracked in `docs/ROADMAP.md` and issue #13 (sub-issues #14–#24).
 
+### Cost-Model NUPC Partition Optimizer — Issue #15 (PR-B)
+
+#### Added
+- **Separable `CostModel` (`src/nonuniform/optimizer.rs`)**: `t_fft`, `t_ifft`, `t_cmul`, `t_cmac`, `t_add`, `t_direct_mac` (Wefers 2015 Eq. 6.12, 6.14, 6.43–6.45) with 6 presets: `theoretical()` (Table 7.2), `x86_sse2_calibrated()` / `x86_avx2_calibrated()` (`HOST_ONLY` Xeon PR-A calibration), `wefers_2015_test_system()` (reproducing Ch. 6/Appendix A.2 within `0.15` cycles/sample), `esp32_p4_f32_estimate()` / `esp32_c6_q15_estimate()` (explicitly labelled `INFERRED`, `DEVICE_VERIFIED = NO`), plus `for_target_f32()` and `for_backend_f32(SimdBackend)`.
+- **Configurable `ClearancePolicy` with formal `c = 1` sample-time derivation**: `MinLoad`, `Strategy1` (`offset(i) - B_i >= B_i - 1`, derived formally from `NonUniformScheduler`'s `W_eff = min(slack, B_s - 1)` single-block-in-flight contract and verified on boundary `D_s = 2B - 1` vs `2B - 2`), `Strategy2` (host-block-scaled `2/4/8`-cycle spans + bounded direct head), and `Custom { min_slack_samples }`.
+- **Zero-allocation `#![no_std]` Viterbi DP (`NonUniformPlan::optimize`, `optimize_with_max_block_size`, `optimizer_scratch_len`, `OptimizerScratchCell`, `OptimizationReport`)**: exact level-by-level Bellman/Viterbi solver in caller-supplied scratch (`0 B` heap, `< 512 B` stack), verified against exhaustive brute-force DFS for small `N`, guaranteeing cost `<= default_profile` and `100%` `NonUniformPlan::validate` compliance.
+- **Block-mode Wefers (2015) validator (`optimize_block_mode`, `BlockModePolicy`, `block_mode_scratch_len`)**: reproduces §6.5.3 (`<= 4` segments, uniform optimal up to `~20–30·B`), §6.12 & Appendix A.2.5 `(128^2 256^4 1024^8 8192^10)` at `240.3` vs `240.4` cycles/sample for `88,200` taps (`B = 128`), A.2.1 `(128^7 1024^7 8192^10)` at `204.0` vs `204.1`, A.2.4 `(128^22 1024^21 8192^8)`, and §6.5.4 prose Strategy 1.
+- **Zero-scratch MCU presets**: `preset_esp32_p4_f32` and `preset_esp32_c6_q15` (`0 B` optimizer scratch, `B <= 1024 / N2048` on C6).
+- **Tests & Benchmarks**: `tests/nupc_optimizer.rs` (validation, brute-force optimality proof, `default_profile` dominance, formal `c = 1` boundary proof, Wefers §6.5.3/§6.12/A.2.5 reproduction, `f64` oracle `SNR > 100 dB` up to 64k, AES17 997 Hz @ `−60` / `−1 dBFS`), zero-alloc coverage in `tests/no_alloc_rt.rs`, and `benches/optimizer_prediction_bench.rs` (Wefers Figs. 7.5 & 7.6 analogue with GUM Type A and ISO 80000-1 / NBR 5891 statistics).
+
+#### Changed
+- **`AutoConvolver` (`src/auto.rs`)**: added `AutoEngine::NonUniform`; `select_f32` and `prepare_f32` now select cost-optimized `NonUniformConvolver` automatically whenever Strategy-2 NUPC beats `Hybrid`, running the Viterbi DP in-place inside the caller's `&mut [f32]` workspace with zero extra RAM; `prepare_q15` / `prepare_q31_with` likewise optimize `FixedQ15NonUniformConvolver` (`B <= 1024`) in-place inside `&mut [i16]`. `engine_len_f32` / `engine_len_q15` / `workspace_len*` remain `const fn` (exact for `Direct`/`Hybrid`/`FixedDirect`, mathematically proven upper bound for cost-optimized NUPC, verified at `workspace_len(131_072)` in `const` generics).
+
 ### Large FFT Sizes `N512`–`N16384` (`f32`) & up to `N2048` (`Q1.15`) — Issue #14 (PR-A)
 
 #### Added

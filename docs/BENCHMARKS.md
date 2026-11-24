@@ -182,3 +182,60 @@ Linux x86-64 container (`fearless_simd::Sse2`), 1024 taps, 32-sample blocks, µs
 | `Q1.15` `NonUniform` (up to `N2048`) | `64..=2048` | `−1 dBFS` | `81.56 dB` | `86.02 dB` | `93.55 dB` (`−11.99 dB`) |
 
 **Honest Numerical Note (`Q1.15` BFP scaling loss)**: Across `N = 64 → 2048` (`log2(N) = 6 → 11`), `Q1.15` `unity_imp` loses `13.51 dB` over 5 additional radix-2 stages (`~2.7 dB/stage`, matching the expected `~0.5 bit/stage` BFP butterfly truncation/rounding budget across forward + inverse transforms in 16-bit mantissas). At `−60 dBFS`, input-block BFP normalization preserves the full `~98 dB` 16-bit output dynamic range (`0.00 dB` loss vs the Q1.15 output ceiling). Reaching `> 90 dB` THD+N at `-1 dBFS` for `N = 2048` in fixed point requires 32-bit BFP mantissas (tracked in Issue #23).
+
+---
+
+## 8. PR-B (Issue #15): Cost-Model Prediction vs Measurement (`HOST_ONLY`)
+
+- **Command**: `cargo +1.100.0 bench --bench optimizer_prediction_bench --features "nonuniform std"` and `cargo +1.100.0 bench --bench nonuniform_bench --features "nonuniform std"`
+- **Environment**: Same Linux x86-64 Intel Xeon 2.30 GHz container (`rustc 1.100.0`, `HOST_ONLY`, `DEVICE_VERIFIED = NO`).
+- **Methodology**: GUM (ISO/IEC Guide 98-3) Type A (`warmup = 512` blocks, `n = 4096` blocks of `H = 64` samples, `k = 2`), relative prediction error `(T_meas - T_pred) / T_meas`, tail percentiles (`p50`/`p95`/`p99`/`max` per callback in µs), and ISO 80000-1 Annex B / ABNT NBR 5891 half-to-even rounding.
+
+### 8.1 UPOLS Predicted vs Measured (`L = 16,384` taps, Wefers Fig. 7.5 Analogue)
+
+| Backend / Model | `B` (`P`) | Predicted (ns/smp) | Measured `mean ± U` (ns/smp) | `s` / `u_A` (ns/smp) | Rel. Error | Callback `p50` / `p99` (µs) |
+| :--- | :---: | ---: | ---: | ---: | ---: | ---: |
+| `AVX2+FMA` (`x86_avx2_calibrated`) | `128` (`128`) | 65.3 | `91.8 ± 3.3` | 75.5 / 1.67 | +28.9% | 10.50 / 62.64 |
+| `AVX2+FMA` (`x86_avx2_calibrated`) | `256` (`64`) | 39.5 | `55.5 ± 1.8` | 28.6 / 0.89 | +28.8% | 13.00 / 41.49 |
+| `AVX2+FMA` (`x86_avx2_calibrated`) | `512` (`32`) | 29.6 | `44.2 ± 2.6` | 29.1 / 1.28 | +33.1% | 19.57 / 85.82 |
+| `AVX2+FMA` (`x86_avx2_calibrated`) | `1024` (`16`) | 26.0 | `35.8 ± 1.1` | 8.7 / 0.54 | +27.3% | 34.49 / 66.50 |
+| `AVX2+FMA` (`x86_avx2_calibrated`) | `2048` (`8`) | 25.4 | `32.6 ± 1.1` | 8.9 / 0.55 | +22.2% | 60.90 / 126.67 |
+| `AVX2+FMA` (`x86_avx2_calibrated`) | `4096` (`4`) | 24.7 | `31.22 ± 0.70` | 5.6 / 0.35 | +20.8% | 119.20 / 222.72 |
+| `SSE2` (`x86_sse2_calibrated`) | `128` (`128`) | 97.0 | `123.9 ± 2.6` | 58.1 / 1.28 | +21.7% | 14.71 / 45.77 |
+| `SSE2` (`x86_sse2_calibrated`) | `256` (`64`) | 57.9 | `71.3 ± 1.3` | 20.6 / 0.64 | +18.8% | 17.31 / 46.72 |
+| `SSE2` (`x86_sse2_calibrated`) | `512` (`32`) | 40.9 | `51.2 ± 2.4` | 27.1 / 1.20 | +20.1% | 23.81 / 73.85 |
+| `SSE2` (`x86_sse2_calibrated`) | `1024` (`16`) | 32.4 | `42.4 ± 2.8` | 22.7 / 1.42 | +23.6% | 39.23 / 87.47 |
+| `SSE2` (`x86_sse2_calibrated`) | `2048` (`8`) | 28.9 | `38.6 ± 3.2` | 25.9 / 1.62 | +25.1% | 69.54 / 140.66 |
+| `SSE2` (`x86_sse2_calibrated`) | `4096` (`4`) | 28.5 | `36.46 ± 0.78` | 6.2 / 0.39 | +21.9% | 138.15 / 226.83 |
+
+### 8.2 Optimized NUPC vs `Hybrid` and `default_profile` (`H = 64`, Wefers Fig. 7.6 Analogue)
+
+| Backend | IR Taps | Engine / Optimized Partition | Pred (ns/smp) | Meas `mean ± U` (ns/smp) | Rel. Err | Callback `p50` / `p95` / `p99` / `max` (µs) | DP Setup |
+| :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: |
+| `AVX2+FMA` | 4,096 | `Hybrid(H128/T128) SPREAD` | 60.7 | `93.0 ± 1.7` | +34.8% | 6.18 / 6.26 / 12.22 / 74.46 | — |
+| `AVX2+FMA` | 4,096 | `NUPC default_profile` | 86.6 | `219.2 ± 3.2` | +60.5% | 14.88 / 15.13 / 45.26 / 146.45 | — |
+| `AVX2+FMA` | 4,096 | `NUPC Strategy2 [D63 32^10 256^15]` | 67.1 | `155.6 ± 3.4` | +56.9% | 7.02 / 15.71 / 39.42 / 166.10 | 198 µs |
+| `AVX2+FMA` | 16,384 | `Hybrid(H128/T128) SPREAD` | 94.9 | `143.3 ± 3.0` | +33.8% | 10.48 / 10.69 / 39.67 / 112.97 | — |
+| `AVX2+FMA` | 16,384 | `NUPC default_profile` | 120.8 | `292.6 ± 7.2` | +58.7% | 19.42 / 22.52 / 74.94 / 591.15 | — |
+| `AVX2+FMA` | 16,384 | `NUPC MinLoad [D64 64^7 512^31]` | 67.3 | `153.5 ± 4.5` | +56.2% | 6.46 / 27.94 / 39.31 / 186.95 | 533 µs |
+| `AVX2+FMA` | 16,384 | `NUPC Strategy1 [D64 32^14 256^62]` | 84.6 | `189.9 ± 4.3` | +55.4% | 9.63 / 18.17 / 45.61 / 234.60 | 1.01 ms |
+| `AVX2+FMA` | 16,384 | `NUPC Strategy2 [D63 32^22 512^31]` | 80.9 | `176.1 ± 3.4` | +54.1% | 8.12 / 17.99 / 41.39 / 126.35 | 1.07 ms |
+| `AVX2+FMA` | 65,536 | `Hybrid(H256/T256) SPREAD` | 157.3 | `242.7 ± 5.5` | +35.2% | 15.04 / 18.46 / 53.98 / 319.00 | — |
+| `AVX2+FMA` | 65,536 | `NUPC default_profile` | 257.6 | `553.9 ± 6.5` | +53.5% | 38.97 / 58.57 / 83.86 / 286.49 | — |
+| `AVX2+FMA` | 65,536 | `NUPC MinLoad [D64 64^15 1024^63]` | 82.4 | `186.4 ± 9.0` | +55.8% | **6.77** / 71.14 / 80.07 / 232.63 | 1.50 ms |
+| `AVX2+FMA` | 65,536 | `NUPC Strategy1 [D64 32^6 128^14 1024^62]` | 104.4 | `248.8 ± 6.1` | +58.0% | 12.86 / 48.45 / 61.53 / 142.13 | 3.63 ms |
+| `AVX2+FMA` | 65,536 | `NUPC Strategy2 [D63 32^10 256^16 4096^15]` | 97.5 | **`221.4 ± 8.5`** | +56.0% | **8.04** / 24.96 / 86.99 / 327.77 | 3.02 ms |
+| `SSE2` | 16,384 | `Hybrid(H256/T256) SPREAD` | 118.8 | `166.0 ± 4.5` | +28.5% | 9.44 / 11.42 / 34.59 / 518.52 | — |
+| `SSE2` | 16,384 | `NUPC default_profile` | 152.7 | `296.4 ± 3.8` | +48.5% | 20.25 / 24.39 / 49.65 / 158.39 | — |
+| `SSE2` | 16,384 | `NUPC Strategy2 [D63 32^22 512^31]` | 91.9 | `168.2 ± 3.1` | +45.4% | **7.37** / 17.94 / 34.19 / 133.89 | 900 µs |
+| `SSE2` | 65,536 | `Hybrid(H512/T512) SPREAD` | 217.9 | `290.8 ± 5.1` | +25.1% | 16.28 / 24.69 / 51.29 / 324.56 | — |
+| `SSE2` | 65,536 | `NUPC default_profile` | 380.7 | `654.9 ± 7.3` | +41.9% | 45.92 / 61.57 / 91.33 / 327.99 | — |
+| `SSE2` | 65,536 | `NUPC MinLoad [D32 32^7 256^15 4096^15]` | 97.3 | `202 ± 14` | +51.8% | **6.37** / 17.71 / `206.72` / 615.40 | 1.52 ms |
+| `SSE2` | 65,536 | `NUPC Strategy1 [D64 32^14 256^14 2048^30]` | 116.3 | `228.5 ± 7.7` | +49.1% | 8.56 / 25.34 / **87.79** / 162.86 | 3.02 ms |
+| `SSE2` | 65,536 | `NUPC Strategy2 [D63 32^10 256^16 4096^15]` | 107.6 | **`216.1 ± 9.6`** | +50.2% | **7.10** / 27.50 / 91.64 / 543.09 | 2.97 ms |
+
+**Honest Interpretation (Wefers Ch. 7 Validation)**:
+- **Ranking accuracy**: The calibrated `CostModel` predicts the exact empirical ranking across every UPOLS block size (`B = 128..=4096`) and every NUPC policy (`default_profile > Strategy1 > Strategy2 > MinLoad`) on both AVX2 and SSE2.
+- **Measured speedup**: At 65,536 taps, `NUPC Strategy2` cuts mean latency by **`3.03×` vs `default_profile`** and **`1.35×` vs best `Hybrid SPREAD`** on SSE2 (`216.1` vs `290.8 ns/smp`), and by **`2.50×` vs `default_profile`** while beating `Hybrid(H256)` on AVX2 (`221.4` vs `242.7 ns/smp`, `1.87×` faster median). On `nonuniform_bench` (`H = 32`), `NUPC Strategy2` also beats the hand-picked 6-stage Gardner schedule at 16k (`5.85 ± 0.26` vs `9.76 ± 0.82 µs`, `1.67×` faster, `44%` less RAM: `279.64` vs `495.76 KiB`).
+- **Empirical confirmation of Wefers §6.5.3–§6.5.4**: On SSE2 64k, `MinLoad` suffers `p99 = 206.72 µs` because zero-clearance segments burst synchronously, whereas `Strategy1` (`p99 = 87.79 µs`) and `Strategy2` (`p99 = 91.64 µs`) cut `p99` by `2.3×` for only `+7–13%` average load.
+- **Honest residual analysis**: UPOLS exhibits a consistent `+19%–33%` memory-streaming overhead over isolated L1-hot primitive timings (mirroring Wefers §7.3.2). `NonUniformConvolver` adds a further `~28–30 ns/stage/sample` fixed overhead (`+45%–60%` total) from sample-wise `read_pos % delay_ring_len` integer divisions and per-sample `on_fdl_sample` calls; PR-C (Issue #16) replaces arbitrary `D_s + B_s` rings with power-of-two `2 * B_s` bitmask rings and subdivides RFFT/IFFT transforms.

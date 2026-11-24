@@ -12,7 +12,7 @@ In the SM-Acoustics layered model (`SM-ENG-001`, *Proposed v1*), `rtconv-simd` s
 
 Both `NonUniformConvolver` (`f32`) and `FixedQ15NonUniformConvolver` (`Q1.15/BFP`) share the exact same planning and streaming contracts with zero logic duplication:
 
-1. **Planning Plane (`src/nonuniform/plan.rs`)**: Representation-independent stage validation (`1..=8` contiguous stages), strict zero-latency causality (`D_s >= B_s` for every FDL stage), `NonUniformBudget` admission control (`WithinKnownBounds` / `Exceeded` / `Unverified`), and default multi-stage profile (`Direct 0..32`, `FDL B=32 32..256`, `FDL B=64 256..1024`, `FDL B=128 1024..`).
+1. **Planning Plane (`src/nonuniform/plan.rs`, `src/nonuniform/optimizer.rs`)**: Representation-independent stage validation (`1..=8` contiguous stages), strict zero-latency causality (`D_s >= B_s` for every FDL stage), `NonUniformBudget` admission control (`WithinKnownBounds` / `Exceeded` / `Unverified`), default multi-stage profile (`Direct 0..32`, `FDL B=32 32..256`, `FDL B=64 256..1024`, `FDL B=128 1024..`), and the zero-allocation `#![no_std]` García/Wefers Viterbi partition optimizer (`CostModel`, `ClearancePolicy`, `NonUniformPlan::optimize`, `optimize_block_mode`, and zero-scratch MCU presets `preset_esp32_p4_f32` / `preset_esp32_c6_q15`).
 2. **Streaming Plane (`src/nonuniform/scheduler.rs`)**: Sample-time `NonUniformScheduler` with causal delay rings (`ir_offset + block_size`), `SPREAD` sub-stepping bounded by `min(slack_samples, B_s - 1)`, and `deadline_misses()` telemetry.
 3. **Numeric Plane**:
    - `f32` (`src/nonuniform/stages.rs`, `src/nonuniform/mod.rs`): `Direct` FIR head (reverse-indexed circular buffer + `dot_two_segments_simd`) + `FftBackend` 50% overlap-save FDL stages.
@@ -23,9 +23,9 @@ Both `NonUniformConvolver` (`f32`) and `FixedQ15NonUniformConvolver` (`Q1.15/BFP
 1. **Artifact plane (`src/artifact.rs`)**: zero-copy `FirArtifact` over RIFF/WAVE, raw binary and text. Decodes to `f32`, Q1.15 or Q1.31 on demand.
 2. **Domain plane (`build.rs` → `cfg(rtconv_no_fpu)`)**: compile-time FPU classification. On stable Rust, RISC-V `F` is not exposed as a cfg, so the target ISA string is parsed.
 3. **Policy plane (`src/auto.rs`)**:
-   - `select_f32` uses the cost model `min(L, B + 4L/B + 20·log2(2B))` for `B ∈ {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192}`.
-   - `select_q15` uses Direct up to 128 taps, NUPC above.
-   - O(1) analytical `const fn` sizing (`workspace_len`, verified up to `131,072` taps in `const` generics); Q1.15 gain headroom; `f32` and `i16` I/O adapters; stereo wrapper.
+   - `select_f32` evaluates `Direct`, `Hybrid(B)` (`B ∈ {32..=8192}`), and Strategy-2 `NonUniform` under `CostModel::for_target_f32()`; when `AutoEngine::NonUniform` wins, `AutoConvolver::prepare_f32` runs the Viterbi DP in-place inside the caller's `&mut [f32]` workspace with zero heap allocation and zero stack arrays.
+   - `select_q15` uses `FixedDirect` up to 128 taps and cost-optimized `FixedNonUniform` (`B <= 1024 / N2048`, `CostModel::esp32_c6_q15_estimate()`) above, also planned in-place inside the caller's `&mut [i16]` workspace.
+   - `const fn` sizing (`workspace_len`, verified up to `131,072` taps in `const` generics): exact for `Direct` / `Hybrid` / `FixedDirect`, and a mathematically proven upper bound for `NonUniform` / `FixedNonUniform` covering both in-place DP scratch and the resulting convolver workspace; Q1.15 gain headroom; `f32` and `i16` I/O adapters; stereo wrapper.
 
 ## Module Structure
 
@@ -43,6 +43,7 @@ Both `NonUniformConvolver` (`f32`) and `FixedQ15NonUniformConvolver` (`Q1.15/BFP
 - `src/hybrid.rs`: `HybridConvolver` (direct FIR head + partitioned FFT tail with `head_len == tail_block_size ∈ {32..=8192}`, 0-sample latency, optional `set_tail_spreading(true)`).
 - `src/nonuniform/` (`#[cfg(feature = "nonuniform")]`):
   - `plan.rs`: `NonUniformPlan`, `NonUniformConfig`, `NonUniformStageConfig` (FDL `block_size ∈ {32..=8192}`), `NonUniformBudget`, `BudgetVerdict`.
+  - `optimizer.rs`: Separable `CostModel` (theoretical, calibrated x86 SSE2/AVX2, Wefers 2015 test system, and `INFERRED` ESP32-P4/C6 estimates), `ClearancePolicy` (formal sample-time `c = 1` Strategy 1 & Strategy 2), zero-alloc `#![no_std]` Viterbi DP (`NonUniformPlan::optimize`), block-mode validator (`optimize_block_mode`), in-place `AutoConvolver` DP helpers, and zero-scratch MCU presets.
   - `scheduler.rs`: Sample-time `NonUniformScheduler` and `SPREAD` work distribution.
   - `memory.rs`: Checked workspace sizing (`NonUniformMemoryRequirements`).
   - `stages.rs` + `mod.rs`: `NonUniformConvolver` (`f32`).

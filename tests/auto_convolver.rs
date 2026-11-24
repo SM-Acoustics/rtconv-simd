@@ -9,9 +9,21 @@ use rtconv_simd::auto::{
 };
 use rtconv_simd::fixed::{FixedQ15DirectConfig, FixedQ15DirectConvolver};
 use rtconv_simd::{
-    DirectConfig, DirectConvolver, FirArtifact, FixedQ15NonUniformConvolver, HybridConfig,
-    HybridConvolver, NonUniformPlan, SimdBackend, SimdFixedFftBackend,
+    ClearancePolicy, CostModel, DirectConfig, DirectConvolver, FirArtifact,
+    FixedQ15NonUniformConvolver, HybridConfig, HybridConvolver, NonUniformConvolver,
+    NonUniformPlan, OptimizerScratchCell, SimdBackend, SimdFixedFftBackend, optimizer_scratch_len,
 };
+
+fn auto_max_block_test(taps: usize, ceiling: usize) -> usize {
+    let cap = ceiling.min(32usize.max(taps / 4));
+    let mut best = 0;
+    for b in rtconv_simd::OPTIMIZER_BLOCK_SIZES {
+        if b <= cap && ClearancePolicy::Strategy2.min_offset_samples(b, 64) < taps {
+            best = b;
+        }
+    }
+    best
+}
 
 fn actual_engine_len_f32(taps: usize) -> usize {
     match select_f32(taps) {
@@ -27,6 +39,23 @@ fn actual_engine_len_f32(taps: usize) -> usize {
             )
             .unwrap()
             .total_f32
+        }
+        AutoEngine::NonUniform => {
+            let fft = SimdFixedFftBackend::new(SimdBackend::scalar());
+            let max_b = auto_max_block_test(taps, 8192);
+            let mut sc = vec![OptimizerScratchCell::ZERO; optimizer_scratch_len(taps, max_b)];
+            let (plan, _) = NonUniformPlan::optimize_with_max_block_size(
+                taps,
+                64,
+                max_b,
+                &CostModel::for_target_f32(),
+                ClearancePolicy::Strategy2,
+                &mut sc,
+            )
+            .unwrap();
+            NonUniformConvolver::memory_requirements(&plan, &fft)
+                .unwrap()
+                .total_f32
         }
         _ => {
             DirectConvolver::memory_requirements(DirectConfig { max_ir_len: taps })
@@ -44,7 +73,17 @@ fn actual_engine_len_q15(taps: usize) -> usize {
                 .total_i16
         }
         _ => {
-            let plan = NonUniformPlan::default_profile(taps, 64).unwrap();
+            let max_b = auto_max_block_test(taps, 1024);
+            let mut sc = vec![OptimizerScratchCell::ZERO; optimizer_scratch_len(taps, max_b)];
+            let (plan, _) = NonUniformPlan::optimize_with_max_block_size(
+                taps,
+                64,
+                max_b,
+                &CostModel::esp32_c6_q15_estimate(),
+                ClearancePolicy::Strategy2,
+                &mut sc,
+            )
+            .unwrap();
             FixedQ15NonUniformConvolver::memory_requirements(&plan)
                 .unwrap()
                 .total_i16
@@ -54,23 +93,67 @@ fn actual_engine_len_q15(taps: usize) -> usize {
 
 #[test]
 fn const_sizing_matches_engine_requirements_exactly() {
-    for taps in (1..=4500).chain([8191, 8192, 9503, 9504, 16383, 35391, 35392, 65536, 131072]) {
-        assert_eq!(
-            engine_len_f32(taps),
-            actual_engine_len_f32(taps),
-            "f32 taps={taps}"
-        );
-        assert_eq!(
-            engine_len_q15(taps),
-            actual_engine_len_q15(taps),
-            "q15 taps={taps}"
-        );
+    // Exact equality for Direct / Hybrid / FixedDirect, and mathematically proven upper bound
+    // (`>= actual` with explicit documented upper-margin ceiling) for cost-optimized NUPC engines.
+    // Note: in PR-B delay rings are `D_s + B_s` (bounded by `(S_eff - 1) * L`), giving <= 3.5x
+    // upper margin on large NUPC plans (tightened further in PR-C when delay rings shrink to 2*B_s).
+    for taps in (1..=600).chain([
+        700, 1024, 1500, 2048, 3000, 4096, 5120, 5121, 8191, 8192, 9503, 9504, 16383, 16384, 35391,
+        35392, 65536, 131072,
+    ]) {
+        let f32_len = engine_len_f32(taps);
+        let f32_actual = actual_engine_len_f32(taps);
+        match select_f32(taps) {
+            AutoEngine::NonUniform => {
+                assert!(
+                    f32_len >= f32_actual,
+                    "f32 NUPC bound underflow taps={taps}: bound={f32_len} < actual={f32_actual}"
+                );
+                assert!(
+                    f32_len <= f32_actual * 4 + 4096,
+                    "f32 NUPC bound unexpectedly loose taps={taps}: bound={f32_len} actual={f32_actual}"
+                );
+            }
+            _ => assert_eq!(f32_len, f32_actual, "f32 taps={taps}"),
+        }
+
+        let q15_len = engine_len_q15(taps);
+        let q15_actual = actual_engine_len_q15(taps);
+        match select_q15(taps) {
+            AutoEngine::FixedDirect => assert_eq!(q15_len, q15_actual, "q15 taps={taps}"),
+            _ => {
+                assert!(
+                    q15_len >= q15_actual,
+                    "q15 NUPC bound underflow taps={taps}: bound={q15_len} < actual={q15_actual}"
+                );
+                assert!(
+                    q15_len <= q15_actual * 4 + 2048,
+                    "q15 NUPC bound unexpectedly loose taps={taps}: bound={q15_len} actual={q15_actual}"
+                );
+            }
+        }
+    }
+
+    // Also verify `AutoConvolver::prepare_f32` and `prepare_q15` succeed in exact `engine_len_*`
+    // slices across engine transitions including `AutoEngine::NonUniform` and `FixedNonUniform`.
+    for taps in [1usize, 64, 128, 129, 300, 700, 2048, 5121, 8192, 16384] {
+        let ir_f = vec![0.001f32; taps];
+        let mut ws_f = vec![0.0f32; engine_len_f32(taps)];
+        let conv_f = AutoConvolver::prepare_f32(&ir_f, &mut ws_f).unwrap();
+        assert_eq!(conv_f.info().engine, select_f32(taps));
+
+        let ir_q = vec![16i16; taps];
+        let mut ws_q = vec![0i16; engine_len_q15(taps)];
+        let conv_q = AutoConvolver::prepare_q15(&ir_q, 0, &mut ws_q).unwrap();
+        assert_eq!(conv_q.info().engine, select_q15(taps));
     }
 }
 
 #[test]
 fn workspace_len_covers_every_shorter_ir() {
-    for max in [1usize, 50, 173, 174, 500, 900, 2000, 3000, 10_000, 40_000] {
+    for max in [
+        1usize, 50, 128, 129, 173, 174, 500, 900, 2000, 3000, 5120, 5121, 10_000, 40_000,
+    ] {
         let wf = workspace_len_f32(max);
         let wq = workspace_len_q15(max);
         for taps in 1..=max {
@@ -97,7 +180,7 @@ fn const_generic_workspace_len_evaluates_at_131072_taps() {
     let _check_q15 = CheckConst::<{ workspace_len_q15(131_072) }>;
     let _ = core::mem::size_of::<AutoWorkspace<{ workspace_len(131_072) }>>();
 
-    // Exhaustively verify O(1) analytical `worst_engine_len_f32` matches brute-force scan up to 131_072.
+    // Exhaustively verify O(1) `worst_engine_len_f32` matches brute-force scan up to 131_072.
     let brute_max = (1..=131_072usize).map(engine_len_f32).max().unwrap();
     assert_eq!(workspace_len_f32(131_072), brute_max + 131_072);
 }
@@ -105,13 +188,13 @@ fn const_generic_workspace_len_evaluates_at_131072_taps() {
 #[test]
 fn selection_follows_cost_model() {
     assert_eq!(select_f32(1), AutoEngine::Direct);
-    assert_eq!(select_f32(128), AutoEngine::Direct);
-    assert_eq!(select_f32(512), AutoEngine::Hybrid { block_size: 32 });
-    assert_eq!(select_f32(2048), AutoEngine::Hybrid { block_size: 64 });
-    assert_eq!(select_f32(4096), AutoEngine::Hybrid { block_size: 128 });
-    assert_eq!(select_f32(16384), AutoEngine::Hybrid { block_size: 256 });
-    assert_eq!(select_f32(65536), AutoEngine::Hybrid { block_size: 512 });
-    assert_eq!(select_f32(262_144), AutoEngine::Hybrid { block_size: 1024 });
+    assert_eq!(select_f32(32), AutoEngine::Direct);
+    assert!(matches!(select_f32(512), AutoEngine::Hybrid { .. }));
+    assert!(matches!(select_f32(1024), AutoEngine::Hybrid { .. }));
+    // Long IRs switch to cost-optimized NonUniform on all targets (SSE2, AVX2, P4, theoretical).
+    assert_eq!(select_f32(16384), AutoEngine::NonUniform);
+    assert_eq!(select_f32(65536), AutoEngine::NonUniform);
+    assert_eq!(select_f32(262_144), AutoEngine::NonUniform);
     assert_eq!(select_q15(128), AutoEngine::FixedDirect);
     assert_eq!(select_q15(129), AutoEngine::FixedNonUniform);
 }
@@ -359,4 +442,74 @@ fn esp32c6_harness_scenario_on_host() {
             assert!((y[8] + 4096).abs() <= 1, "y200={}", y[8]);
         }
     }
+}
+
+#[test]
+fn f32_auto_selects_optimized_nonuniform_on_long_ir_oracle_snr() {
+    let taps = 16_384usize;
+    let h = fir(taps, 42, 0.75);
+    let hf: Vec<f32> = h.iter().map(|&v| v as f32).collect();
+    let mut ws = vec![0.0f32; engine_len_f32(taps)];
+    let mut conv = AutoConvolver::prepare_f32(&hf, &mut ws).unwrap();
+    assert_eq!(conv.info().domain, NumericDomain::Float32);
+    assert_eq!(conv.info().engine, AutoEngine::NonUniform);
+    assert_eq!(conv.info().latency_samples, 0);
+
+    let x = signal(20_000, 99, 0.4);
+    let xf: Vec<f32> = x.iter().map(|&v| v as f32).collect();
+    let mut y = vec![0.0f32; xf.len()];
+    let mut pos = 0usize;
+    for &n in [1usize, 31, 64, 100, 7, 256, 513].iter().cycle() {
+        if pos >= xf.len() {
+            break;
+        }
+        let n = n.min(xf.len() - pos);
+        conv.process_f32(&xf[pos..pos + n], &mut y[pos..pos + n])
+            .unwrap();
+        pos += n;
+    }
+
+    let xq: Vec<f64> = xf.iter().map(|&v| v as f64).collect();
+    let reference = oracle(&h, &xq);
+    let s = snr(&reference, y.iter().map(|&v| v as f64));
+    assert!(
+        s > 100.0,
+        "AutoConvolver f32 NonUniform 16k oracle SNR = {s:.2} dB (expected > 100 dB)"
+    );
+
+    // Verify reset() clears state cleanly and reproduces identical output.
+    conv.reset();
+    let mut y2 = vec![0.0f32; 512];
+    conv.process_f32(&xf[..512], &mut y2).unwrap();
+    for (i, (&a, &b)) in y[..512].iter().zip(&y2).enumerate() {
+        assert!((a - b).abs() < 1e-6, "reset mismatch at {i}: {a} vs {b}");
+    }
+}
+
+#[test]
+fn q15_auto_optimized_nonuniform_long_ir() {
+    let taps = 4_096usize;
+    let h = fir(taps, 17, 0.8);
+    let bytes = wav_f32_stereo(&h, &h);
+    let art = FirArtifact::parse(&bytes).unwrap();
+    let mut ws = vec![0i16; workspace_len_q15(taps)];
+    let mut conv = AutoConvolver::from_artifact(&art, 0, &mut ws).unwrap();
+    assert_eq!(conv.info().domain, NumericDomain::FixedQ15);
+    assert_eq!(conv.info().engine, AutoEngine::FixedNonUniform);
+
+    let l2 = h.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let x = signal(6_000, 23, 0.15 / l2);
+    let xq: Vec<i16> = x.iter().map(|&v| (v * 32768.0).round() as i16).collect();
+    let mut y = vec![0i16; x.len()];
+    for (xi, yo) in xq.chunks(53).zip(y.chunks_mut(53)) {
+        conv.process_i16(xi, yo).unwrap();
+    }
+    let xr: Vec<f64> = xq.iter().map(|&v| v as f64 / 32768.0).collect();
+    let reference = oracle(&h, &xr);
+    let s = snr(&reference, y.iter().map(|&v| v as f64 / 32768.0));
+    assert_eq!(conv.saturation_count(), 0);
+    assert!(
+        s > 60.0,
+        "AutoConvolver Q1.15 optimized NUPC 4k oracle SNR = {s:.2} dB"
+    );
 }

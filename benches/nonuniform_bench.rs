@@ -6,6 +6,9 @@
 //!
 //! Empirical host measurements only — NOT formal WCET proofs.
 
+use rtconv_simd::nonuniform::{
+    ClearancePolicy, CostModel, OptimizerScratchCell, optimizer_scratch_len,
+};
 use rtconv_simd::{
     HybridConfig, HybridConvolver, NonUniformConfig, NonUniformConvolver, NonUniformPlan,
     NonUniformStageConfig, SimdBackend, SimdFixedFftBackend,
@@ -256,5 +259,17 @@ fn main() {
                 fft,
             );
         }
+
+        let model = CostModel::for_backend_f32(backend);
+        let mut sc = vec![OptimizerScratchCell::ZERO; optimizer_scratch_len(ir_len, 8192)];
+        let (opt_plan, _rep) = NonUniformPlan::optimize(
+            ir_len,
+            HOST_BLOCK,
+            &model,
+            ClearancePolicy::Strategy2,
+            &mut sc,
+        )
+        .unwrap();
+        bench_nupc("NUPC optimized (Strategy2)", &ir, opt_plan, backend, fft);
     }
 }

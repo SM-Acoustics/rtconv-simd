@@ -733,6 +733,88 @@ fn verify_large_ffts_q15() {
     }
 }
 
+#[cfg(feature = "nonuniform")]
+fn verify_nupc_optimizer(backend: SimdBackend) {
+    use rtconv_simd::nonuniform::{
+        BlockModePolicy, ClearancePolicy, CostModel, NonUniformConvolver, NonUniformPlan,
+        OptimizerScratchCell, block_mode_scratch_len, optimize_block_mode, optimizer_scratch_len,
+        preset_esp32_c6_q15, preset_esp32_p4_f32,
+    };
+
+    let model = CostModel::for_backend_f32(backend);
+    let ir_len = 16_384usize;
+    let mut sc = vec![OptimizerScratchCell::ZERO; optimizer_scratch_len(ir_len, 8192)];
+    let mut opt_plan = None;
+    assert_zero_alloc("nupc_optimizer::optimize_sample_time", || {
+        let (plan, rep) =
+            NonUniformPlan::optimize(ir_len, 64, &model, ClearancePolicy::Strategy2, &mut sc)
+                .unwrap();
+        black_box(rep);
+        opt_plan = Some(plan);
+    });
+    let opt_plan = opt_plan.unwrap();
+
+    // Block-mode Viterbi DP (Wefers §6.12: 88,200 taps, B=128)
+    let w_model = CostModel::wefers_2015_test_system();
+    let mut bsc = vec![OptimizerScratchCell::ZERO; block_mode_scratch_len(88_200, 128, 8192)];
+    assert_zero_alloc("nupc_optimizer::optimize_block_mode", || {
+        let part = optimize_block_mode(
+            88_200,
+            128,
+            8192,
+            &w_model,
+            BlockModePolicy::Strategy2TableA25,
+            &mut bsc,
+        )
+        .unwrap();
+        black_box(part);
+    });
+
+    // Zero-scratch MCU presets
+    assert_zero_alloc("nupc_optimizer::mcu_presets", || {
+        black_box(preset_esp32_p4_f32(16_384, 64).unwrap());
+        black_box(preset_esp32_c6_q15(16_384, 64).unwrap());
+    });
+
+    // Prepare + process optimized NUPC plan with zero heap allocation
+    let fft = SimdFixedFftBackend::new(backend);
+    let req = NonUniformConvolver::memory_requirements(&opt_plan, &fft).unwrap();
+    let mut ws = vec![0.0f32; req.total_f32];
+    let ir = vec![0.01f32; ir_len];
+    let inp = [0.25f32; 64];
+    let mut out = [0.0f32; 64];
+    let mut nu = None;
+    assert_zero_alloc("nupc_optimizer::convolver_prepare", || {
+        nu = Some(NonUniformConvolver::prepare(&ir, opt_plan, &mut ws, backend, fft).unwrap());
+    });
+    let nu = nu.as_mut().unwrap();
+    assert_zero_alloc("nupc_optimizer::convolver_process", || {
+        for _ in 0..32 {
+            nu.process_block(&inp, &mut out).unwrap();
+        }
+    });
+    assert_zero_alloc("nupc_optimizer::convolver_reset", || nu.reset());
+
+    // AutoConvolver selecting cost-optimized AutoEngine::NonUniform (16,384 taps, in-place DP)
+    #[cfg(feature = "auto")]
+    {
+        use rtconv_simd::auto::{AutoConvolver, AutoEngine, engine_len_f32};
+        let mut auto_ws = vec![0.0f32; engine_len_f32(ir_len)];
+        let mut aconv = None;
+        assert_zero_alloc("auto::nonuniform_16k::prepare_f32", || {
+            aconv = Some(AutoConvolver::prepare_f32(&ir, &mut auto_ws).unwrap());
+        });
+        let aconv = aconv.as_mut().unwrap();
+        assert_eq!(aconv.info().engine, AutoEngine::NonUniform);
+        assert_zero_alloc("auto::nonuniform_16k::process_f32", || {
+            for _ in 0..32 {
+                aconv.process_f32(&inp, &mut out).unwrap();
+            }
+        });
+        assert_zero_alloc("auto::nonuniform_16k::reset", || aconv.reset());
+    }
+}
+
 fn main() {
     // Warm up runtime environment and CPU feature detection before arming instrumentation.
     let backend = SimdBackend::detect_or_baseline();
@@ -749,6 +831,8 @@ fn main() {
     verify_phastft_audio_callback(backend);
     #[cfg(feature = "nonuniform")]
     verify_nonuniform(backend);
+    #[cfg(feature = "nonuniform")]
+    verify_nupc_optimizer(backend);
     #[cfg(feature = "fixed-q15")]
     verify_fixed_q15_direct();
     #[cfg(feature = "fixed-fft")]
