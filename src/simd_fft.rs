@@ -669,6 +669,119 @@ fn pack_time_bitrev(time_in: &[f32], re: &mut [f32], im: &mut [f32], m: usize) {
     }
 }
 
+#[inline(always)]
+fn r2c_untangle_in_place(spec_re: &mut [f32], spec_im: &mut [f32], m: usize) {
+    // k = 0 (DC) and k = M (Nyquist): exact same arithmetic order as `r2c_untangle`.
+    let z0_re = spec_re[0];
+    let z0_im = spec_im[0];
+    spec_re[0] = z0_re + z0_im;
+    spec_im[0] = 0.0;
+    spec_re[m] = z0_re - z0_im;
+    spec_im[m] = 0.0;
+
+    // k = M/2
+    let half_m = m / 2;
+    spec_im[half_m] = -spec_im[half_m];
+
+    let r2c_stride = (MAX_FFT_SIZE / 2) / m;
+    let mut k = 1;
+    while k < half_m {
+        let mk = m - k;
+        let a = spec_re[k];
+        let b = spec_im[k];
+        let c = spec_re[mk];
+        let d = spec_im[mk];
+
+        let a_re = 0.5 * (a + c);
+        let a_im = 0.5 * (b - d);
+        let b_re = 0.5 * (b + d);
+        let b_im = 0.5 * (c - a);
+
+        let (wc, ws) = twiddle_q1(k * r2c_stride);
+
+        let wb_re = wc * b_re + ws * b_im;
+        let wb_im = wc * b_im - ws * b_re;
+
+        spec_re[k] = a_re + wb_re;
+        spec_im[k] = a_im + wb_im;
+        spec_re[mk] = a_re - wb_re;
+        spec_im[mk] = -a_im + wb_im;
+        k += 1;
+    }
+}
+
+#[inline(always)]
+fn c2r_preprocess_in_place_bitrev(spec_re: &mut [f32], spec_im: &mut [f32], m: usize) {
+    // Exact same arithmetic as `c2r_preprocess_bitrev`, written in-place then bit-reversed.
+    let inv_n = 0.5 / (m as f32);
+    let inv_m = 1.0 / (m as f32);
+    let bitrev_shift = usize::BITS - m.trailing_zeros();
+
+    // k = 0 -> bitrev(0) = 0
+    let x0 = spec_re[0];
+    let xm = spec_re[m];
+    spec_re[0] = inv_n * (x0 + xm);
+    spec_im[0] = inv_n * (x0 - xm);
+
+    // k = M/2
+    let half_m = m / 2;
+    spec_re[half_m] *= inv_m;
+    spec_im[half_m] *= -inv_m;
+
+    let r2c_stride = (MAX_FFT_SIZE / 2) / m;
+    let mut k = 1;
+    while k < half_m {
+        let mk = m - k;
+        let xr1 = spec_re[k];
+        let xi1 = spec_im[k];
+        let xr2 = spec_re[mk];
+        let xi2 = spec_im[mk];
+
+        let e_re = inv_n * (xr1 + xr2);
+        let e_im = inv_n * (xi1 - xi2);
+        let d_re = inv_n * (xr1 - xr2);
+        let d_im = inv_n * (xi1 + xi2);
+
+        let (wc, ws) = twiddle_q1(k * r2c_stride);
+
+        let o_re = wc * d_re - ws * d_im;
+        let o_im = wc * d_im + ws * d_re;
+
+        spec_re[k] = e_re - o_im;
+        spec_im[k] = e_im + o_re;
+        spec_re[mk] = e_re + o_im;
+        spec_im[mk] = -e_im + o_re;
+        k += 1;
+    }
+
+    // In-place bit-reversal permutation on 0..m (involution -> exact match to scatter bitrev).
+    let mut i = 0;
+    while i < m {
+        let br = i.reverse_bits() >> bitrev_shift;
+        if i < br {
+            spec_re.swap(i, br);
+            spec_im.swap(i, br);
+        }
+        i += 1;
+    }
+}
+
+#[simd]
+fn cfft_stage_simd_impl<S: Simd>(
+    simd: S,
+    re: &mut [f32],
+    im: &mut [f32],
+    m: usize,
+    half: usize,
+    inverse: bool,
+) {
+    match half {
+        4 => stage_half4_simd(simd, re, im, m, inverse),
+        8 => stage_half8_simd(simd, re, im, m, inverse),
+        _ => stage_native_simd(simd, re, im, m, half, inverse),
+    }
+}
+
 #[simd]
 fn rfft_forward_simd_impl<S: Simd>(
     simd: S,
@@ -821,6 +934,140 @@ impl FftBackend for SimdFixedFftBackend {
                 self.backend.level(),
                 simd => rfft_inverse_simd_impl(simd, size, spec_re, spec_im, time_out, scratch)
             );
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn supports_staged_fft(&self) -> bool {
+        true
+    }
+
+    #[inline]
+    fn staged_forward_steps(&self, size: FftSize) -> usize {
+        // M = N / 2 complex DIT FFT: step 0 = pack+bitrev+radix4(half=1,2),
+        // steps 1..log2(M)-1 = single butterfly stages half=4..M/2, final step = r2c untangle.
+        (size.log2() as usize) - 1
+    }
+
+    #[inline]
+    fn staged_inverse_steps(&self, size: FftSize) -> usize {
+        // step 0 = c2r preprocess+bitrev+radix4(half=1,2),
+        // steps 1..log2(M)-1 = single inverse butterfly stages half=4..M/2, final step = unpack.
+        (size.log2() as usize) - 1
+    }
+
+    fn rfft_forward_step(
+        &self,
+        size: FftSize,
+        step: usize,
+        time_in: &[f32],
+        spec_re: &mut [f32],
+        spec_im: &mut [f32],
+        _scratch: &mut [f32],
+    ) -> Result<(), ConvError> {
+        let n = size.len();
+        let m = size.half_len();
+        let bins = size.spectrum_bins();
+        let total_steps = self.staged_forward_steps(size);
+        if step >= total_steps {
+            return Err(ConvError::InvalidStateTransition);
+        }
+        if spec_re.len() < bins || spec_im.len() < bins {
+            return Err(ConvError::MismatchedBufferLength {
+                expected: bins,
+                actual: spec_re.len().min(spec_im.len()),
+            });
+        }
+
+        if step == 0 {
+            if time_in.len() != n {
+                return Err(ConvError::MismatchedBufferLength {
+                    expected: n,
+                    actual: time_in.len(),
+                });
+            }
+            pack_time_bitrev(time_in, &mut spec_re[..m], &mut spec_im[..m], m);
+            radix4_stage01(&mut spec_re[..m], &mut spec_im[..m], m, false);
+        } else if step + 1 == total_steps {
+            r2c_untangle_in_place(spec_re, spec_im, m);
+        } else {
+            let half = 2usize << step;
+            if self.backend.is_scalar() || self.backend.level().is_fallback() {
+                stage_scalar(&mut spec_re[..m], &mut spec_im[..m], m, half, false);
+            } else {
+                dispatch!(
+                    self.backend.level(),
+                    simd => cfft_stage_simd_impl(
+                        simd,
+                        &mut spec_re[..m],
+                        &mut spec_im[..m],
+                        m,
+                        half,
+                        false
+                    )
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn rfft_inverse_step(
+        &self,
+        size: FftSize,
+        step: usize,
+        spec_re: &mut [f32],
+        spec_im: &mut [f32],
+        time_out: &mut [f32],
+        _scratch: &mut [f32],
+    ) -> Result<(), ConvError> {
+        let n = size.len();
+        let m = size.half_len();
+        let bins = size.spectrum_bins();
+        let total_steps = self.staged_inverse_steps(size);
+        if step >= total_steps {
+            return Err(ConvError::InvalidStateTransition);
+        }
+        if spec_re.len() < bins || spec_im.len() < bins {
+            return Err(ConvError::MismatchedBufferLength {
+                expected: bins,
+                actual: spec_re.len().min(spec_im.len()),
+            });
+        }
+
+        if step == 0 {
+            c2r_preprocess_in_place_bitrev(spec_re, spec_im, m);
+            radix4_stage01(&mut spec_re[..m], &mut spec_im[..m], m, true);
+        } else if step + 1 == total_steps {
+            if time_out.len() != n {
+                return Err(ConvError::MismatchedBufferLength {
+                    expected: n,
+                    actual: time_out.len(),
+                });
+            }
+            let mut k = 0;
+            while k < m {
+                time_out[2 * k] = spec_re[k];
+                time_out[2 * k + 1] = spec_im[k];
+                k += 1;
+            }
+        } else {
+            let half = 2usize << step;
+            if self.backend.is_scalar() || self.backend.level().is_fallback() {
+                stage_scalar(&mut spec_re[..m], &mut spec_im[..m], m, half, true);
+            } else {
+                dispatch!(
+                    self.backend.level(),
+                    simd => cfft_stage_simd_impl(
+                        simd,
+                        &mut spec_re[..m],
+                        &mut spec_im[..m],
+                        m,
+                        half,
+                        true
+                    )
+                );
+            }
         }
         Ok(())
     }

@@ -126,7 +126,6 @@ const AUTO_F32_MAX_FDL_STAGES: usize = 4;
 const AUTO_Q15_MAX_FDL_STAGES: usize = 3;
 const AUTO_F32_MAX_BLOCK: usize = 8192;
 const AUTO_Q15_MAX_BLOCK: usize = 1024;
-const AUTO_STRATEGY2_MAX_DIRECT_HEAD: usize = IO_CHUNK * 4; // 256 taps (matches ClearancePolicy::Strategy2)
 
 const fn max(a: usize, b: usize) -> usize {
     if a > b { a } else { b }
@@ -233,15 +232,15 @@ pub const fn select_q15(taps: usize) -> AutoEngine {
 /// Strategy-2 plan of `taps` samples with `<= AUTO_F32_MAX_FDL_STAGES` strictly increasing FDL
 /// stages (`B <= auto_max_block(taps, AUTO_F32_MAX_BLOCK)`).
 ///
-/// Proof sketch for any such plan with direct head `L_0 <= min(256, taps - 1)` and `S <= s_eff`
-/// FDL stages `(D_s, len_s, B_s)` (`B_1 < ... < B_S <= b_cap`, non-final stages multiples of `B_s`):
-/// - `state + spectral = 2*L_0 + sum(2*B_s + 4*P_s*(B_s + 1) + 2*(B_s + 1))`
-///   `<= 4*taps + 4*(b_cap - 1) + 4*(taps/32 + s_eff) + 4*sum_B + 2*s_eff`
+/// Proof sketch for any such plan with direct head `L_0 < taps` and `S <= s_eff` FDL stages
+/// `(D_s, len_s, B_s)` (`B_1 < ... < B_S <= b_cap`, non-final stages multiples of `B_s`):
+/// - Shared real input ring: `max_s(max(2 * B_s, D_s + 1)) <= max(2 * b_cap, taps)` since `D_s < taps`.
+/// - `state + spectral = 2*L_0 + shared_in + sum(4*P_s*(B_s + 1) + 2*(B_s + 1))`
+///   `<= 4*taps + max(2*b_cap, taps) + 4*(b_cap - 1) + 4*(taps/32 + s_eff) + 2*sum_B + 2*s_eff`
 ///   using `sum(P_s * B_s) <= (taps - L_0) + (b_cap - 1)`, `2*L_0 + 4*(taps - L_0) <= 4*taps`,
 ///   and `sum(ceil(len_s / B_s)) <= taps / 32 + s_eff`.
-/// - `delay = sum(D_s + B_s) <= min(256, taps - 1) + (s_eff - 1)*(taps - 1) + sum_B`
-///   since `D_1 = L_0 <= min(256, taps - 1)` and `D_2..D_S <= taps - 1`.
-/// - `scratch = 2 * max_fft_size = 4 * B_S <= 4 * b_cap` (`SimdFixedFftBackend`).
+/// - Power-of-two output delay rings: `delay = sum(2 * B_s) <= 2 * sum_B`.
+/// - Shared scratch: `2 * max_fft_size = 4 * B_S <= 4 * b_cap` (`SimdFixedFftBackend`).
 /// - Also bounds `optimizer_scratch_len_f32(taps, b_cap, AUTO_F32_MAX_FDL_STAGES)` so the DP runs
 ///   in-place inside the engine workspace before convolver preparation.
 const fn nupc_upper_bound_f32(taps: usize) -> usize {
@@ -269,9 +268,10 @@ const fn nupc_upper_bound_f32(taps: usize) -> usize {
         sum_b += OPTIMIZER_BLOCK_SIZES[eligible_count - 1 - j];
         j += 1;
     }
-    let state_spec = 4 * taps + 4 * (b_cap - 1) + 4 * (taps / 32 + s_eff) + 4 * sum_b + 2 * s_eff;
-    let d1 = min(AUTO_STRATEGY2_MAX_DIRECT_HEAD, taps - 1);
-    let delay = d1 + (s_eff - 1) * (taps - 1) + sum_b;
+    let shared_in = max(2 * b_cap, taps);
+    let state_spec =
+        4 * taps + shared_in + 4 * (b_cap - 1) + 4 * (taps / 32 + s_eff) + 2 * sum_b + 2 * s_eff;
+    let delay = 2 * sum_b;
     let scratch = 4 * b_cap;
     let engine_ub = state_spec + delay + scratch;
     let opt_sc = optimizer_scratch_len_f32(taps, b_cap, AUTO_F32_MAX_FDL_STAGES);
@@ -307,13 +307,14 @@ const fn nupc_upper_bound_q15(taps: usize) -> usize {
         sum_b += OPTIMIZER_BLOCK_SIZES[eligible_count - 1 - j];
         j += 1;
     }
-    // state + spectral: 2*L_0 + sum(2*B_s + 4*P_s*(B_s+1) + 2*P_s + 8*(B_s+1))
-    let state_spec = 4 * taps + 4 * (b_cap - 1) + 6 * (taps / 32 + s_eff) + 10 * sum_b + 8 * s_eff;
-    // Q1.23 delay rings: 2 words/sample * sum(D_s + B_s)
-    let d1 = min(AUTO_STRATEGY2_MAX_DIRECT_HEAD, taps - 1);
-    let delay = 2 * (d1 + (s_eff - 1) * (taps - 1) + sum_b);
-    // Shared scratch: spec_re + spec_im (2*(b_cap+1)) + time + fft (5 * 2 * b_cap = 10 * b_cap)
-    let scratch = 12 * b_cap + 2;
+    // state + spectral: 2*L_0 + shared_in + sum(4*P_s*(B_s+1) + 2*P_s + 8*(B_s+1))
+    let shared_in = max(2 * b_cap, taps);
+    let state_spec =
+        4 * taps + shared_in + 4 * (b_cap - 1) + 6 * (taps / 32 + s_eff) + 8 * sum_b + 8 * s_eff;
+    // Power-of-two Q1.23 output rings: 2 words/sample * sum(2 * B_s) = 4 * sum_B
+    let delay = 4 * sum_b;
+    // Shared scratch: spec_re + spec_im (2*(b_cap+1)) + time_scratch (2 * b_cap)
+    let scratch = 4 * b_cap + 2;
     let engine_ub = state_spec + delay + scratch;
     let opt_sc = optimizer_scratch_len_i16(taps, b_cap, AUTO_Q15_MAX_FDL_STAGES);
     max(engine_ub, opt_sc)

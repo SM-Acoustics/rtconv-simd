@@ -22,8 +22,10 @@ pub use direct::{
 };
 #[cfg(feature = "fixed-fft")]
 pub use fft_q15::{
-    MAX_FIXED_FFT, fixed_fft_rom_bytes, fixed_fft_scratch_len_i32, fixed_fft_supports_size,
-    irfft_q15_bfp, irfft_q15_bfp_with_scratch, rfft_q15_bfp, rfft_q15_bfp_with_scratch,
+    FixedStagedFftState, MAX_FIXED_FFT, fixed_fft_rom_bytes, fixed_fft_scratch_len_i32,
+    fixed_fft_staged_steps, fixed_fft_supports_size, irfft_q15_bfp,
+    irfft_q15_bfp_step_with_scratch, irfft_q15_bfp_with_scratch, rfft_q15_bfp,
+    rfft_q15_bfp_step_with_scratch, rfft_q15_bfp_with_scratch,
 };
 #[cfg(feature = "fixed-nonuniform")]
 pub use nonuniform::{

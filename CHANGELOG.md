@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Planned work is tracked in `docs/ROADMAP.md` and issue #13 (sub-issues #14–#24).
 
+### Time-Distributed FFT/IFFT & Clearance Deferral — Issue #16 (PR-C)
+
+#### Added
+- **Non-breaking staged FFT extension on `FftBackend` (`src/fft.rs`)**: `supports_staged_fft(&self) -> bool`, `staged_forward_steps`, `staged_inverse_steps`, `rfft_forward_step`, and `rfft_inverse_step` with monolithic defaults so `MicroFftBackend`, `PhastFftBackend`, and external backends keep full backward compatibility.
+- **Bit-exact zero-extra-RAM staged `f32` transforms (`src/simd_fft.rs`)**: `SimdFixedFftBackend` decomposes `N64..=N16384` forward/inverse RFFTs into `log2(N) - 1` (`5..=13`) radix-2 butterfly stages executing in-place inside each FDL stage's newest FDL slot / accumulator (`0 B` extra scratch, bit-identical `to_bits()` output across `Scalar` and `AVX2+FMA`).
+- **Bit-exact zero-extra-RAM staged `Q1.15` BFP transforms (`src/fixed/fft_q15.rs`, `src/fixed/mod.rs`)**: `fixed_fft_staged_steps`, `FixedStagedFftState`, `rfft_q15_bfp_step_with_scratch`, and `irfft_q15_bfp_step_with_scratch` (`N64..=N2048`, `log2(N)` = `6..=11` steps), plus workspace-backed `rfft_q15_bfp_ws_step` / `irfft_q15_bfp_wide_ws_step` running in-place inside each stage's `8 * (B_s + 1) >= 4 * N_s` `i64` accumulator buffer.
+- **Unified periodic-ceiling scheduler & clearance deferral (`src/nonuniform/scheduler.rs`)**: extended `StageWorkItem` (`RfftSteps`, `ContinueCmac`, `IfftSteps`, `CombinedSlice`, `starts_block`, `commits_output`), added `on_fdl_sample_with_steps`, `stage_work_item_ops`, clearance deferral `defer_s = slack_s.saturating_sub(B_s - 1)`, and periodic-ceiling distribution `target(slot) = ceil((slot + 1) * U / span)` across `[t_start(k), t_fin(k)]` eliminating boundary double-spikes.
+- **Backend-aware admission bounds (`src/nonuniform/plan.rs`)**: `direct_sample_ops()`, `estimated_worst_ops_for_backend(&fft)`, and `check_budget_for_backend(budget, bytes, &fft)` using the proven alignment-independent callback bound `q * U + min(U, ceil(rem * U / span))` (`100.0%` tight on Strategy 1 `4k`/`16k`, `2.69×` worst-ops reduction on `64k` Strategy 1, `3.10×` admission-bound tightening on `64k` Strategy 2).
+- **Comprehensive verification (`tests/time_distributed_fft.rs`)**: bit-exactness (`SimdFixedFftBackend` `N64..=N16384` Scalar/SIMD, `fft_q15` `N64..=N2048`, full `NonUniformConvolver` vs monolithic wrapper + `f64` oracle `SNR > 100 dB`), deterministic sliding-window op-trace proofs (`1.21×–1.76×` peak/mean on Strategy 1), RAM reduction proofs, fragmented-block zero-deadline-miss tests, Q1.15 AES17 `997 Hz` tests (`91.13 / 90.83 dB` @ `−1 dBFS`, `0` saturations), plus new coverage in `tests/denormal_guard.rs` and `tests/no_alloc_rt.rs`.
+
+#### Changed
+- **Shared real input history ring & power-of-two `2 * B_s` output delay rings (`src/nonuniform/{memory,stages}.rs`, `src/fixed/nonuniform.rs`)**: replaced all per-stage `2 * B_s` overlap input buffers with a single shared input ring (`max_s(max(2 * B_s, D_s + 1))`), shrank every FDL output delay ring from `D_s + B_s` to power-of-two `2 * B_s` (`4 * B_s` `i16` words in Q1.23) with branchless bitmask wrap (`pos & delay_ring_mask`, zero integer division in the hot loop), and eliminated the separate `4 * max_fft` Q1.15 shared FFT scratch (`−16.00 KiB` at `N2048`, `−56.9%` to `−75.2%` delay-ring RAM on high-offset plans).
+- **Tightened `AutoConvolver` `const fn` NUPC workspace upper bounds (`src/auto.rs`)**: updated `nupc_upper_bound_f32` and `nupc_upper_bound_q15` for `2 * B_s` / `4 * B_s` rings and shared input ring (verified in `tests/auto_convolver.rs` up to `workspace_len(131_072)`).
+
 ### Cost-Model NUPC Partition Optimizer — Issue #15 (PR-B)
 
 #### Added

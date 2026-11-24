@@ -12,7 +12,7 @@ All core convolvers operate exclusively inside a single caller-owned workspace s
 3. **`HybridConvolver`** (`head_len = B_tail ∈ {32..=8192}`):
    - `DirectConvolver(B_tail)` + `PartitionedConvolver(B_tail, max_ir_len - B_tail)` + `2 * B_tail` (staging in/out).
 4. **`NonUniformConvolver`** (`feature = "nonuniform"`, up to `MAX_NONUNIFORM_STAGES = 8`, FDL `block_size ∈ {32..=8192}`):
-   - Per-stage Direct (`2 * L_0`) + FDL stage workspaces (`ir_spectra + fdl + acc + causal delay ring of ir_offset + B_s`) + shared FFT scratch (`NonUniformMemoryRequirements` reports exact `total_f32` and `total_bytes`).
+   - Direct stage (`2 * L_0`) + single shared real input history ring (`max_s(max(2 * B_s, D_s + 1))` across FDL stages, replacing per-stage `2 * B_s` overlap buffers) + FDL spectral buffers (`4 * P * bins + 2 * bins`, reusing the newest FDL slot for in-place staged RFFT and `acc` for in-place staged IFFT) + power-of-two causal output delay rings (`2 * B_s` per FDL stage, branchless bitmask wrap) + shared FFT scratch (`2 * max_fft_size`). `NonUniformMemoryRequirements` reports exact `state_f32`, `spectral_f32`, `delay_f32`, `scratch_f32`, `total_f32`, and `total_bytes`.
 
 ## Fixed-Point Q1.15 / BFP Workspace (`i16` elements, 2 bytes each)
 
@@ -21,17 +21,17 @@ All core convolvers operate exclusively inside a single caller-owned workspace s
   - Split `ir_re`/`ir_im`/`ir_exp`, FDL ring + per-slot BFP exponents, workspace-packed `i64` spectral accumulators (`8 * bins` `i16` words), temporary spectrum (`2 * bins`), time scratch (`N`), and packed `i32` FFT butterfly scratch (`4 * N` `i16` words).
   - Plans/configs with `B > 1024` (`N > 2048`) are rejected explicitly with `ConvError::UnsupportedFftSize`.
 - **`FixedQ15NonUniformConvolver`** (`feature = "fixed-nonuniform"`, FDL `B ∈ {32..=1024}`):
-  - `FixedQ15NonUniformMemoryRequirements` breaks down `state_i16`, `spectral_i16` (now including per-stage `i64` accumulators packed as `8 * bins` `i16` words), `delay_i16` (each causal-ring sample is a Q1.23 `i32` stored as **2** `i16` words, so stages are summed before a single convergent RNE rounding), `scratch_i16` (`2 * max_bins + 5 * max_fft`, including `4 * max_fft` packed FFT scratch), `total_i16`, `total_bytes`, and **`instance_bytes`**.
-  - Because per-stage `i64` accumulators and FFT work arrays live in the caller `&mut [i16]` workspace, `instance_bytes` is compact (**`< 4 KiB`**, down from `~16.5 KiB` in `0.2.0`) even with `N2048` stages, and is still counted by `NonUniformBudget` memory admission.
+  - `FixedQ15NonUniformMemoryRequirements` breaks down `state_i16` (`2 * L_0` direct + single shared Q1.15 input history ring `max_s(max(2 * B_s, D_s + 1))`), `spectral_i16` (BFP spectra, exponents, and per-stage `i64` accumulators packed as `8 * bins = 4 * N + 8` `i16` words, which also host the in-place `4 * N` staged BFP FFT/IFFT work buffers), `delay_i16` (power-of-two `2 * B_s` Q1.23 output rings = `4 * B_s` `i16` words per FDL stage, summed before a single convergent RNE rounding), `scratch_i16` (`2 * max_bins + max_fft` — **zero separate `4 * max_fft` FFT scratch**, saving `16.00 KiB` at `N2048`), `total_i16`, `total_bytes`, and **`instance_bytes`**.
+  - Because per-stage `i64` accumulators and staged BFP FFT/IFFT work arrays live in the caller `&mut [i16]` workspace, `instance_bytes` stays compact (**`< 4 KiB`**, down from `~16.5 KiB` in `0.2.0`) even with `N2048` stages, and is still counted by `NonUniformBudget` memory admission.
 
 ## ROM, External Scratch, and Peak Stack by FFT Backend
 
 | Backend | Supported `N` | Twiddle / Bitrev ROM (`.rodata`) | External Scratch | Peak Stack |
 | :--- | :--- | ---: | :--- | :--- |
-| **`SimdFixedFftBackend`** (`f32`) | `64..=16384` | **`16,388 B`** (`[f32; 4097]` quarter-wave, `0 B` bitrev ROM) | `N` `f32` (`256 B`–`64.00 KiB`) | `< 256 B` |
+| **`SimdFixedFftBackend`** (`f32`) | `64..=16384` | **`16,388 B`** (`[f32; 4097]` quarter-wave, `0 B` bitrev ROM) | `N` `f32` (`256 B`–`64.00 KiB`); `0 B` extra for staged | `< 256 B` |
 | **`MicroFftBackend`** (`f32`) | `64..=16384` | **`16,380 B`** (`microfft 0.6.0` `size-16384` sine table) | `N` `f32` (`256 B`–`64.00 KiB`) | `< 256 B` |
 | **`PhastFftBackend`** (`f32`, `std`) | `64..=16384` | Precomputed `PlannerR2c32` (allocated once in `new()`) | `N` `f32` (`256 B`–`64.00 KiB`) | `< 256 B` |
-| **`fft_q15` (`*_with_scratch` / `*_ws`)** | `64..=2048` | **`1,026 B`** (`[i16; 513]` quarter-wave, `0 B` bitrev ROM) | `2 * N` `i32` / `4 * N` `i16` (`512 B`–`16.00 KiB`) | `< 256 B` |
+| **`fft_q15` (`*_with_scratch` / `*_ws`)** | `64..=2048` | **`1,026 B`** (`[i16; 513]` quarter-wave, `0 B` bitrev ROM) | `2 * N` `i32` / `4 * N` `i16` (`512 B`–`16.00 KiB`; reused in-place in NUPC) | `< 256 B` |
 | **`fft_q15` (legacy `rfft_q15_bfp`)** | `64..=256` only | shares the `1,026 B` ROM (`N > 256` → `UnsupportedFftSize`) | `0 B` | `~2 KiB` (`[i32; 256] × 2`) |
 
 - **`SimdFixedFftBackend` twiddles**: generated in `f64` and rounded to `f32` under IEEE 754 round-to-nearest-even in `build.rs`, stored as a single `static` quarter-wave cosine table (`TW_COS_Q: [f32; 4097]`) strided by power of two. Bit-reversal indices are computed with `usize::reverse_bits()`.
@@ -52,15 +52,15 @@ All core convolvers operate exclusively inside a single caller-owned workspace s
 | `Hybrid (H128/T128, N=256)` | 35.74 KiB | 261.49 KiB | 1,035.49 KiB | 2,067.49 KiB | 1,024 B | `< 256 B` |
 | `Hybrid (H512/T512, N=1024)` | 46.05 KiB | 270.49 KiB | 1,039.99 KiB | 2,065.99 KiB | 4,096 B | `< 256 B` |
 | `Hybrid (H2048/T2048, N=4096)` | 32.00 KiB | 312.12 KiB | 1,080.49 KiB | 2,104.99 KiB | 16,384 B | `< 256 B` |
-| `NonUniform (D32/32/64/128)` | 43.70 KiB | 269.45 KiB | 1,043.45 KiB | 2,075.45 KiB | 1,024 B | `< 256 B` |
-| `NonUniform (D32/32/128/512/2k/8k)` | — | 639.74 KiB | 1,407.84 KiB | 2,431.96 KiB | 65,536 B | `< 256 B` |
+| `NonUniform (D32/32/64/128)` | 41.70 KiB | 267.45 KiB | 1,041.45 KiB | 2,073.45 KiB | 1,024 B | `< 256 B` |
+| `NonUniform (D32/32/128/512/2k/8k)` | — | 618.49 KiB | 1,386.59 KiB | 2,410.71 KiB | 65,536 B | `< 256 B` |
 | `FixedQ15Partitioned (B=128, N=256)` | 21.71 KiB | 135.02 KiB | — | — | 2,048 B (`in ws`) | `< 512 B` |
 | `FixedQ15Partitioned (B=512, N=1024)` | 38.07 KiB | 150.39 KiB | — | — | 8,192 B (`in ws`) | `< 512 B` |
 | `FixedQ15Partitioned (B=1024, N=2048)` | 60.04 KiB | 172.21 KiB | — | — | 16,384 B (`in ws`) | `< 512 B` |
-| `FixedQ15NonUniform (D32/32/64/128)` | 29.62 KiB | 142.93 KiB | — | — | 2,048 B (`in ws`) | `< 512 B` |
-| `FixedQ15NonUniform (D32..B1024)` | 56.43 KiB | 220.64 KiB | — | — | 16,384 B (`in ws`) | `< 512 B` |
+| `FixedQ15NonUniform (D32/32/64/128)` | 24.49 KiB | 137.81 KiB | — | — | 0 B extra (`in acc`) | `< 512 B` |
+| `FixedQ15NonUniform (preset_esp32_c6_q15)` | 26.73 KiB | 169.37 KiB | — | — | 0 B extra (`in acc`) | `< 512 B` |
 
-*Note on NUPC delay rings*: In `NonUniform (D32/32/128/512/2k/8k)`, `85.25 KiB` of the workspace is per-stage `D_s + B_s` causal output delay rings; reducing these rings toward `~2 * B_s` via clearance-aware deferral is tracked in Issue #16 (PR-C).
+*Note on PR-C NUPC ring & scratch savings (Issue #16)*: Clearance-aware deferral (`defer_s = slack_s.saturating_sub(B_s - 1)`) shrinks every FDL output delay ring from `D_s + B_s` to power-of-two `2 * B_s` (`4 * B_s` `i16` words in Q1.23) while replacing all per-stage input overlap buffers with a single shared input ring of length `max_s(max(2 * B_s, D_s + 1))`. Compared to PR-A/PR-B, this saves `21.25 KiB` on `NonUniform (D32..8k)`, `37.25 KiB` on `NonUniform (D32..4k)`, `−56.9%` delay-ring RAM on high-offset `B = 8192 @ 30000` plans, and `−75.2%` delay-ring RAM plus **`−16.00 KiB`** shared FFT scratch on `FixedQ15NonUniform` (`N2048`) because staged BFP FFT/IFFT runs in-place inside each stage's `8 * (B_s + 1)` accumulator.
 
 ## Partition Optimizer Scratch & Pre-Computed MCU Presets (`src/nonuniform/optimizer.rs`, Class B)
 
