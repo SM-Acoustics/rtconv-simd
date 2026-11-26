@@ -2,7 +2,7 @@
 
 **Zero-latency, zero-allocation FIR convolution in pure Rust, from AVX2/NEON desktops to FPU-less RISC-V microcontrollers. Give it a FIR file and it picks the engine.**
 
-`#![no_std]` · `#![forbid(unsafe_code)]` · no heap (`alloc` is never used) · MSRV `1.89.0` · `MIT OR Apache-2.0`
+`#![no_std]` · `#![forbid(unsafe_code)]` · no heap (`alloc` is never used) · MSRV `1.89.0` · `GPL-3.0-or-later`
 
 `rtconv-simd` (library crate `rtconv_simd`) is a real-time FIR convolution suite with:
 
@@ -254,4 +254,8 @@ See [`docs/PORTABILITY.md`](./docs/PORTABILITY.md) and [`hardware/esp32c6/README
 
 ## License
 
-Dual-licensed under [`MIT`](./LICENSE-MIT) or [`Apache-2.0`](./LICENSE-APACHE), at your option.
+Licensed under the GNU General Public License v3.0 or later ([`GPL-3.0-or-later`](./LICENSE)).
+
+Commercial dual-licensing is available upon request from the copyright holder (SM Acoustics) for proprietary or closed-source integration.
+
+*Historical note:* Release tags `v0.1.0` and `v0.2.0` remain available under their original `MIT OR Apache-2.0` terms.

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Planned work is tracked in `docs/ROADMAP.md` and issue #13 (sub-issues #14–#24).
 
+### License Transition (`0.3.0+`)
+
+#### Changed
+- **License transition for post-`v0.2.0` (`0.3.0+`)**: Changed package license from `MIT OR Apache-2.0` to `GPL-3.0-or-later` (with optional commercial dual-licensing via SM Acoustics) by sole copyright holder decision, aligning `rtconv-simd` with the SM Acoustics organization licensing policy. Historical release tags `v0.1.0` and `v0.2.0` remain available under their original `MIT OR Apache-2.0` terms.
+
 ### Time-Distributed FFT/IFFT & Clearance Deferral — Issue #16 (PR-C)
 
 #### Added
