@@ -120,7 +120,7 @@ Typed errors (`ArtifactError`) cover truncation, unsupported formats, non-finite
 rtconv-simd = { git = "https://github.com/SM-Acoustics/rtconv-simd", branch = "main" }
 ```
 
-> **Release status**: the crate version on `main` is **`0.2.0`** (see [`CHANGELOG.md`](./CHANGELOG.md)). The latest GitHub release is `v0.1.0`. Tagging `v0.2.0` and publishing to crates.io are maintainer actions. Planned work: [`docs/ROADMAP.md`](./docs/ROADMAP.md) and issue [#13](https://github.com/SM-Acoustics/rtconv-simd/issues/13).
+> **Planned work**: [`docs/ROADMAP.md`](./docs/ROADMAP.md) and issue [#13](https://github.com/SM-Acoustics/rtconv-simd/issues/13).
 
 ---
 
