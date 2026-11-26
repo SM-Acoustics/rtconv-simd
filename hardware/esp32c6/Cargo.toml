@@ -6,7 +6,7 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [dependencies]
-rtconv-simd = { path = "../..", default-features = false, features = ["fixed-nonuniform"] }
+rtconv-simd = { path = "../..", default-features = false, features = ["auto"] }
 
 [profile.release]
 opt-level = "s"

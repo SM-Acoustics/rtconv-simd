@@ -1,8 +1,9 @@
 //! Standalone `#![no_std]` ESP32-C6 (`riscv32imac-unknown-none-elf`) synthetic DSP harness.
 //!
 //! Exercises `FixedQ15DirectConvolver`, `DirectConvolver` (`f32` software baseline),
-//! `FixedQ15PartitionedConvolver`, and `FixedQ15NonUniformConvolver` using static/stack
-//! caller-supplied buffers with zero heap allocation and zero I2S dependency.
+//! `FixedQ15PartitionedConvolver`, and the zero-configuration `AutoConvolver` (which selects
+//! `FixedQ15NonUniformConvolver` on this FPU-less target) loading a raw `f32` `.bin` FIR artifact,
+//! using caller-supplied buffers with zero heap allocation and zero I2S dependency.
 //!
 //! Flashing and physical cycle measurement (`DEVICE_VERIFIED`) require explicit owner
 //! authorization and a connected ESP32-C6 board; do not flash automatically.
@@ -11,9 +12,36 @@
 #![no_main]
 
 use core::panic::PanicInfo;
+use rtconv_simd::auto::{AutoConvolver, AutoEngine, AutoWorkspace, workspace_len};
 use rtconv_simd::{
     DirectConfig, DirectConvolver, FixedQ15DirectConfig, FixedQ15DirectConvolver,
-    FixedQ15PartitionedConfig, FixedQ15PartitionedConvolver, SimdBackend,
+    FixedQ15PartitionedConfig, FixedQ15PartitionedConvolver, HAS_HARDWARE_FPU, SimdBackend,
+};
+
+/// Taps of the embedded synthetic FIR artifact (`> Q15_DIRECT_MAX_TAPS`, so NUPC is selected).
+const FIR_TAPS: usize = 300;
+
+/// Raw little-endian `f32` mono FIR (rePhase `.bin` layout) built at compile time:
+/// `h[0] = 0.5`, `h[200] = -0.25`, zeros elsewhere.
+const FIR_BIN: [u8; FIR_TAPS * 4] = {
+    let mut out = [0u8; FIR_TAPS * 4];
+    let mut k = 0;
+    while k < FIR_TAPS {
+        let v: f32 = if k == 0 {
+            0.5
+        } else if k == 200 {
+            -0.25
+        } else {
+            0.0
+        };
+        let b = v.to_le_bytes();
+        out[4 * k] = b[0];
+        out[4 * k + 1] = b[1];
+        out[4 * k + 2] = b[2];
+        out[4 * k + 3] = b[3];
+        k += 1;
+    }
+    out
 };
 
 /// Result summary produced by a synthetic benchmark/validation pass on ESP32-C6.
@@ -27,6 +55,9 @@ pub struct HarnessReport {
     pub q15_fdl_sats: u64,
     /// Total samples processed per engine.
     pub samples_processed: usize,
+    /// `true` if `AutoConvolver` chose the FPU-less Q1.15 non-uniform engine and reproduced
+    /// the embedded artifact's impulse response.
+    pub auto_ok: bool,
 }
 
 /// Executes the synthetic DSP validation workload (Direct Q15, Direct f32, FDL Q15)
@@ -87,7 +118,7 @@ pub fn run_synthetic_suite() -> HarnessReport {
         block_size: 32,
         max_ir_len: 64,
     };
-    let mut pws = [0i16; 512];
+    let mut pws = [0i16; 1024];
     let mut q15_fdl_sats = 0u64;
     if let Ok(mut pconv) = FixedQ15PartitionedConvolver::prepare(&ir_q15, pcfg, &mut pws) {
         if pconv.process_block(&in_q15, &mut out_q15).is_ok() {
@@ -102,11 +133,38 @@ pub fn run_synthetic_suite() -> HarnessReport {
         impulse_ok = false;
     }
 
+    // 4. Zero-configuration AutoConvolver from the embedded raw f32 artifact.
+    let mut auto_ok = !HAS_HARDWARE_FPU;
+    let mut ws = AutoWorkspace::<{ workspace_len(FIR_TAPS) }>::new();
+    match AutoConvolver::from_bytes(&FIR_BIN, 0, ws.as_mut_slice()) {
+        Ok(mut conv) => {
+            auto_ok &= conv.info().engine == AutoEngine::FixedNonUniform;
+            let mut x = [0i16; 32];
+            let mut y = [0i16; 32];
+            x[0] = 16384; // +0.5
+            for block in 0..8 {
+                if conv.process_i16(&x, &mut y).is_err() {
+                    auto_ok = false;
+                }
+                x[0] = 0;
+                // Expected: y[0] = 0.25 (8192) and y[200] = -0.125 (-4096).
+                if block == 0 && (y[0] - 8192).abs() > 1 {
+                    auto_ok = false;
+                }
+                if block == 6 && (y[200 - 192] + 4096).abs() > 1 {
+                    auto_ok = false;
+                }
+            }
+        }
+        Err(_) => auto_ok = false,
+    }
+
     HarnessReport {
         impulse_ok,
         q15_direct_sats,
         q15_fdl_sats,
         samples_processed: 32,
+        auto_ok,
     }
 }
 

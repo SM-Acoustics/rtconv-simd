@@ -414,6 +414,469 @@ fn verify_fixed_q15_nonuniform() {
     });
 }
 
+#[cfg(feature = "auto")]
+fn verify_auto() {
+    use rtconv_simd::auto::{
+        AutoConvolver, AutoStereoConvolver, workspace_len_f32, workspace_len_q15,
+    };
+
+    // 2,000-tap stereo IEEE-float WAV (rePhase "32 bits IEEE stereo" layout), built before arming.
+    let taps = 2000usize;
+    let mut data = Vec::new();
+    for k in 0..taps {
+        let v = if k == 1000 {
+            0.9f32
+        } else {
+            1e-3 * ((k % 7) as f32 - 3.0)
+        };
+        data.extend_from_slice(&v.to_le_bytes());
+        data.extend_from_slice(&(-v).to_le_bytes());
+    }
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    for v in [3u16, 2] {
+        wav.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in [48_000u32, 48_000 * 8] {
+        wav.extend_from_slice(&v.to_le_bytes());
+    }
+    for v in [8u16, 32] {
+        wav.extend_from_slice(&v.to_le_bytes());
+    }
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    wav.extend_from_slice(&data);
+
+    let mut wsf = vec![0.0f32; 2 * workspace_len_f32(taps)];
+    let mut wsq = vec![0i16; workspace_len_q15(taps)];
+    let in_f = [0.25f32; 37];
+    let mut out_f = [0.0f32; 37];
+    let mut out_r = [0.0f32; 37];
+    let in_q = [8192i16; 37];
+    let mut out_q = [0i16; 37];
+    let mut inter = [4096i16; 64];
+
+    let mut stereo = None;
+    assert_zero_alloc("auto::stereo_f32::from_bytes", || {
+        stereo = Some(AutoStereoConvolver::from_bytes(&wav, &mut wsf).unwrap());
+    });
+    let stereo = stereo.as_mut().unwrap();
+    assert_zero_alloc("auto::stereo_f32::process", || {
+        for _ in 0..64 {
+            stereo
+                .process_f32(&in_f, &in_f, &mut out_f, &mut out_r)
+                .unwrap();
+            stereo.process_interleaved_i16(&mut inter).unwrap();
+        }
+    });
+    assert_zero_alloc("auto::stereo_f32::reset", || stereo.reset());
+
+    let mut q = None;
+    assert_zero_alloc("auto::q15::from_bytes", || {
+        q = Some(AutoConvolver::from_bytes(&wav, 1, &mut wsq).unwrap());
+    });
+    let q = q.as_mut().unwrap();
+    assert_zero_alloc("auto::q15::process", || {
+        for _ in 0..64 {
+            q.process_i16(&in_q, &mut out_q).unwrap();
+            q.process_f32(&in_f, &mut out_f).unwrap();
+        }
+        black_box(q.info());
+        black_box(q.saturation_count());
+    });
+    assert_zero_alloc("auto::q15::reset", || q.reset());
+}
+
+fn verify_large_ffts_f32(backend: SimdBackend) {
+    use rtconv_simd::{FftBackend, FftSize};
+
+    let micro = MicroFftBackend::new();
+    let simd = SimdFixedFftBackend::new(backend);
+    #[cfg(feature = "phastft")]
+    let phast = PhastFftBackend::new();
+
+    for &size in &[
+        FftSize::N512,
+        FftSize::N1024,
+        FftSize::N2048,
+        FftSize::N4096,
+        FftSize::N8192,
+        FftSize::N16384,
+    ] {
+        let n = size.len();
+        let bins = size.spectrum_bins();
+        let x = vec![0.25f32; n];
+        let mut re = vec![0.0f32; bins];
+        let mut im = vec![0.0f32; bins];
+        let mut out = vec![0.0f32; n];
+        let mut sc_micro = vec![0.0f32; micro.scratch_len_f32(size)];
+        let mut sc_simd = vec![0.0f32; simd.scratch_len_f32(size)];
+
+        assert_zero_alloc("microfft_large::rfft_irfft", || {
+            micro
+                .rfft_forward(size, &x, &mut re, &mut im, &mut sc_micro)
+                .unwrap();
+            micro
+                .rfft_inverse(size, &re, &im, &mut out, &mut sc_micro)
+                .unwrap();
+            black_box(&out);
+        });
+        assert_zero_alloc("simdfixed_large::rfft_irfft", || {
+            simd.rfft_forward(size, &x, &mut re, &mut im, &mut sc_simd)
+                .unwrap();
+            simd.rfft_inverse(size, &re, &im, &mut out, &mut sc_simd)
+                .unwrap();
+            black_box(&out);
+        });
+        assert_zero_alloc("simdfixed_large::staged_steps", || {
+            let fwd_steps = simd.staged_forward_steps(size);
+            for step in 0..fwd_steps {
+                let t_in: &[f32] = if step == 0 { &x } else { &[] };
+                simd.rfft_forward_step(size, step, t_in, &mut re, &mut im, &mut [])
+                    .unwrap();
+            }
+            let inv_steps = simd.staged_inverse_steps(size);
+            for step in 0..inv_steps {
+                let t_out: &mut [f32] = if step + 1 == inv_steps {
+                    &mut out
+                } else {
+                    &mut []
+                };
+                simd.rfft_inverse_step(size, step, &mut re, &mut im, t_out, &mut [])
+                    .unwrap();
+            }
+            black_box(&out);
+        });
+        #[cfg(feature = "phastft")]
+        {
+            let mut sc_phast = vec![0.0f32; phast.scratch_len_f32(size)];
+            assert_zero_alloc("phastft_large::rfft_irfft", || {
+                phast
+                    .rfft_forward(size, &x, &mut re, &mut im, &mut sc_phast)
+                    .unwrap();
+                phast
+                    .rfft_inverse(size, &re, &im, &mut out, &mut sc_phast)
+                    .unwrap();
+                black_box(&out);
+            });
+        }
+    }
+
+    // PartitionedConvolver with B = 8192 (FFT N16384)
+    let ir_16k = vec![0.01f32; 16_384];
+    let in_8k = vec![0.25f32; 8192];
+    let mut out_8k = vec![0.0f32; 8192];
+    let p_cfg = PartitionedConfig {
+        block_size: 8192,
+        max_ir_len: 16_384,
+    };
+    let mut p_ws = vec![
+        0.0f32;
+        PartitionedConvolver::memory_requirements(p_cfg, &simd)
+            .unwrap()
+            .total_f32
+    ];
+    let mut p_conv = None;
+    assert_zero_alloc("partitioned_n16384::prepare", || {
+        p_conv =
+            Some(PartitionedConvolver::prepare(&ir_16k, p_cfg, &mut p_ws, backend, simd).unwrap());
+    });
+    let p_conv = p_conv.as_mut().unwrap();
+    assert_zero_alloc("partitioned_n16384::process_block", || {
+        p_conv.process_block(&in_8k, &mut out_8k).unwrap();
+        p_conv.process_block(&in_8k, &mut out_8k).unwrap();
+    });
+    assert_zero_alloc("partitioned_n16384::reset", || p_conv.reset());
+
+    // NonUniformConvolver with large stages up to B = 8192 (FFT N16384)
+    #[cfg(feature = "nonuniform")]
+    {
+        use rtconv_simd::{
+            NonUniformConfig, NonUniformConvolver, NonUniformPlan, NonUniformStageConfig,
+        };
+        let stages = [
+            NonUniformStageConfig {
+                ir_offset: 0,
+                ir_len: 64,
+                block_size: 1,
+            },
+            NonUniformStageConfig {
+                ir_offset: 64,
+                ir_len: 192,
+                block_size: 64,
+            },
+            NonUniformStageConfig {
+                ir_offset: 256,
+                ir_len: 768,
+                block_size: 256,
+            },
+            NonUniformStageConfig {
+                ir_offset: 1024,
+                ir_len: 3072,
+                block_size: 1024,
+            },
+            NonUniformStageConfig {
+                ir_offset: 4096,
+                ir_len: 4096,
+                block_size: 4096,
+            },
+            NonUniformStageConfig {
+                ir_offset: 8192,
+                ir_len: 8192,
+                block_size: 8192,
+            },
+        ];
+        let plan = NonUniformPlan::validate(NonUniformConfig {
+            max_ir_len: 16_384,
+            host_block_max: 64,
+            stages: &stages,
+        })
+        .unwrap();
+        let req = NonUniformConvolver::memory_requirements(&plan, &simd).unwrap();
+        let mut ws = vec![0.0f32; req.total_f32];
+        let in_64 = [0.25f32; 64];
+        let mut out_64 = [0.0f32; 64];
+        let mut nu = None;
+        assert_zero_alloc("nonuniform_n16384::prepare", || {
+            nu = Some(NonUniformConvolver::prepare(&ir_16k, plan, &mut ws, backend, simd).unwrap());
+        });
+        let nu = nu.as_mut().unwrap();
+        assert_zero_alloc("nonuniform_n16384::process_block", || {
+            for _ in 0..130 {
+                nu.process_block(&in_64, &mut out_64).unwrap();
+            }
+        });
+        assert_zero_alloc("nonuniform_n16384::reset", || nu.reset());
+    }
+}
+
+#[cfg(feature = "fixed-fft")]
+fn verify_large_ffts_q15() {
+    use rtconv_simd::FftSize;
+    use rtconv_simd::fixed::{
+        FixedStagedFftState, fixed_fft_scratch_len_i32, fixed_fft_staged_steps,
+        irfft_q15_bfp_step_with_scratch, irfft_q15_bfp_with_scratch,
+        rfft_q15_bfp_step_with_scratch, rfft_q15_bfp_with_scratch,
+    };
+    use rtconv_simd::{FixedQ15PartitionedConfig, FixedQ15PartitionedConvolver};
+
+    for &size in &[FftSize::N512, FftSize::N1024, FftSize::N2048] {
+        let n = size.len();
+        let bins = size.spectrum_bins();
+        let x = vec![4096i16; n];
+        let mut re = vec![0i16; bins];
+        let mut im = vec![0i16; bins];
+        let mut out = vec![0i16; n];
+        let mut sc = vec![0i32; fixed_fft_scratch_len_i32(size)];
+        assert_zero_alloc("fixed_fft_large::rfft_irfft", || {
+            let exp = rfft_q15_bfp_with_scratch(size, &x, &mut re, &mut im, &mut sc).unwrap();
+            let sats = irfft_q15_bfp_with_scratch(size, &re, &im, exp, &mut out, &mut sc).unwrap();
+            black_box((sats, &out));
+        });
+        assert_zero_alloc("fixed_fft_large::staged_steps", || {
+            let steps = fixed_fft_staged_steps(size);
+            let mut fstate = FixedStagedFftState::new();
+            let mut exp = 0i8;
+            for step in 0..steps {
+                let t_in: &[i16] = if step == 0 { &x } else { &[] };
+                if let Some(e) = rfft_q15_bfp_step_with_scratch(
+                    size,
+                    step,
+                    t_in,
+                    &mut re,
+                    &mut im,
+                    &mut sc,
+                    &mut fstate,
+                )
+                .unwrap()
+                {
+                    exp = e;
+                }
+            }
+            let mut istate = FixedStagedFftState::new();
+            let mut sats = 0u64;
+            for step in 0..steps {
+                let t_out: &mut [i16] = if step + 1 == steps { &mut out } else { &mut [] };
+                if let Some(s) = irfft_q15_bfp_step_with_scratch(
+                    size,
+                    step,
+                    &re,
+                    &im,
+                    exp,
+                    t_out,
+                    &mut sc,
+                    &mut istate,
+                )
+                .unwrap()
+                {
+                    sats = s;
+                }
+            }
+            black_box((sats, &out));
+        });
+    }
+
+    let ir = vec![64i16; 2048];
+    let input = vec![4096i16; 1024];
+    let mut output = vec![0i16; 1024];
+    let cfg = FixedQ15PartitionedConfig {
+        block_size: 1024,
+        max_ir_len: 2048,
+    };
+    let req = FixedQ15PartitionedConvolver::memory_requirements(cfg).unwrap();
+    let mut ws = vec![0i16; req.total_i16];
+    let mut conv = None;
+    assert_zero_alloc("fixed_q15_partitioned_n2048::prepare", || {
+        conv = Some(FixedQ15PartitionedConvolver::prepare(&ir, cfg, &mut ws).unwrap());
+    });
+    let conv = conv.as_mut().unwrap();
+    assert_zero_alloc("fixed_q15_partitioned_n2048::process_block", || {
+        conv.process_block(&input, &mut output).unwrap();
+        conv.process_block(&input, &mut output).unwrap();
+    });
+    assert_zero_alloc("fixed_q15_partitioned_n2048::reset", || conv.reset());
+
+    #[cfg(feature = "fixed-nonuniform")]
+    {
+        use rtconv_simd::{
+            FixedQ15NonUniformConvolver, NonUniformConfig, NonUniformPlan, NonUniformStageConfig,
+        };
+        let stages = [
+            NonUniformStageConfig {
+                ir_offset: 0,
+                ir_len: 128,
+                block_size: 1,
+            },
+            NonUniformStageConfig {
+                ir_offset: 128,
+                ir_len: 128,
+                block_size: 128,
+            },
+            NonUniformStageConfig {
+                ir_offset: 256,
+                ir_len: 256,
+                block_size: 256,
+            },
+            NonUniformStageConfig {
+                ir_offset: 512,
+                ir_len: 512,
+                block_size: 512,
+            },
+            NonUniformStageConfig {
+                ir_offset: 1024,
+                ir_len: 1024,
+                block_size: 1024,
+            },
+        ];
+        let plan = NonUniformPlan::validate(NonUniformConfig {
+            max_ir_len: 2048,
+            host_block_max: 64,
+            stages: &stages,
+        })
+        .unwrap();
+        let req = FixedQ15NonUniformConvolver::memory_requirements(&plan).unwrap();
+        let mut ws = vec![0i16; req.total_i16];
+        let in_64 = [4096i16; 64];
+        let mut out_64 = [0i16; 64];
+        let mut nu = None;
+        assert_zero_alloc("fixed_q15_nonuniform_n2048::prepare", || {
+            nu = Some(FixedQ15NonUniformConvolver::prepare(&ir, plan, &mut ws).unwrap());
+        });
+        let nu = nu.as_mut().unwrap();
+        assert_zero_alloc("fixed_q15_nonuniform_n2048::process_block", || {
+            for _ in 0..34 {
+                nu.process_block(&in_64, &mut out_64).unwrap();
+            }
+        });
+        assert_zero_alloc("fixed_q15_nonuniform_n2048::reset", || nu.reset());
+    }
+}
+
+#[cfg(feature = "nonuniform")]
+fn verify_nupc_optimizer(backend: SimdBackend) {
+    use rtconv_simd::nonuniform::{
+        BlockModePolicy, ClearancePolicy, CostModel, NonUniformConvolver, NonUniformPlan,
+        OptimizerScratchCell, block_mode_scratch_len, optimize_block_mode, optimizer_scratch_len,
+        preset_esp32_c6_q15, preset_esp32_p4_f32,
+    };
+
+    let model = CostModel::for_backend_f32(backend);
+    let ir_len = 16_384usize;
+    let mut sc = vec![OptimizerScratchCell::ZERO; optimizer_scratch_len(ir_len, 8192)];
+    let mut opt_plan = None;
+    assert_zero_alloc("nupc_optimizer::optimize_sample_time", || {
+        let (plan, rep) =
+            NonUniformPlan::optimize(ir_len, 64, &model, ClearancePolicy::Strategy2, &mut sc)
+                .unwrap();
+        black_box(rep);
+        opt_plan = Some(plan);
+    });
+    let opt_plan = opt_plan.unwrap();
+
+    // Block-mode Viterbi DP (Wefers §6.12: 88,200 taps, B=128)
+    let w_model = CostModel::wefers_2015_test_system();
+    let mut bsc = vec![OptimizerScratchCell::ZERO; block_mode_scratch_len(88_200, 128, 8192)];
+    assert_zero_alloc("nupc_optimizer::optimize_block_mode", || {
+        let part = optimize_block_mode(
+            88_200,
+            128,
+            8192,
+            &w_model,
+            BlockModePolicy::Strategy2TableA25,
+            &mut bsc,
+        )
+        .unwrap();
+        black_box(part);
+    });
+
+    // Zero-scratch MCU presets
+    assert_zero_alloc("nupc_optimizer::mcu_presets", || {
+        black_box(preset_esp32_p4_f32(16_384, 64).unwrap());
+        black_box(preset_esp32_c6_q15(16_384, 64).unwrap());
+    });
+
+    // Prepare + process optimized NUPC plan with zero heap allocation
+    let fft = SimdFixedFftBackend::new(backend);
+    let req = NonUniformConvolver::memory_requirements(&opt_plan, &fft).unwrap();
+    let mut ws = vec![0.0f32; req.total_f32];
+    let ir = vec![0.01f32; ir_len];
+    let inp = [0.25f32; 64];
+    let mut out = [0.0f32; 64];
+    let mut nu = None;
+    assert_zero_alloc("nupc_optimizer::convolver_prepare", || {
+        nu = Some(NonUniformConvolver::prepare(&ir, opt_plan, &mut ws, backend, fft).unwrap());
+    });
+    let nu = nu.as_mut().unwrap();
+    assert_zero_alloc("nupc_optimizer::convolver_process", || {
+        for _ in 0..32 {
+            nu.process_block(&inp, &mut out).unwrap();
+        }
+    });
+    assert_zero_alloc("nupc_optimizer::convolver_reset", || nu.reset());
+
+    // AutoConvolver selecting cost-optimized AutoEngine::NonUniform (16,384 taps, in-place DP)
+    #[cfg(feature = "auto")]
+    {
+        use rtconv_simd::auto::{AutoConvolver, AutoEngine, engine_len_f32};
+        let mut auto_ws = vec![0.0f32; engine_len_f32(ir_len)];
+        let mut aconv = None;
+        assert_zero_alloc("auto::nonuniform_16k::prepare_f32", || {
+            aconv = Some(AutoConvolver::prepare_f32(&ir, &mut auto_ws).unwrap());
+        });
+        let aconv = aconv.as_mut().unwrap();
+        assert_eq!(aconv.info().engine, AutoEngine::NonUniform);
+        assert_zero_alloc("auto::nonuniform_16k::process_f32", || {
+            for _ in 0..32 {
+                aconv.process_f32(&inp, &mut out).unwrap();
+            }
+        });
+        assert_zero_alloc("auto::nonuniform_16k::reset", || aconv.reset());
+    }
+}
+
 fn main() {
     // Warm up runtime environment and CPU feature detection before arming instrumentation.
     let backend = SimdBackend::detect_or_baseline();
@@ -425,16 +888,23 @@ fn main() {
     verify_positive_control();
     verify_microfft_engines(backend);
     verify_simd_fixed_and_tail_spreading(backend);
+    verify_large_ffts_f32(backend);
     #[cfg(feature = "phastft")]
     verify_phastft_audio_callback(backend);
     #[cfg(feature = "nonuniform")]
     verify_nonuniform(backend);
+    #[cfg(feature = "nonuniform")]
+    verify_nupc_optimizer(backend);
     #[cfg(feature = "fixed-q15")]
     verify_fixed_q15_direct();
     #[cfg(feature = "fixed-fft")]
     verify_fixed_q15_partitioned();
+    #[cfg(feature = "fixed-fft")]
+    verify_large_ffts_q15();
     #[cfg(feature = "fixed-nonuniform")]
     verify_fixed_q15_nonuniform();
+    #[cfg(feature = "auto")]
+    verify_auto();
 
     println!("no_alloc_rt: ALL ZERO-ALLOCATION AND POSITIVE-CONTROL CHECKS PASSED");
 }

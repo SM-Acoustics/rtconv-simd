@@ -11,7 +11,13 @@ Compilation, MSRV, cross-compilation, host testing, and hardware execution are t
 | ARM64 bare-metal (`aarch64-unknown-none`) | `CROSS_COMPILE_VERIFIED` (`embedded.yml`) | `OPEN` | `OPEN` (`DEVICE_VERIFIED: NO`) | NEON via `fearless_simd` |
 | WebAssembly (`wasm32-unknown-unknown`) | `CROSS_COMPILE_VERIFIED` (`embedded.yml`) | `OPEN` | `OPEN` (`DEVICE_VERIFIED: NO`) | SIMD128 (`-C target-feature=+simd128`) or fallback |
 | Cortex-M4F/M7F (`thumbv7em-none-eabihf`) | `CROSS_COMPILE_VERIFIED` (`embedded.yml`) | `OPEN` | `OPEN` (`DEVICE_VERIFIED: NO`) | Scalar fallback / Q1.15/BFP |
-| RISC-V / ESP32-C6 (`riscv32imac-unknown-none-elf`) | `CROSS_COMPILE_VERIFIED` (`embedded.yml` + `hardware/esp32c6/`) | `OPEN` | `OPEN` (`DEVICE_VERIFIED: NO`, harness ready) | Explicit scalar fallback (`f32`) / FPU-free Q1.15/BFP |
+| RISC-V / ESP32-C6 (`riscv32imac-unknown-none-elf`) | `CROSS_COMPILE_VERIFIED` (`embedded.yml`: core, default `auto`, `fixed-nonuniform`, `-D warnings`; `hardware/esp32c6/` harness) | host mirror (`tests/auto_convolver.rs::esp32c6_harness_scenario_on_host`) | `OPEN` (`DEVICE_VERIFIED: NO`, harness ready) | `auto` → Q1.15/BFP; explicit scalar fallback for `f32` engines |
+| RISC-V / ESP32-P4 (`riscv32imafc-unknown-none-elf`) | `CROSS_COMPILE_VERIFIED` (`embedded.yml`: core, default `auto`, `fixed-nonuniform`, `-D warnings`) | `OPEN` | `OPEN` (`DEVICE_VERIFIED: NO`) | `auto` → `f32` (hardware single-precision FPU, scalar; PIE SIMD unused) |
+| Cortex-M0/M0+ (`thumbv6m-none-eabi`) | `CROSS_COMPILE_VERIFIED` (`embedded.yml`) | `OPEN` | `OPEN` | `auto` → Q1.15/BFP |
+
+## Automatic Numeric Domain (`auto::NativeElem`)
+
+`build.rs` emits `cfg(rtconv_no_fpu)` when `f32` would be software-emulated. On stable Rust, `cfg(target_feature = "f")` is **not** exposed for RISC-V, so `riscv32imac` and `riscv32imafc` have identical cfgs. The ISA letters of the target triple are therefore parsed (`f`, `d` or `g` ⇒ FPU). For ARM the rule is the `eabihf` ABI or VFP features; ESP32-S2, AVR and MSP430 are treated as FPU-less. Classification was probed with `cargo build -vv` for `riscv32imac` (Q1.15), `riscv32imafc` (`f32`), `thumbv6m` (Q1.15), `thumbv7em-none-eabihf` (`f32`) and `x86_64` (`f32`). The `native-q15` feature forces Q1.15.
 
 ## RISC-V / ESP32-C6 / ESP32-P4 Note
 

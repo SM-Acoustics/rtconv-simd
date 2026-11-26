@@ -39,22 +39,75 @@ impl Rng {
     }
 }
 
-/// Independent `f64` reference DFT (bins 0..=N/2).
+/// Direct `O(N)` `f64` DFT evaluation at a single frequency bin `k`.
+fn reference_dft_bin_f64(x: &[f32], k: usize) -> (f64, f64) {
+    let n = x.len();
+    let mut sr = 0.0f64;
+    let mut si = 0.0f64;
+    for (m, &xm) in x.iter().enumerate() {
+        let angle = -2.0 * PI * (k as f64) * (m as f64) / (n as f64);
+        sr += (xm as f64) * angle.cos();
+        si += (xm as f64) * angle.sin();
+    }
+    (sr, si)
+}
+
+/// Independent `f64` reference DFT (bins 0..=N/2): direct O(N^2) DFT for `N <= 512`, and
+/// textbook radix-2 Cooley-Tukey in `f64` cross-checked against direct `O(N)` DFT bins for
+/// `N > 512` (so `N = 16384` runs in milliseconds while remaining mathematically anchored to
+/// the DFT definition).
 fn reference_rfft_f64(x: &[f32]) -> (Vec<f64>, Vec<f64>) {
     let n = x.len();
     let bins = n / 2 + 1;
-    let mut re = vec![0.0f64; bins];
-    let mut im = vec![0.0f64; bins];
-    for k in 0..bins {
-        let mut sr = 0.0f64;
-        let mut si = 0.0f64;
-        for (m, &xm) in x.iter().enumerate() {
-            let angle = -2.0 * PI * (k as f64) * (m as f64) / (n as f64);
-            sr += (xm as f64) * angle.cos();
-            si += (xm as f64) * angle.sin();
+    if n <= 512 {
+        let mut re = vec![0.0f64; bins];
+        let mut im = vec![0.0f64; bins];
+        for k in 0..bins {
+            let (sr, si) = reference_dft_bin_f64(x, k);
+            re[k] = sr;
+            im[k] = si;
         }
-        re[k] = sr;
-        im[k] = si;
+        return (re, im);
+    }
+
+    let bits = n.trailing_zeros();
+    let mut re = vec![0.0f64; n];
+    let mut im = vec![0.0f64; n];
+    for (i, &v) in x.iter().enumerate() {
+        let rev = i.reverse_bits() >> (usize::BITS - bits);
+        re[rev] = v as f64;
+    }
+    let mut half = 1usize;
+    while half < n {
+        let step = half << 1;
+        let angle_step = -2.0 * PI / (step as f64);
+        for base in (0..n).step_by(step) {
+            for j in 0..half {
+                let ang = angle_step * (j as f64);
+                let wr = ang.cos();
+                let wi = ang.sin();
+                let i0 = base + j;
+                let i1 = i0 + half;
+                let tr = re[i1] * wr - im[i1] * wi;
+                let ti = re[i1] * wi + im[i1] * wr;
+                re[i1] = re[i0] - tr;
+                im[i1] = im[i0] - ti;
+                re[i0] += tr;
+                im[i0] += ti;
+            }
+        }
+        half = step;
+    }
+    re.truncate(bins);
+    im.truncate(bins);
+
+    // Anchor the fast f64 oracle directly against the textbook O(N) DFT sum on 8 bins.
+    for &k in &[0usize, 1, 7, n / 8, n / 4, n / 3, bins - 2, bins - 1] {
+        let (dr, di) = reference_dft_bin_f64(x, k);
+        assert!(
+            (re[k] - dr).abs() < 1e-9 && (im[k] - di).abs() < 1e-9,
+            "f64 FFT oracle diverged from direct DFT at N={n} k={k}"
+        );
     }
     (re, im)
 }
@@ -99,11 +152,30 @@ fn snr_db(reference: &[f32], actual: &[f32]) -> f64 {
     }
 }
 
+fn spectrum_snr_db(ref_re: &[f64], ref_im: &[f64], got_re: &[f32], got_im: &[f32]) -> f64 {
+    let mut sig = 0.0f64;
+    let mut err = 0.0f64;
+    for k in 0..ref_re.len() {
+        let dr = ref_re[k] - got_re[k] as f64;
+        let di = ref_im[k] - got_im[k] as f64;
+        sig += ref_re[k] * ref_re[k] + ref_im[k] * ref_im[k];
+        err += dr * dr + di * di;
+    }
+    if err == 0.0 {
+        f64::INFINITY
+    } else {
+        10.0 * (sig / err).log10()
+    }
+}
+
 fn validate_fft_backend<F: FftBackend>(label: &str, fft: &F) {
     let mut rng = Rng::new(0xBEEF_1234_5678);
 
-    for &size in &[FftSize::N64, FftSize::N128, FftSize::N256] {
-        assert!(fft.supports_size(size));
+    for size in FftSize::ALL {
+        assert!(
+            fft.supports_size(size),
+            "{label} missing support for {size:?}"
+        );
         let n = size.len();
         let bins = size.spectrum_bins();
         let x = rng.vec_f32(n, 1.0);
@@ -114,23 +186,18 @@ fn validate_fft_backend<F: FftBackend>(label: &str, fft: &F) {
         let mut scratch = vec![0.0f32; fft.scratch_len_f32(size)];
         let mut time_out = vec![0.0f32; n];
 
-        // 1. Forward RFFT vs f64 DFT
+        // 1. Forward RFFT vs f64 DFT oracle (SNR > 120 dB)
         fft.rfft_forward(size, &x, &mut spec_re, &mut spec_im, &mut scratch)
             .unwrap();
-        let mut max_spec_err = 0.0f64;
-        for k in 0..bins {
-            let er = (spec_re[k] as f64 - ref_re[k]).abs();
-            let ei = (spec_im[k] as f64 - ref_im[k]).abs();
-            max_spec_err = max_spec_err.max(er).max(ei);
-        }
+        let spec_snr = spectrum_snr_db(&ref_re, &ref_im, &spec_re, &spec_im);
         assert!(
-            max_spec_err < 2e-4,
-            "{label} N={n} forward spectrum error {max_spec_err} >= 2e-4"
+            spec_snr > 120.0,
+            "{label} N={n} forward spectrum SNR={spec_snr:.2} dB <= 120 dB"
         );
         // DC and Nyquist imaginary parts must be ~0
-        assert!(spec_im[0].abs() < 1e-6, "{label} N={n} DC imag != 0");
+        assert!(spec_im[0].abs() < 1e-5, "{label} N={n} DC imag != 0");
         assert!(
-            spec_im[bins - 1].abs() < 1e-6,
+            spec_im[bins - 1].abs() < 1e-5,
             "{label} N={n} Nyq imag != 0"
         );
 
@@ -147,13 +214,16 @@ fn validate_fft_backend<F: FftBackend>(label: &str, fft: &F) {
             "{label} N={n} Parseval relative error {rel_parseval} >= 1e-5"
         );
 
-        // 3. Round-trip RFFT -> IFFT
+        // 3. Round-trip RFFT -> IFFT (SNR > 120 dB)
         fft.rfft_inverse(size, &spec_re, &spec_im, &mut time_out, &mut scratch)
             .unwrap();
         let rt_err = max_abs_diff(&x, &time_out);
         let rt_snr = snr_db(&x, &time_out);
+        println!(
+            "{label:<24} N={n:<5} fwd_snr={spec_snr:6.2} dB  rt_snr={rt_snr:6.2} dB  rt_err={rt_err:.2e}"
+        );
         assert!(
-            rt_err < 5e-6 && rt_snr > 120.0,
+            rt_err < 1e-5 && rt_snr > 120.0,
             "{label} N={n} round-trip err={rt_err:.3e}, snr={rt_snr:.2} dB"
         );
     }

@@ -1,14 +1,14 @@
 [package]
 name = "rtconv-simd"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 license = "GPL-3.0-or-later"
 readme = "README.md"
 repository = "https://github.com/SM-Acoustics/rtconv-simd"
 documentation = "https://docs.rs/rtconv-simd"
-description = "Pure Rust, no_std FIR convolution with SIMD FFT, caller-managed memory, and predictable real-time DSP workloads."
-keywords = ["dsp", "convolution", "simd", "audio", "no-std"]
+description = "Zero-latency, allocation-free no_std FIR convolution: SIMD FFT, Q1.15 block-floating-point engines for FPU-less MCUs, and automatic setup from WAV/raw/text FIR files."
+keywords = ["dsp", "convolution", "fir", "audio", "no-std"]
 categories = ["multimedia::audio", "no-std", "algorithms"]
 exclude = [
     ".github/*",
@@ -22,12 +22,23 @@ exclude = [
     "RT_AUDIT.md",
 ]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [lib]
 name = "rtconv_simd"
 path = "src/lib.rs"
 
 [features]
-default = []
+# `auto` is `no_std` and allocation-free like the rest of the crate; it only adds code.
+default = ["auto"]
+# Zero-configuration `AutoConvolver` / `AutoStereoConvolver`: FIR artifact in, engine chosen
+# from the IR length and the target's FPU (f32 on ESP32-P4/Cortex-M4F/desktop, Q1.15/BFP on
+# ESP32-C6/Cortex-M0). Pulls in the fixed-point and non-uniform engines.
+auto = ["fixed-nonuniform"]
+# Force the Q1.15 domain as `auto::NativeElem` even on targets with an FPU (RAM savings,
+# bit-exact cross-target behaviour, or host testing of the FPU-less path).
+native-q15 = ["auto"]
 # Enables runtime CPU feature detection (`Level::new()`) via `fearless_simd/std`.
 # Core DSP processing never uses `std` or `alloc`.
 std = ["fearless_simd/std"]
@@ -37,7 +48,7 @@ phastft = ["std", "dep:phastft"]
 nonuniform = []
 # Fixed-point Q1.15 direct FIR engine (`#![no_std]`, zero-alloc, FPU-free).
 fixed-q15 = []
-# Fixed-point Q1.15 / Block Floating Point FFT (N64/N128/N256) and FDL convolver.
+# Fixed-point Q1.15 / Block Floating Point FFT (N64..N2048) and FDL convolver.
 fixed-fft = ["fixed-q15"]
 # Integrated fixed-point Q1.15/BFP Non-Uniform Partitioned Convolver (reuses NUPC scheduler).
 fixed-nonuniform = ["nonuniform", "fixed-fft"]
@@ -45,7 +56,7 @@ fixed-nonuniform = ["nonuniform", "fixed-fft"]
 [dependencies]
 fearless_simd = { version = "1.2.0", default-features = false, features = ["force_support_fallback", "libm"] }
 fearless_simd_macros = "0.1.0"
-microfft = { version = "0.6.0", default-features = false, features = ["size-256"] }
+microfft = { version = "0.6.0", default-features = false, features = ["size-16384"] }
 phastft = { version = "0.4.1", default-features = false, optional = true }
 
 [profile.release]
@@ -71,6 +82,10 @@ name = "fft_backends_bench"
 harness = false
 
 [[bench]]
+name = "denormal_bench"
+harness = false
+
+[[bench]]
 name = "nonuniform_bench"
 harness = false
 required-features = ["nonuniform"]
@@ -79,3 +94,8 @@ required-features = ["nonuniform"]
 name = "fixed_q15_bench"
 harness = false
 required-features = ["fixed-q15"]
+
+[[bench]]
+name = "optimizer_prediction_bench"
+harness = false
+required-features = ["nonuniform"]
