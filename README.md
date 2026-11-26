@@ -2,7 +2,7 @@
 
 **Deterministic, zero-allocation FIR convolution in pure Rust — from AVX2/NEON desktop audio engines to FPU-less RISC-V microcontrollers.**
 
-`#![no_std]` · `#![forbid(unsafe_code)]` · `MSRV 1.89.0` · `Zero Heap` · `MIT OR Apache-2.0`
+`#![no_std]` · `#![forbid(unsafe_code)]` · `MSRV 1.89.0` · `Zero Heap` · `GPL-3.0-or-later`
 
 `rtconv-simd` (library crate `rtconv_simd`) is a real-time FIR convolution suite with caller-managed workspaces, pluggable SIMD FFT backends, multi-stage non-uniform partitioning (NUPC), and a complete Q1.15 / Block Floating Point (BFP) fixed-point stack.
 
@@ -252,4 +252,8 @@ cargo run --release --example fixed_q15_direct --features fixed-q15
 
 ## License
 
-Dual-licensed under [`MIT`](./LICENSE-MIT) or [`Apache-2.0`](./LICENSE-APACHE), at your option.
+Licensed under the GNU General Public License v3.0 or later ([`GPL-3.0-or-later`](./LICENSE)).
+
+Commercial dual-licensing is available upon request from the copyright holder (SM Acoustics) for proprietary or closed-source integration.
+
+*Historical note:* Release tag `v0.1.0` remains available under its original `MIT OR Apache-2.0` terms.

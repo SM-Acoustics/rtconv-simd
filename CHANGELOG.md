@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Engineering Audit Reports (`WO-RTCONV-004`)**: `docs/WO-RTCONV-004A-CI-AUDIT.md` through `docs/WO-RTCONV-004F-ESP32C6.md` and consolidated `docs/WO-RTCONV-004-FINAL-REPORT.md`.
 
 ### Fixed & Changed
+- **License transition for `0.2.0+`**: Changed package license from `MIT OR Apache-2.0` to `GPL-3.0-or-later` (with optional commercial dual-licensing via SM Acoustics) by sole copyright holder decision, aligning `rtconv-simd` with the SM Acoustics organization licensing policy. Historical release `v0.1.0` remains available under its original `MIT OR Apache-2.0` terms.
 - Refactored `tests/no_alloc_rt.rs` to a standalone single-threaded `harness = false` binary with positive allocation control, resolving the macOS `libtest` concurrency flake while preserving Rust `1.89.0` compatibility (`#5`).
 - Pinned `dtolnay/rust-toolchain` by commit SHA with explicit `toolchain:` inputs across CI workflows and added a Dependabot `ignore` rule so MSRV `1.89.0` is never auto-bumped (`#5`).
 - Upgraded GitHub Actions `actions/checkout` from `v4` to `v7` across all four workflows (`#2`).
