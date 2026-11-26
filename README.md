@@ -257,5 +257,3 @@ See [`docs/PORTABILITY.md`](./docs/PORTABILITY.md) and [`hardware/esp32c6/README
 Licensed under the GNU General Public License v3.0 or later ([`GPL-3.0-or-later`](./LICENSE)).
 
 Commercial dual-licensing is available upon request from the copyright holder (SM Acoustics) for proprietary or closed-source integration.
-
-*Historical note:* Release tags `v0.1.0` and `v0.2.0` remain available under their original `MIT OR Apache-2.0` terms.
