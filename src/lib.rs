@@ -45,6 +45,7 @@ pub mod fixed;
 pub mod hybrid;
 #[cfg(feature = "nonuniform")]
 pub mod nonuniform;
+mod numconv;
 pub mod partitioned;
 #[cfg(feature = "phastft")]
 pub mod phastft_backend;

@@ -1,9 +1,11 @@
 //! Standalone `#![no_std]` ESP32-C6 (`riscv32imac-unknown-none-elf`) synthetic DSP harness.
 //!
-//! Exercises `FixedQ15DirectConvolver`, `DirectConvolver` (`f32` software baseline),
-//! `FixedQ15PartitionedConvolver`, and the zero-configuration `AutoConvolver` (which selects
-//! `FixedQ15NonUniformConvolver` on this FPU-less target) loading a raw `f32` `.bin` FIR artifact,
-//! using caller-supplied buffers with zero heap allocation and zero I2S dependency.
+//! Exercises `FixedQ15DirectConvolver`, `FixedQ15PartitionedConvolver`, and the
+//! zero-configuration `AutoConvolver` (which selects `FixedQ15NonUniformConvolver` on this
+//! FPU-less target) loading a raw `f32` `.bin` FIR artifact, using caller-supplied buffers with
+//! zero heap allocation and zero I2S dependency. The default build links no soft-float routine
+//! (guarded in CI); the `soft-float-baseline` feature adds the deliberate `f32`
+//! `DirectConvolver` comparison workload.
 //!
 //! Flashing and physical cycle measurement (`DEVICE_VERIFIED`) require explicit owner
 //! authorization and a connected ESP32-C6 board; do not flash automatically.
@@ -14,9 +16,11 @@
 use core::panic::PanicInfo;
 use rtconv_simd::auto::{AutoConvolver, AutoEngine, AutoWorkspace, workspace_len};
 use rtconv_simd::{
-    DirectConfig, DirectConvolver, FixedQ15DirectConfig, FixedQ15DirectConvolver,
-    FixedQ15PartitionedConfig, FixedQ15PartitionedConvolver, HAS_HARDWARE_FPU, SimdBackend,
+    FixedQ15DirectConfig, FixedQ15DirectConvolver, FixedQ15PartitionedConfig,
+    FixedQ15PartitionedConvolver, HAS_HARDWARE_FPU,
 };
+#[cfg(feature = "soft-float-baseline")]
+use rtconv_simd::{DirectConfig, DirectConvolver, SimdBackend};
 
 /// Taps of the embedded synthetic FIR artifact (`> Q15_DIRECT_MAX_TAPS`, so NUPC is selected).
 const FIR_TAPS: usize = 300;
@@ -60,7 +64,8 @@ pub struct HarnessReport {
     pub auto_ok: bool,
 }
 
-/// Executes the synthetic DSP validation workload (Direct Q15, Direct f32, FDL Q15)
+/// Executes the synthetic DSP validation workload (Direct Q15, FDL Q15, Auto; Direct `f32`
+/// only with the `soft-float-baseline` feature)
 /// at 32-sample blocks (`48 kHz` nominal budget = `666.67 us` / ~`106,667` cycles @ 160 MHz).
 pub fn run_synthetic_suite() -> HarnessReport {
     let mut impulse_ok = true;
@@ -90,28 +95,9 @@ pub fn run_synthetic_suite() -> HarnessReport {
         impulse_ok = false;
     }
 
-    // 2. Software f32 Direct FIR baseline (64 taps, 32-sample block)
-    let mut ir_f32 = [0.0f32; 64];
-    ir_f32[0] = 0.5;
-    ir_f32[15] = -0.25;
-    let mut in_f32 = [0.0f32; 32];
-    in_f32[0] = 0.5;
-    let mut out_f32 = [0.0f32; 32];
-    let dcfg = DirectConfig { max_ir_len: 64 };
-    let mut dws = [0.0f32; 128];
-    if let Ok(mut dconv) =
-        DirectConvolver::prepare(&ir_f32, dcfg, &mut dws, SimdBackend::baseline())
-    {
-        if dconv.process_block(&in_f32, &mut out_f32).is_ok() {
-            if (out_f32[0] - 0.25).abs() > 1e-5 || (out_f32[15] + 0.125).abs() > 1e-5 {
-                impulse_ok = false;
-            }
-        } else {
-            impulse_ok = false;
-        }
-    } else {
-        impulse_ok = false;
-    }
+    // 2. Software f32 Direct FIR baseline (64 taps, 32-sample block): opt-in soft-float.
+    #[cfg(feature = "soft-float-baseline")]
+    soft_float_baseline(&mut impulse_ok);
 
     // 3. Q15 BFP Partitioned FDL (B = 32 / N64, 64 taps = 2 partitions)
     let pcfg = FixedQ15PartitionedConfig {
@@ -165,6 +151,30 @@ pub fn run_synthetic_suite() -> HarnessReport {
         q15_fdl_sats,
         samples_processed: 32,
         auto_ok,
+    }
+}
+
+/// Opt-in soft-float baseline: `f32` `DirectConvolver` (64 taps, 32-sample block).
+#[cfg(feature = "soft-float-baseline")]
+fn soft_float_baseline(impulse_ok: &mut bool) {
+    let mut ir_f32 = [0.0f32; 64];
+    ir_f32[0] = 0.5;
+    ir_f32[15] = -0.25;
+    let mut in_f32 = [0.0f32; 32];
+    in_f32[0] = 0.5;
+    let mut out_f32 = [0.0f32; 32];
+    let dcfg = DirectConfig { max_ir_len: 64 };
+    let mut dws = [0.0f32; 128];
+    match DirectConvolver::prepare(&ir_f32, dcfg, &mut dws, SimdBackend::baseline()) {
+        Ok(mut dconv) => {
+            if dconv.process_block(&in_f32, &mut out_f32).is_err()
+                || (out_f32[0] - 0.25).abs() > 1e-5
+                || (out_f32[15] + 0.125).abs() > 1e-5
+            {
+                *impulse_ok = false;
+            }
+        }
+        Err(_) => *impulse_ok = false,
     }
 }
 

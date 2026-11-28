@@ -11,15 +11,29 @@
 //!    overrides the choice.
 //! 2. **Engine and partition size** from the IR length with [`CostModel`] (Wefers 2015 / García
 //!    2002 separable cost model):
-//!    - `f32`: chooses the cheapest of [`DirectConvolver`], zero-latency [`HybridConvolver`]
-//!      (`B ∈ {32..=8192}`), and cost-optimized [`NonUniformConvolver`] (Viterbi DP under
+//!    - `f32`: chooses the cheapest of [`DirectConvolver`](crate::DirectConvolver), zero-latency
+//!      [`HybridConvolver`](crate::HybridConvolver) (`B ∈ {32..=8192}`), and cost-optimized
+//!      [`NonUniformConvolver`](crate::NonUniformConvolver) (Viterbi DP under
 //!      [`ClearancePolicy::Strategy2`], running zero-alloc in the caller workspace).
 //!    - `Q1.15`: direct FIR up to [`Q15_DIRECT_MAX_TAPS`] taps, otherwise cost-optimized
 //!      [`FixedQ15NonUniformConvolver`] (`B <= 1024 / N2048`) planned with
-//!      [`CostModel::esp32_c6_q15_estimate`] inside the caller workspace.
+//!      [`CostModel::esp32_c6_q15_estimate`] inside the caller workspace. The planner runs on
+//!      an exact integer image of that model, so it needs no floating point.
 //! 3. **Gain headroom** for Q1.15: filters whose peak tap exceeds `1.0` are scaled by `2^-s`
 //!    on load and the output is scaled back by `2^s` with saturation (telemetry in
 //!    [`AutoConvolver::saturation_count`]).
+//!
+//! ## FPU-less builds (`cfg(rtconv_no_fpu)`, or the `native-q15` feature)
+//! The `f32` engines are **not part of** [`AutoConvolver`] there: the engine enum only holds
+//! the Q1.15 family, `f32` workspaces are not accepted ([`AutoElem`] is implemented for `i16`
+//! only), and [`AutoConvolver::prepare_f32`] quantizes the taps to Q1.31 from their IEEE bit
+//! patterns (round to nearest even, exact headroom shift) and prepares the Q1.15 engines in an
+//! `i16` workspace. `f32` I/O ([`AutoConvolver::process_f32`]) is converted with integer
+//! arithmetic. Nothing in the automatic layer then executes a floating-point operation, so no
+//! soft-float routine, `f32` FFT or twiddle ROM is linked. The explicit `f32` engines
+//! ([`DirectConvolver`](crate::DirectConvolver), [`HybridConvolver`](crate::HybridConvolver),
+//! [`NonUniformConvolver`](crate::NonUniformConvolver)) stay public for deliberate soft-float
+//! use.
 //!
 //! Every engine has **zero algorithmic latency**; all memory comes from one caller workspace
 //! whose size is a `const fn` ([`workspace_len`]), so it can be a `static` array:
@@ -37,19 +51,26 @@
 //! assert!((output[1] - 0.25).abs() < 1e-3);
 //! ```
 
+// Links to the `f32` engines use explicit `crate::` targets because FPU-less builds do not
+// import those types into this module; with an FPU the same links are merely redundant.
+#![cfg_attr(not(rtconv_no_fpu), allow(rustdoc::redundant_explicit_links))]
+
+use crate::ConvError;
 use crate::artifact::FirArtifact;
 use crate::fixed::block_float::q31_to_q15;
-use crate::fixed::{
-    FixedQ15DirectConfig, FixedQ15DirectConvolver, FixedQ15NonUniformConvolver, q15_to_f32,
-};
+use crate::fixed::{FixedQ15DirectConfig, FixedQ15DirectConvolver, FixedQ15NonUniformConvolver};
 use crate::nonuniform::optimizer::{
-    optimize_in_f32_scratch, optimize_in_i16_scratch, optimizer_scratch_len_f32,
+    ESP32_C6_Q15_INTEGER_MODEL, optimize_in_i16_scratch, optimizer_scratch_len_f32,
     optimizer_scratch_len_i16,
 };
-use crate::nonuniform::{ClearancePolicy, CostModel, NonUniformConvolver, OPTIMIZER_BLOCK_SIZES};
+use crate::nonuniform::{ClearancePolicy, CostModel, OPTIMIZER_BLOCK_SIZES};
+#[cfg(rtconv_no_fpu)]
+use crate::numconv::{Ieee, f32_to_q31_rne, ieee_exceeds_q15_headroom};
+use crate::numconv::{f32_to_q15_rne_sat, q15_to_f32_exact};
+#[cfg(not(rtconv_no_fpu))]
 use crate::{
-    ConvError, DirectConfig, DirectConvolver, HybridConfig, HybridConvolver, SimdBackend,
-    SimdFixedFftBackend,
+    DirectConfig, DirectConvolver, HybridConfig, HybridConvolver, SimdBackend, SimdFixedFftBackend,
+    nonuniform::{NonUniformConvolver, optimizer::optimize_in_f32_scratch},
 };
 
 // ------------------------------------------------------------------------------------------
@@ -100,14 +121,16 @@ pub const NATIVE_DOMAIN: NumericDomain = if HAS_HARDWARE_FPU {
 /// Engine chosen by the automatic planner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AutoEngine {
-    /// `f32` direct FIR ([`DirectConvolver`]).
+    /// `f32` direct FIR ([`DirectConvolver`](crate::DirectConvolver)).
     Direct,
-    /// `f32` zero-latency hybrid with SPREAD tail ([`HybridConvolver`]), head = partition = `B`.
+    /// `f32` zero-latency hybrid with SPREAD tail ([`HybridConvolver`](crate::HybridConvolver)),
+    /// head = partition = `B`.
     Hybrid {
         /// Head length and tail partition size `B`.
         block_size: usize,
     },
-    /// `f32` zero-latency cost-optimized non-uniform convolver ([`NonUniformConvolver`]).
+    /// `f32` zero-latency cost-optimized non-uniform convolver
+    /// ([`NonUniformConvolver`](crate::NonUniformConvolver)).
     NonUniform,
     /// Q1.15 direct FIR ([`FixedQ15DirectConvolver`]).
     FixedDirect,
@@ -196,6 +219,9 @@ const fn const_nupc_candidate_cost(taps: usize, model: &CostModel) -> f64 {
 }
 
 /// Selects the `f32` engine for `taps` coefficients (cheapest under [`CostModel::for_target_f32`]).
+///
+/// A `const fn` evaluated at compile time in workspace sizing; on FPU-less builds the automatic
+/// layer never calls it at run time.
 pub const fn select_f32(taps: usize) -> AutoEngine {
     let model = CostModel::for_target_f32();
     let mut best = AutoEngine::Direct;
@@ -321,7 +347,7 @@ const fn nupc_upper_bound_q15(taps: usize) -> usize {
 }
 
 /// Engine workspace (`f32` elements) required by [`select_f32`]`(taps)` with
-/// [`SimdFixedFftBackend`].
+/// [`SimdFixedFftBackend`](crate::SimdFixedFftBackend).
 ///
 /// Exact for `Direct` and `Hybrid`; mathematically proven tight upper bound for cost-optimized
 /// `NonUniform` (covering both in-place Viterbi DP scratch and the resulting convolver workspace).
@@ -431,11 +457,15 @@ impl<const N: usize> Default for AutoWorkspace<N> {
 
 mod sealed {
     pub trait Sealed {}
+    #[cfg(not(rtconv_no_fpu))]
     impl Sealed for f32 {}
     impl Sealed for i16 {}
 }
 
 /// Workspace element type selecting the numeric domain (`f32` or `i16`). Sealed.
+///
+/// Implemented for `f32` only on targets with a hardware FPU; FPU-less builds accept `i16`
+/// workspaces only (see the module documentation).
 pub trait AutoElem: sealed::Sealed + Copy + 'static {
     /// Domain selected by this element type.
     const DOMAIN: NumericDomain;
@@ -448,6 +478,7 @@ pub trait AutoElem: sealed::Sealed + Copy + 'static {
     ) -> Result<AutoConvolver<'a>, ConvError>;
 }
 
+#[cfg(not(rtconv_no_fpu))]
 impl AutoElem for f32 {
     const DOMAIN: NumericDomain = NumericDomain::Float32;
 
@@ -526,10 +557,15 @@ pub struct AutoInfo {
     pub sample_rate: Option<u32>,
 }
 
+/// Engines reachable from the automatic layer. On FPU-less builds only the Q1.15 family
+/// exists, so the `f32` engines, the `f32` FFT and its twiddle ROM are never linked.
 #[allow(clippy::large_enum_variant)]
 enum Engine<'a> {
+    #[cfg(not(rtconv_no_fpu))]
     Direct(DirectConvolver<'a>),
+    #[cfg(not(rtconv_no_fpu))]
     Hybrid(HybridConvolver<'a, SimdFixedFftBackend>),
+    #[cfg(not(rtconv_no_fpu))]
     NonUniform(NonUniformConvolver<'a, SimdFixedFftBackend>),
     FixedDirect(FixedQ15DirectConvolver<'a>),
     FixedNonUniform(FixedQ15NonUniformConvolver<'a>),
@@ -573,6 +609,7 @@ impl<'a> AutoConvolver<'a> {
     }
 
     /// Prepares the `f32` domain from IR taps (`workspace.len() >= engine_len_f32(ir.len())`).
+    #[cfg(not(rtconv_no_fpu))]
     pub fn prepare_f32(ir: &[f32], workspace: &'a mut [f32]) -> Result<Self, ConvError> {
         if ir.is_empty() {
             return Err(ConvError::EmptyIr);
@@ -629,6 +666,36 @@ impl<'a> AutoConvolver<'a> {
         })
     }
 
+    /// FPU-less build: prepares the **Q1.15** engines from `f32` taps
+    /// (`workspace.len() >= engine_len_q15(ir.len())`, `i16` elements).
+    ///
+    /// No floating-point operation is executed: each tap is decomposed from
+    /// [`f32::to_bits`] (sign, exponent, significand per IEEE Std 754-1985 §3.2.1), the
+    /// headroom shift `s` is the smallest with `max|h| * 2^-s <= 32767/32768` (exact integer
+    /// comparison, as [`FirArtifact::q15_headroom_shift`]), and the taps are converted to
+    /// Q1.31 as `RNE(h * 2^(31 - s))` (round to nearest, ties to even, §4.1) before
+    /// [`Self::prepare_q31_with`]. The result is identical to [`Self::from_artifact`] on a raw
+    /// `f32` artifact holding the same taps.
+    #[cfg(rtconv_no_fpu)]
+    pub fn prepare_f32(ir: &[f32], workspace: &'a mut [i16]) -> Result<Self, ConvError> {
+        if ir.is_empty() {
+            return Err(ConvError::EmptyIr);
+        }
+        let mut shift = 0u32;
+        for (index, &h) in ir.iter().enumerate() {
+            let v = Ieee::from_f32_bits(h.to_bits());
+            if matches!(v, Ieee::NonFinite { .. }) {
+                return Err(ConvError::NonFiniteCoefficient { index });
+            }
+            while shift < 31 && ieee_exceeds_q15_headroom(v, shift) {
+                shift += 1;
+            }
+        }
+        // Finite taps always convert (`None` is NaN only, rejected above).
+        let tap = |i: usize| f32_to_q31_rne(ir[i], shift).map_or(0, |(v, _)| v);
+        Self::prepare_q31_with(ir.len(), tap, shift, workspace)
+    }
+
     /// Prepares the Q1.15 domain from Q1.15 taps already scaled by `2^-gain_shift`; the output
     /// is multiplied back by `2^gain_shift` with saturation
     /// (`workspace.len() >= engine_len_q15(ir.len())`).
@@ -649,13 +716,12 @@ impl<'a> AutoConvolver<'a> {
                 workspace,
             )?),
             _ => {
-                let model = CostModel::esp32_c6_q15_estimate();
-                let (plan, _) = optimize_in_i16_scratch(
+                let plan = optimize_in_i16_scratch(
                     taps,
                     IO_CHUNK,
                     auto_max_block(taps, AUTO_Q15_MAX_BLOCK),
                     AUTO_Q15_MAX_FDL_STAGES,
-                    &model,
+                    &ESP32_C6_Q15_INTEGER_MODEL,
                     ClearancePolicy::Strategy2,
                     workspace,
                 )?;
@@ -691,13 +757,12 @@ impl<'a> AutoConvolver<'a> {
                 )?)
             }
             _ => {
-                let model = CostModel::esp32_c6_q15_estimate();
-                let (plan, _) = optimize_in_i16_scratch(
+                let plan = optimize_in_i16_scratch(
                     taps,
                     IO_CHUNK,
                     auto_max_block(taps, AUTO_Q15_MAX_BLOCK),
                     AUTO_Q15_MAX_FDL_STAGES,
-                    &model,
+                    &ESP32_C6_Q15_INTEGER_MODEL,
                     ClearancePolicy::Strategy2,
                     workspace,
                 )?;
@@ -741,6 +806,7 @@ impl<'a> AutoConvolver<'a> {
         let engine = match &self.engine {
             Engine::FixedDirect(c) => c.saturation_count(),
             Engine::FixedNonUniform(c) => c.saturation_count(),
+            #[cfg(not(rtconv_no_fpu))]
             _ => 0,
         };
         engine.saturating_add(self.conversion_saturations)
@@ -749,8 +815,11 @@ impl<'a> AutoConvolver<'a> {
     /// Clears all signal state (history, FDL rings, delay lines) keeping the filter.
     pub fn reset(&mut self) {
         match &mut self.engine {
+            #[cfg(not(rtconv_no_fpu))]
             Engine::Direct(c) => c.reset(),
+            #[cfg(not(rtconv_no_fpu))]
             Engine::Hybrid(c) => c.reset(),
+            #[cfg(not(rtconv_no_fpu))]
             Engine::NonUniform(c) => c.reset(),
             Engine::FixedDirect(c) => c.reset(),
             Engine::FixedNonUniform(c) => c.reset(),
@@ -786,10 +855,12 @@ impl<'a> AutoConvolver<'a> {
 
     /// Processes `f32` samples (full scale `±1.0`), any block length.
     ///
-    /// In the Q1.15 domain samples are converted in chunks of 64 on the stack (software
-    /// floating point on FPU-less targets; prefer [`Self::process_i16`] there).
+    /// In the Q1.15 domain samples are converted in chunks of 64 on the stack with integer
+    /// arithmetic only (bit-identical on every target): input `RNE(x * 2^15)` with saturation
+    /// (NaN → `0`, counted clips in [`Self::saturation_count`]), output exactly `q / 2^15`.
     pub fn process_f32(&mut self, input: &[f32], output: &mut [f32]) -> Result<(), ConvError> {
         Self::check_len(input.len(), output.len())?;
+        #[cfg(not(rtconv_no_fpu))]
         match &mut self.engine {
             Engine::Direct(c) => return c.process_block(input, output),
             Engine::Hybrid(c) => return c.process_block(input, output),
@@ -801,7 +872,7 @@ impl<'a> AutoConvolver<'a> {
         for (xi, yo) in input.chunks(IO_CHUNK).zip(output.chunks_mut(IO_CHUNK)) {
             let n = xi.len();
             for (d, &s) in qi[..n].iter_mut().zip(xi) {
-                let (q, sat) = f32_to_q15_sat(s);
+                let (q, sat) = f32_to_q15_rne_sat(s);
                 if sat {
                     self.conversion_saturations = self.conversion_saturations.saturating_add(1);
                 }
@@ -809,7 +880,7 @@ impl<'a> AutoConvolver<'a> {
             }
             self.process_q15_engine(&qi[..n], &mut qo[..n])?;
             for (d, &q) in yo.iter_mut().zip(&qo[..n]) {
-                *d = q15_to_f32(q);
+                *d = q15_to_f32_exact(q);
             }
         }
         Ok(())
@@ -821,6 +892,18 @@ impl<'a> AutoConvolver<'a> {
     /// rounded to nearest with saturation.
     pub fn process_i16(&mut self, input: &[i16], output: &mut [i16]) -> Result<(), ConvError> {
         Self::check_len(input.len(), output.len())?;
+        #[cfg(rtconv_no_fpu)]
+        {
+            self.process_q15_engine(input, output)
+        }
+        #[cfg(not(rtconv_no_fpu))]
+        {
+            self.process_i16_any(input, output)
+        }
+    }
+
+    #[cfg(not(rtconv_no_fpu))]
+    fn process_i16_any(&mut self, input: &[i16], output: &mut [i16]) -> Result<(), ConvError> {
         if matches!(
             self.engine,
             Engine::FixedDirect(_) | Engine::FixedNonUniform(_)
@@ -832,7 +915,7 @@ impl<'a> AutoConvolver<'a> {
         for (xi, yo) in input.chunks(IO_CHUNK).zip(output.chunks_mut(IO_CHUNK)) {
             let n = xi.len();
             for (d, &s) in fi[..n].iter_mut().zip(xi) {
-                *d = q15_to_f32(s);
+                *d = crate::fixed::q15_to_f32(s);
             }
             match &mut self.engine {
                 Engine::Direct(c) => c.process_block(&fi[..n], &mut fo[..n])?,
@@ -855,6 +938,7 @@ impl<'a> AutoConvolver<'a> {
         match &mut self.engine {
             Engine::FixedDirect(c) => c.process_block(input, output)?,
             Engine::FixedNonUniform(c) => c.process_block(input, output)?,
+            #[cfg(not(rtconv_no_fpu))]
             _ => unreachable_engine()?,
         }
         self.apply_gain_q15(output);
@@ -863,12 +947,15 @@ impl<'a> AutoConvolver<'a> {
 }
 
 /// Typed refusal for a domain/engine mismatch (cannot occur through the public API).
+#[cfg(not(rtconv_no_fpu))]
 #[inline]
 fn unreachable_engine() -> Result<(), ConvError> {
     Err(ConvError::InvalidStateTransition)
 }
 
 /// Rounds `x * 32768` to nearest with saturation, reporting whether it clipped (NaN → 0).
+/// Hardware-FPU path for `i16` I/O on the `f32` engines (unchanged behaviour).
+#[cfg(not(rtconv_no_fpu))]
 #[inline]
 fn f32_to_q15_sat(x: f32) -> (i16, bool) {
     if x.is_nan() {

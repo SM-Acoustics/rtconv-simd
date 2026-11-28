@@ -48,6 +48,20 @@ jobs:
         with:
           toolchain: stable
           targets: riscv32imac-unknown-none-elf
+          components: llvm-tools
       - name: Build harness (no flashing, no hardware access)
         working-directory: hardware/esp32c6
         run: cargo build --release
+      # Issue #32: the FPU-less build must not link the f32 auto path, core's decimal-to-float
+      # tables or any soft-float routine, and .text + .rodata stays <= the 0.2.0 size (81,196 B).
+      # Sizes are written to the job summary.
+      - name: FPU-less binary guard (forbidden symbols, soft-float, size budget)
+        run: |
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          bin="$(rustc --print sysroot)/lib/rustlib/$host/bin"
+          LLVM_NM="$bin/llvm-nm" LLVM_SIZE="$bin/llvm-size" \
+            scripts/check-no-fpu-binary.sh \
+            hardware/esp32c6/target/riscv32imac-unknown-none-elf/release/rtconv-esp32c6-harness 81196
+      - name: Build opt-in soft-float baseline (compile check only)
+        working-directory: hardware/esp32c6
+        run: cargo build --release --features soft-float-baseline

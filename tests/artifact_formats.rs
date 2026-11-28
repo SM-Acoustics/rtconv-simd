@@ -324,3 +324,95 @@ fn negative_cases() {
         Err(ArtifactError::ChannelOutOfRange { .. })
     ));
 }
+
+/// Q1.31 decode of text with `f64` reference: `RNE(x * 2^(31 - shift))`, saturating.
+fn q31_ref(x: f64, shift: u32) -> i32 {
+    let r = (x * (2.0f64).powi(31 - shift as i32)).round_ties_even();
+    r.clamp(i32::MIN as f64, i32::MAX as f64) as i32
+}
+
+fn text_q31(text: &str, shift: u32) -> (Vec<i32>, usize) {
+    let art = FirArtifact::parse(text.as_bytes()).unwrap();
+    assert_eq!(art.container(), Container::Text);
+    let mut q = vec![0i32; art.frames()];
+    let sat = art.decode_q31(0, shift, &mut q).unwrap();
+    (q, sat)
+}
+
+/// Text artifacts decode to Q1.31 with integer arithmetic only (no `str::parse::<f64>` on the
+/// fixed-point path), correctly rounded to nearest even for any number of digits.
+#[test]
+fn text_to_q31_integer_decoder_matches_f64_reference() {
+    // Decimal comma, exponent forms, signs: all exactly representable, so the f64 reference
+    // (`str::parse` is correctly rounded) is exact.
+    let (q, sat) = text_q31("0,5\n-0,25\n+1,25e-1\n-6.25E-2\n.5e-1\n5.\n-0\n", 0);
+    let want = [0.5, -0.25, 0.125, -0.0625, 0.05, 5.0, 0.0];
+    assert_eq!(sat, 1, "5.0 saturates");
+    for (got, &x) in q.iter().zip(&want) {
+        assert_eq!(*got, q31_ref(x, 0), "{x}");
+    }
+
+    // Extreme exponents: underflow to 0 below 2^-32 and saturation above 1.0.
+    let (q, sat) = text_q31(
+        "1e-400\n-1e-400\n2.3e-10\n1e400\n-1e400\n1e-999999999999\n",
+        0,
+    );
+    assert_eq!(q, [0, 0, 0, i32::MAX, i32::MIN, 0]);
+    assert_eq!(sat, 2);
+
+    // Mantissas with 19 and more significant digits (f64 reference far from ties here).
+    for tok in [
+        "0.1234567890123456789",
+        "-0.98765432109876543210987654321",
+        "0.000000001234567890123456789012345678901234567890",
+        "0.33333333333333333333333333333333333333333333333333333333333333",
+    ] {
+        let x: f64 = tok.parse().unwrap();
+        let (q, _) = text_q31(&format!("{tok}\n"), 0);
+        assert_eq!(q[0], q31_ref(x, 0), "{tok}");
+    }
+
+    // Exact ties (2q+1) * 2^-32 are representable in f64: the reference is exact.
+    // 2^-32 -> 0 (even), 3 * 2^-32 -> 2 (even, 23 significant digits), 5 * 2^-32 -> 2.
+    let ties = "2.3283064365386962890625e-10\n\
+                6.9849193096160888671875e-10\n\
+                1.16415321826934814453125e-9\n\
+                -6.9849193096160888671875e-10\n";
+    let (q, _) = text_q31(ties, 0);
+    assert_eq!(q, [0, 2, 2, -2]);
+    for (tok, got) in ties.lines().zip(&q) {
+        let x: f64 = tok.trim().parse().unwrap();
+        assert_eq!(*got, q31_ref(x, 0), "{tok}");
+    }
+    // One non-zero digit far past the tie breaks it upwards (ABNT NBR 5891:2014 §2.2).
+    let (q, _) = text_q31("2.32830643653869628906250000000000000000000000001e-10\n", 0);
+    assert_eq!(q, [1]);
+
+    // Headroom shift: the exact decimal value decides the shift (1.7 needs s = 1).
+    let art = FirArtifact::parse(b"0.1\n1.7\n-0.4\n").unwrap();
+    assert_eq!(art.q15_headroom_shift(0).unwrap(), 1);
+    let mut q = [0i32; 3];
+    assert_eq!(art.decode_q31(0, 1, &mut q).unwrap(), 0);
+    assert_eq!(q[1], q31_ref(1.7, 1));
+    // Non-finite text is reported with its frame on the fixed-point path too.
+    let art = FirArtifact::parse(b"0.5\n-inf\n").unwrap();
+    assert_eq!(
+        art.decode_q31(0, 0, &mut q).unwrap_err(),
+        ArtifactError::NonFiniteSample { frame: 1 }
+    );
+    assert_eq!(
+        art.q15_headroom_shift(0).unwrap_err(),
+        ArtifactError::NonFiniteSample { frame: 1 }
+    );
+}
+
+/// The Q1.15 text path rounds the exact decimal value once (no detour through f64).
+#[test]
+fn text_to_q15_rounds_ties_to_even() {
+    // 0.5 LSB -> 0, 1.5 LSB -> 2, 2.5 LSB -> 2 (Q1.15 LSB = 2^-15).
+    let art =
+        FirArtifact::parse(b"0.0000152587890625\n0.0000457763671875\n7.62939453125e-5\n").unwrap();
+    let mut q = [0i16; 3];
+    assert_eq!(art.decode_q15(0, 0, &mut q).unwrap(), 0);
+    assert_eq!(q, [0, 2, 2]);
+}

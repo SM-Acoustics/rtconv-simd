@@ -5,7 +5,8 @@ Independent `#![no_std]` bare-metal harness targeting **ESP32-C6 (`riscv32imac-u
 ## Verification Status
 
 - **`CROSS_COMPILE_VERIFIED`**: `YES` (`cargo build --release`, run in CI by `embedded.yml` job `esp32c6-harness` with `-D warnings`).
-- **Workloads**: `FixedQ15DirectConvolver`, `DirectConvolver` (`f32` soft-float baseline), `FixedQ15PartitionedConvolver`, and `AutoConvolver` loading a compile-time raw `f32` `.bin` FIR artifact. On this FPU-less target `auto` selects the Q1.15 `FixedQ15NonUniformConvolver`; `HarnessReport::auto_ok` checks the impulse response. The same scenario runs on the host in `tests/auto_convolver.rs::esp32c6_harness_scenario_on_host`.
+- **Workloads**: `FixedQ15DirectConvolver`, `FixedQ15PartitionedConvolver`, and `AutoConvolver` loading a compile-time raw `f32` `.bin` FIR artifact. On this FPU-less target `auto` selects the Q1.15 `FixedQ15NonUniformConvolver`; `HarnessReport::auto_ok` checks the impulse response. The same scenario runs on the host in `tests/auto_convolver.rs::esp32c6_harness_scenario_on_host`. The `f32` `DirectConvolver` soft-float comparison is opt-in: `cargo build --release --features soft-float-baseline`.
+- **No soft-float, no dead `f32` path** (issue #32): the default build links none of `TW_COS_Q`, `SimdFixedFftBackend`, `POWER_OF_FIVE_128`, `__mulsf3`, `__muldf3` or any other soft-float routine, and `.text + .rodata` stays within the 0.2.0 size (81,196 B). CI enforces both with `scripts/check-no-fpu-binary.sh` and writes `llvm-size -A` to the job summary. Measured: `.text` 43,362 B + `.rodata` 6,656 B = 50,018 B (`rustc 1.97.0`), down from 119,604 B.
 - **Stack**: the `AutoConvolver` value (~17 KiB, dominated by `i64` NUPC accumulators) and its workspace live on the `_start` stack in this compile-only harness. On a device, move them into `static` storage (for example `static_cell`) and confirm the stack high-water mark.
 - **`DEVICE_VERIFIED`**: `NO` (physical ESP32-C6 execution and `mcycle` CSR measurements require a connected board and explicit owner authorization before flashing).
 - **`REALTIME_MEASURED`**: `NO`.
@@ -20,6 +21,10 @@ Independent `#![no_std]` bare-metal harness targeting **ESP32-C6 (`riscv32imac-u
 
 ```bash
 rustup target add riscv32imac-unknown-none-elf
+rustup component add llvm-tools
 cd hardware/esp32c6
 cargo build --release   # target set in .cargo/config.toml
+bin="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin"
+LLVM_NM="$bin/llvm-nm" LLVM_SIZE="$bin/llvm-size" \
+  ../../scripts/check-no-fpu-binary.sh target/riscv32imac-unknown-none-elf/release/rtconv-esp32c6-harness
 ```

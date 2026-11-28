@@ -13,8 +13,22 @@
 //! All multi-byte values are little-endian (the RIFF and x86/ARM/RISC-V convention).
 //!
 //! Nothing is copied or allocated by [`FirArtifact::parse`]; samples are decoded on demand into
-//! caller-provided `&mut [f32]` (floating-point engines) or `&mut [i16]` (Q1.15 engines) with
-//! the integer→Q1.15 path using integer arithmetic only, so it runs without an FPU.
+//! caller-provided `&mut [f32]` (floating-point engines), `&mut [i16]` (Q1.15) or `&mut [i32]`
+//! (Q1.31).
+//!
+//! ## Integer-only fixed-point path
+//! Parsing ([`FirArtifact::parse`] and friends), [`FirArtifact::q15_headroom_shift`],
+//! [`FirArtifact::decode_q15`] and [`FirArtifact::decode_q31`] execute **no floating-point
+//! operation** for any container: IEEE samples are decomposed from their bits and text is
+//! scaled with exact integer arithmetic (`crate::numconv`), so FPU-less targets link neither
+//! soft-float routines nor `core`'s decimal-to-float tables for them. Only
+//! [`FirArtifact::decode_f32`] and [`FirArtifact::peak`] produce floating-point values; they are
+//! linked only when called.
+//!
+//! Rounding into Q1.15 / Q1.31: IEEE and text sources round to nearest, ties to even
+//! (IEEE Std 754-1985 §4.1, §5.4; ABNT NBR 5891:2014 §2.2–§2.4), exactly for text of any length.
+//! Integer PCM sources keep their established round-half-away-from-zero rule (exact whenever
+//! the destination is at least as wide as the source and no headroom shift is applied).
 //!
 //! ## Detection rules ([`FirArtifact::parse`])
 //! 1. `RIFF....WAVE` header → WAV (format tag and `SubFormat` GUID are validated).
@@ -29,6 +43,8 @@
 //! fixtures generated in `tests/artifact_formats.rs`.
 
 use core::fmt;
+
+use crate::numconv::{Decimal, Ieee, ieee_exceeds_q15_headroom, ieee_to_fixed_rne};
 
 /// Errors produced while parsing or decoding a FIR artifact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,15 +202,18 @@ pub struct FirArtifact<'a> {
     sample_rate: Option<u32>,
 }
 
-/// One decoded sample, kept exact for integer encodings so Q1.15 conversion needs no FPU.
+/// One undecoded sample, kept exact in its source representation so the fixed-point paths
+/// need no FPU.
 #[derive(Clone, Copy)]
-enum Sample {
+enum Sample<'a> {
     /// Signed integer with `frac_bits` fractional bits (value = `v / 2^frac_bits`).
-    Int {
-        v: i32,
-        frac_bits: u32,
-    },
-    Float(f64),
+    Int { v: i32, frac_bits: u32 },
+    /// IEEE 754 binary32 bit pattern.
+    F32(u32),
+    /// IEEE 754 binary64 bit pattern.
+    F64(u64),
+    /// Validated decimal text token.
+    Text(Decimal<'a>),
 }
 
 const KSDATAFORMAT_TAIL: [u8; 14] = [
@@ -218,7 +237,7 @@ fn le_u32(b: &[u8], at: usize) -> Result<u32, ArtifactError> {
 }
 
 #[inline]
-fn read_sample(bytes: &[u8], enc: SampleEncoding) -> Sample {
+fn read_sample(bytes: &[u8], enc: SampleEncoding) -> Sample<'static> {
     match enc {
         SampleEncoding::PcmU8 => Sample::Int {
             v: bytes[0] as i32 - 128,
@@ -238,20 +257,98 @@ fn read_sample(bytes: &[u8], enc: SampleEncoding) -> Sample {
             frac_bits: 31,
         },
         SampleEncoding::F32 => {
-            Sample::Float(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64)
+            Sample::F32(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
         }
-        SampleEncoding::F64 => Sample::Float(f64::from_le_bytes([
+        SampleEncoding::F64 => Sample::F64(u64::from_le_bytes([
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ])),
     }
 }
 
-impl Sample {
+/// Floating-point value of a decimal token through `core`'s correctly rounded parser
+/// (the only place text reaches floating point; used by [`FirArtifact::decode_f32`] and
+/// [`FirArtifact::peak`]). The decimal comma is mapped to `.` in a 64-byte stack buffer; the
+/// grammar of [`Decimal::parse`] guarantees such tokens fit and that `core` accepts the result,
+/// so the `NaN` fallback (reported as a non-finite sample) is unreachable for parsed artifacts.
+fn decimal_to_f64(d: &Decimal<'_>) -> f64 {
+    let tok = d.token();
+    let mut buf = [0u8; 64];
+    let text = if tok.contains(&b',') {
+        let n = tok.len().min(buf.len());
+        for (dst, &src) in buf.iter_mut().zip(&tok[..n]) {
+            *dst = if src == b',' { b'.' } else { src };
+        }
+        core::str::from_utf8(&buf[..n])
+    } else {
+        core::str::from_utf8(tok)
+    };
+    match text.map(str::parse::<f64>) {
+        Ok(Ok(v)) => v,
+        _ => f64::NAN,
+    }
+}
+
+impl Sample<'_> {
+    /// Value as `f64` (floating-point APIs only).
     #[inline]
     fn to_f64(self) -> f64 {
         match self {
             Self::Int { v, frac_bits } => v as f64 / (1u64 << frac_bits) as f64,
-            Self::Float(x) => x,
+            Self::F32(b) => f32::from_bits(b) as f64,
+            Self::F64(b) => f64::from_bits(b),
+            Self::Text(d) => decimal_to_f64(&d),
+        }
+    }
+
+    /// `round(x * 2^(frac - shift))` clamped to `[min, max]` with a saturation flag, integer
+    /// arithmetic only. IEEE and text sources round to nearest even; integer PCM keeps the
+    /// established half-away-from-zero rule. Non-finite values return `None`.
+    #[inline]
+    fn to_fixed(self, frac: u32, shift: u32, min: i64, max: i64) -> Option<(i64, bool)> {
+        let shift = shift.min(31);
+        let k = frac as i32 - shift as i32;
+        match self {
+            Self::Int { v, frac_bits } => {
+                let v = v as i64;
+                let q = if frac_bits <= frac {
+                    round_shift_i64(v << (frac - frac_bits), shift)
+                } else {
+                    round_shift_i64(v, frac_bits - frac + shift)
+                };
+                let c = q.clamp(min, max);
+                Some((c, c != q))
+            }
+            Self::F32(b) => ieee_to_fixed_rne(Ieee::from_f32_bits(b), k, min, max),
+            Self::F64(b) => ieee_to_fixed_rne(Ieee::from_f64_bits(b), k, min, max),
+            Self::Text(d) => d.to_fixed_rne(k, min, max),
+        }
+    }
+
+    /// `true` for NaN and infinities (integer test on the encoding).
+    #[inline]
+    fn is_non_finite(self) -> bool {
+        match self {
+            Self::Int { .. } => false,
+            Self::F32(b) => matches!(Ieee::from_f32_bits(b), Ieee::NonFinite { .. }),
+            Self::F64(b) => matches!(Ieee::from_f64_bits(b), Ieee::NonFinite { .. }),
+            Self::Text(d) => d.is_non_finite(),
+        }
+    }
+
+    /// `true` when `|x| * 2^-shift` exceeds the Q1.15 maximum `32767 / 32768` (exact).
+    #[inline]
+    fn exceeds_q15_headroom(self, shift: u32) -> bool {
+        match self {
+            Self::Int { v, frac_bits } => {
+                // |v| * 2^(15 - frac_bits - shift) > 32767, exact in i64.
+                let mag = (v as i64).unsigned_abs();
+                let e = 15 - frac_bits as i32 - shift as i32;
+                let (fl, inexact) = crate::numconv::dyadic_floor(mag, e);
+                fl > 32767 || (fl == 32767 && inexact)
+            }
+            Self::F32(b) => ieee_exceeds_q15_headroom(Ieee::from_f32_bits(b), shift),
+            Self::F64(b) => ieee_exceeds_q15_headroom(Ieee::from_f64_bits(b), shift),
+            Self::Text(d) => d.exceeds_q15_headroom(shift),
         }
     }
 }
@@ -267,17 +364,6 @@ fn round_shift_i64(v: i64, shift: u32) -> i64 {
         (v + half) >> shift
     } else {
         -((-v + half) >> shift)
-    }
-}
-
-#[inline]
-fn sat_i16(v: i64) -> (i16, bool) {
-    if v > i16::MAX as i64 {
-        (i16::MAX, true)
-    } else if v < i16::MIN as i64 {
-        (i16::MIN, true)
-    } else {
-        (v as i16, false)
     }
 }
 
@@ -300,7 +386,7 @@ fn is_data_line(line: &str) -> bool {
 /// (`0,125;-0,5` or `0,125 -0,5`). An integer-only CSV line such as `1,2` is therefore read as
 /// the single value `1.2`.
 #[inline]
-fn for_each_token<F: FnMut(&str) -> bool>(line: &str, mut f: F) {
+fn for_each_token<'t, F: FnMut(&'t str) -> bool>(line: &'t str, mut f: F) {
     // With '.' present, numbers use decimal points, so ',' can only be a column separator.
     let comma_is_sep = line.contains('.');
     for tok in line.split(|c: char| c.is_whitespace() || c == ';' || (comma_is_sep && c == ',')) {
@@ -311,25 +397,6 @@ fn for_each_token<F: FnMut(&str) -> bool>(line: &str, mut f: F) {
             return;
         }
     }
-}
-
-fn parse_number(tok: &str) -> Option<f64> {
-    if let Ok(v) = tok.parse::<f64>() {
-        return Some(v);
-    }
-    // Decimal comma: copy into a small stack buffer with ',' -> '.'.
-    let bytes = tok.as_bytes();
-    if bytes.len() > 64 || !bytes.contains(&b',') {
-        return None;
-    }
-    let mut buf = [0u8; 64];
-    for (d, &s) in buf.iter_mut().zip(bytes) {
-        *d = if s == b',' { b'.' } else { s };
-    }
-    core::str::from_utf8(&buf[..bytes.len()])
-        .ok()?
-        .parse::<f64>()
-        .ok()
 }
 
 fn looks_like_text(bytes: &[u8]) -> bool {
@@ -344,19 +411,55 @@ fn looks_like_text(bytes: &[u8]) -> bool {
 // Raw float classification
 // ------------------------------------------------------------------------------------------
 
+/// Smallest `f32` whose value is `>= 1e-15` (as `f64`): the plausibility floor of
+/// [`raw_float_score`], expressed as a bit pattern so classification needs no FPU.
+const F32_PLAUSIBLE_MIN_BITS: u32 = {
+    let t = 1e-15f64 as f32;
+    if (t as f64) < 1e-15 {
+        t.to_bits() + 1
+    } else {
+        t.to_bits()
+    }
+};
+/// `1e4` is exact in `f32`.
+const F32_PLAUSIBLE_MAX_BITS: u32 = 1e4f32.to_bits();
+const F64_PLAUSIBLE_MIN_BITS: u64 = 1e-15f64.to_bits();
+const F64_PLAUSIBLE_MAX_BITS: u64 = 1e4f64.to_bits();
+
 /// Counts samples that are implausible for a FIR filter under `enc`, plus non-zero samples.
+///
+/// A non-zero sample is implausible when it is non-finite or its magnitude lies outside
+/// `[1e-15, 1e4]`. Positive IEEE values are ordered like their bit patterns, so the test is an
+/// integer comparison of `|x|`'s bits against the bounds' bits (identical to comparing the
+/// values in `f64`).
 fn raw_float_score(bytes: &[u8], enc: SampleEncoding) -> (usize, usize) {
     let w = enc.bytes();
     let mut implausible = 0usize;
     let mut nonzero = 0usize;
     for chunk in bytes.chunks_exact(w) {
-        let v = read_sample(chunk, enc).to_f64();
-        if v == 0.0 {
+        let (zero, plausible) = match read_sample(chunk, enc) {
+            Sample::F32(b) => {
+                let a = b & 0x7FFF_FFFF;
+                (
+                    a == 0,
+                    (F32_PLAUSIBLE_MIN_BITS..=F32_PLAUSIBLE_MAX_BITS).contains(&a),
+                )
+            }
+            Sample::F64(b) => {
+                let a = b & 0x7FFF_FFFF_FFFF_FFFF;
+                (
+                    a == 0,
+                    (F64_PLAUSIBLE_MIN_BITS..=F64_PLAUSIBLE_MAX_BITS).contains(&a),
+                )
+            }
+            // Only called with float encodings.
+            _ => (false, false),
+        };
+        if zero {
             continue;
         }
         nonzero += 1;
-        let a = v.abs();
-        if !v.is_finite() || !(1e-15..=1e4).contains(&a) {
+        if !plausible {
             implausible += 1;
         }
     }
@@ -545,7 +648,7 @@ impl<'a> FirArtifact<'a> {
             let mut cols = 0usize;
             let mut ok = true;
             for_each_token(line, |tok| {
-                if parse_number(tok).is_some() {
+                if Decimal::parse(tok.as_bytes()).is_some() {
                     cols += 1;
                     true
                 } else {
@@ -616,7 +719,7 @@ impl<'a> FirArtifact<'a> {
     }
 
     /// Visits every sample of `channel` in frame order.
-    fn visit<F: FnMut(usize, Sample) -> Result<(), ArtifactError>>(
+    fn visit<F: FnMut(usize, Sample<'a>) -> Result<(), ArtifactError>>(
         &self,
         channel: usize,
         mut f: F,
@@ -643,14 +746,14 @@ impl<'a> FirArtifact<'a> {
                     let mut value = None;
                     for_each_token(line, |tok| {
                         if col == channel {
-                            value = parse_number(tok);
+                            value = Decimal::parse(tok.as_bytes());
                             return false;
                         }
                         col += 1;
                         true
                     });
                     let v = value.ok_or(ArtifactError::InvalidText { line: idx + 1 })?;
-                    f(frame, Sample::Float(v))?;
+                    f(frame, Sample::Text(v))?;
                     frame += 1;
                 }
             }
@@ -691,6 +794,7 @@ impl<'a> FirArtifact<'a> {
                 Sample::Int { v, frac_bits } if frac_bits <= 23 => {
                     v as f32 / (1u32 << frac_bits) as f32
                 }
+                Sample::F32(b) => f32::from_bits(b),
                 other => other.to_f64() as f32,
             };
             if !v.is_finite() {
@@ -703,7 +807,9 @@ impl<'a> FirArtifact<'a> {
     }
 
     /// Smallest right shift `s` such that `peak(channel) * 2^-s` fits Q1.15 without clipping
-    /// (`<= 32767/32768`, or exactly `-1.0` for PCM). Integer PCM always returns `0`.
+    /// (`<= 32767/32768`, or exactly `-1.0` for PCM), capped at `31`. Integer PCM always returns
+    /// `0`. Computed with exact integer comparisons (no FPU) for every container; text uses the
+    /// exact decimal value.
     pub fn q15_headroom_shift(&self, channel: usize) -> Result<u32, ArtifactError> {
         if let Payload::Binary(_, enc) = self.payload
             && !enc.is_float()
@@ -711,50 +817,37 @@ impl<'a> FirArtifact<'a> {
             self.check_channel(channel)?;
             return Ok(0);
         }
-        let peak = self.peak(channel)?;
-        let limit = 32767.0 / 32768.0;
         let mut s = 0u32;
-        let mut p = peak;
-        while p > limit && s < 31 {
-            p *= 0.5;
-            s += 1;
-        }
+        self.visit(channel, |frame, smp| {
+            if smp.is_non_finite() {
+                return Err(ArtifactError::NonFiniteSample { frame });
+            }
+            while s < 31 && smp.exceeds_q15_headroom(s) {
+                s += 1;
+            }
+            Ok(())
+        })?;
         Ok(s)
     }
 
     /// Visits `channel` as Q1.31 (`round(x * 2^-shift * 2^31)`, saturating), returning the
-    /// number of saturated samples. Integer sources use integer arithmetic only.
+    /// number of saturated samples. Integer arithmetic only, for every container (see the
+    /// module documentation for the rounding rule).
     pub(crate) fn for_each_q31<F: FnMut(usize, i32)>(
         &self,
         channel: usize,
         shift: u32,
         mut f: F,
     ) -> Result<usize, ArtifactError> {
-        let shift = shift.min(31);
         let mut saturated = 0usize;
         self.visit(channel, |frame, s| {
-            let q: i64 = match s {
-                Sample::Int { v, frac_bits } => {
-                    round_shift_i64((v as i64) << (31 - frac_bits), shift)
-                }
-                Sample::Float(x) => {
-                    if !x.is_finite() {
-                        return Err(ArtifactError::NonFiniteSample { frame });
-                    }
-                    let scaled = x * 2_147_483_648.0 / (1u64 << shift) as f64;
-                    let r = if scaled >= 0.0 {
-                        scaled + 0.5
-                    } else {
-                        scaled - 0.5
-                    };
-                    r as i64
-                }
-            };
-            let c = q.clamp(i32::MIN as i64, i32::MAX as i64);
-            if c != q {
+            let (v, sat) = s
+                .to_fixed(31, shift, i32::MIN as i64, i32::MAX as i64)
+                .ok_or(ArtifactError::NonFiniteSample { frame })?;
+            if sat {
                 saturated += 1;
             }
-            f(frame, c as i32);
+            f(frame, v as i32);
             Ok(())
         })?;
         Ok(saturated)
@@ -762,7 +855,8 @@ impl<'a> FirArtifact<'a> {
 
     /// Decodes `channel` into Q1.31 (`out[..frames()]`) as `round(x * 2^-shift * 2^31)` with
     /// saturation, returning the number of saturated samples. Preserves the full precision of
-    /// 24/32-bit PCM and most of `f32`/`f64` for the fixed-point engines' `prepare_q31`.
+    /// 24/32-bit PCM and rounds `f32` / `f64` / text exactly (ties to even) with integer
+    /// arithmetic only.
     pub fn decode_q31(
         &self,
         channel: usize,
@@ -780,9 +874,9 @@ impl<'a> FirArtifact<'a> {
     }
 
     /// Decodes `channel` into Q1.15 (`out[..frames()]`) as `round(x * 2^-shift * 32768)` with
-    /// saturation, returning the number of saturated samples. Integer PCM sources use integer
-    /// arithmetic only (no FPU required); use [`Self::q15_headroom_shift`] to pick a `shift`
-    /// that avoids saturation for filters with gain above 0 dBFS.
+    /// saturation, returning the number of saturated samples. Every container is decoded with
+    /// integer arithmetic only (no FPU required); use [`Self::q15_headroom_shift`] to pick a
+    /// `shift` that avoids saturation for filters with gain above 0 dBFS.
     pub fn decode_q15(
         &self,
         channel: usize,
@@ -796,37 +890,15 @@ impl<'a> FirArtifact<'a> {
                 provided: out.len(),
             });
         }
-        let shift = shift.min(31);
         let mut saturated = 0usize;
         self.visit(channel, |frame, s| {
-            let q = match s {
-                Sample::Int { v, frac_bits } => {
-                    let v = v as i64;
-                    if frac_bits >= 15 {
-                        round_shift_i64(v, frac_bits - 15 + shift)
-                    } else {
-                        round_shift_i64(v << (15 - frac_bits), shift)
-                    }
-                }
-                Sample::Float(x) => {
-                    if !x.is_finite() {
-                        return Err(ArtifactError::NonFiniteSample { frame });
-                    }
-                    let scaled = x * 32768.0 / (1u64 << shift) as f64;
-                    let r = if scaled >= 0.0 {
-                        scaled + 0.5
-                    } else {
-                        scaled - 0.5
-                    };
-                    // `as` saturates for out-of-range floats.
-                    r as i64
-                }
-            };
-            let (v, sat) = sat_i16(q);
+            let (v, sat) = s
+                .to_fixed(15, shift, i16::MIN as i64, i16::MAX as i64)
+                .ok_or(ArtifactError::NonFiniteSample { frame })?;
             if sat {
                 saturated += 1;
             }
-            out[frame] = v;
+            out[frame] = v as i16;
             Ok(())
         })?;
         Ok(saturated)

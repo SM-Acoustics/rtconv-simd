@@ -138,9 +138,22 @@ fn const_sizing_matches_engine_requirements_exactly() {
     // slices across engine transitions including `AutoEngine::NonUniform` and `FixedNonUniform`.
     for taps in [1usize, 64, 128, 129, 300, 700, 2048, 5121, 8192, 16384] {
         let ir_f = vec![0.001f32; taps];
-        let mut ws_f = vec![0.0f32; engine_len_f32(taps)];
-        let conv_f = AutoConvolver::prepare_f32(&ir_f, &mut ws_f).unwrap();
-        assert_eq!(conv_f.info().engine, select_f32(taps));
+        // Hardware FPU: f32 engines in an f32 workspace.
+        #[cfg(not(feature = "native-q15"))]
+        {
+            let mut ws_f = vec![0.0f32; engine_len_f32(taps)];
+            let conv_f = AutoConvolver::prepare_f32(&ir_f, &mut ws_f).unwrap();
+            assert_eq!(conv_f.info().engine, select_f32(taps));
+        }
+        // FPU-less build: f32 taps are quantized from their bits into the Q1.15 engines,
+        // which need exactly `engine_len_q15` i16 words.
+        #[cfg(feature = "native-q15")]
+        {
+            let mut ws_f = vec![0i16; engine_len_q15(taps)];
+            let conv_f = AutoConvolver::prepare_f32(&ir_f, &mut ws_f).unwrap();
+            assert_eq!(conv_f.info().engine, select_q15(taps));
+            assert_eq!(conv_f.info().domain, NumericDomain::FixedQ15);
+        }
 
         let ir_q = vec![16i16; taps];
         let mut ws_q = vec![0i16; engine_len_q15(taps)];
@@ -268,6 +281,8 @@ fn fir(len: usize, seed: u64, peak: f64) -> Vec<f64> {
         .collect()
 }
 
+/// `f32` auto engines exist only with a hardware FPU (not under `native-q15`).
+#[cfg(not(feature = "native-q15"))]
 #[test]
 fn f32_domain_stereo_wav_end_to_end_with_fragmented_blocks() {
     for taps in [48usize, 700, 3000] {
@@ -363,6 +378,7 @@ fn q15_domain_end_to_end_with_gain_above_unity() {
     }
 }
 
+#[cfg(not(feature = "native-q15"))]
 #[test]
 fn i16_io_on_f32_engine_and_interleaved_stereo() {
     let taps = 400;
@@ -385,8 +401,11 @@ fn i16_io_on_f32_engine_and_interleaved_stereo() {
 
 #[test]
 fn mono_artifact_feeds_both_stereo_channels_and_errors_are_typed() {
+    // Native domain of the build: f32 with an FPU, Q1.15 under `native-q15` (0.5 / 0.25 and
+    // their products are exact in both).
+    use rtconv_simd::auto::{NativeElem, workspace_len};
     let text = b"0.5\n0.25\n";
-    let mut ws = vec![0.0f32; 2 * workspace_len_f32(2)];
+    let mut ws = vec![NativeElem::default(); 2 * workspace_len(2)];
     let mut st = AutoStereoConvolver::from_bytes(text, &mut ws).unwrap();
     let (mut a, mut b) = ([0.0f32; 3], [0.0f32; 3]);
     st.process_f32(&[1.0, 0.0, 0.0], &[0.0, 1.0, 0.0], &mut a, &mut b)
@@ -394,12 +413,12 @@ fn mono_artifact_feeds_both_stereo_channels_and_errors_are_typed() {
     assert_eq!(a, [0.5, 0.25, 0.0]);
     assert_eq!(b, [0.0, 0.5, 0.25]);
 
-    let mut tiny = [0.0f32; 3];
+    let mut tiny = [NativeElem::default(); 3];
     assert!(matches!(
         AutoConvolver::from_bytes(text, 0, &mut tiny),
         Err(rtconv_simd::ConvError::WorkspaceTooSmall { .. })
     ));
-    let mut ws = vec![0.0f32; 64];
+    let mut ws = vec![NativeElem::default(); 64];
     assert!(matches!(
         AutoConvolver::from_bytes(text, 1, &mut ws),
         Err(rtconv_simd::ConvError::Artifact(_))
@@ -444,6 +463,7 @@ fn esp32c6_harness_scenario_on_host() {
     }
 }
 
+#[cfg(not(feature = "native-q15"))]
 #[test]
 fn f32_auto_selects_optimized_nonuniform_on_long_ir_oracle_snr() {
     let taps = 16_384usize;
@@ -512,4 +532,89 @@ fn q15_auto_optimized_nonuniform_long_ir() {
         s > 60.0,
         "AutoConvolver Q1.15 optimized NUPC 4k oracle SNR = {s:.2} dB"
     );
+}
+
+/// Raw little-endian `f32` mono artifact (rePhase `.bin`).
+#[cfg(feature = "native-q15")]
+fn raw_f32(h: &[f64]) -> Vec<u8> {
+    h.iter().flat_map(|&v| (v as f32).to_le_bytes()).collect()
+}
+
+/// FPU-less build: `prepare_f32` (taps quantized from their IEEE bits, integer-only) prepares
+/// exactly the same engine as loading the same taps from a raw `f32` artifact, and both
+/// produce bit-identical output, including filters above 0 dBFS (headroom shift).
+#[cfg(feature = "native-q15")]
+#[test]
+fn no_fpu_prepare_f32_matches_from_artifact_bit_exactly() {
+    for (taps, peak) in [
+        (1usize, 0.5),
+        (64, 0.8),
+        (128, 1.6),
+        (129, 0.7),
+        (300, 3.3),
+        (2048, 0.9),
+        (4096, 0.75),
+    ] {
+        let h = fir(taps, 31 + taps as u64, peak);
+        let hf: Vec<f32> = h.iter().map(|&v| v as f32).collect();
+        let bytes = raw_f32(&h);
+
+        let mut ws_a = vec![0i16; engine_len_q15(taps)];
+        let mut a = AutoConvolver::prepare_f32(&hf, &mut ws_a).unwrap();
+        let mut ws_b = vec![0i16; workspace_len_q15(taps)];
+        let mut b = AutoConvolver::from_bytes(&bytes, 0, &mut ws_b).unwrap();
+        let (ia, ib) = (a.info(), b.info());
+        assert_eq!(
+            (
+                ia.domain,
+                ia.engine,
+                ia.taps,
+                ia.gain_shift,
+                ia.latency_samples
+            ),
+            (
+                ib.domain,
+                ib.engine,
+                ib.taps,
+                ib.gain_shift,
+                ib.latency_samples
+            ),
+            "taps={taps}"
+        );
+        assert_eq!(ia.domain, NumericDomain::FixedQ15);
+        let l2 = h.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let x = signal(3000, 5, 0.2 / l2.max(1.0));
+        let xq: Vec<i16> = x.iter().map(|&v| (v * 32768.0).round() as i16).collect();
+        let (mut ya, mut yb) = (vec![0i16; x.len()], vec![0i16; x.len()]);
+        let mut pos = 0usize;
+        for &n in [1usize, 64, 37, 200].iter().cycle() {
+            if pos >= x.len() {
+                break;
+            }
+            let end = (pos + n).min(x.len());
+            a.process_i16(&xq[pos..end], &mut ya[pos..end]).unwrap();
+            b.process_i16(&xq[pos..end], &mut yb[pos..end]).unwrap();
+            pos = end;
+        }
+        assert_eq!(ya, yb, "taps={taps}");
+        assert_eq!(a.saturation_count(), b.saturation_count());
+    }
+}
+
+#[cfg(feature = "native-q15")]
+#[test]
+fn no_fpu_prepare_f32_rejects_non_finite_and_empty() {
+    let mut ws = vec![0i16; engine_len_q15(4)];
+    assert!(matches!(
+        AutoConvolver::prepare_f32(&[0.5, f32::NAN, 0.0, 0.0], &mut ws),
+        Err(rtconv_simd::ConvError::NonFiniteCoefficient { index: 1 })
+    ));
+    assert!(matches!(
+        AutoConvolver::prepare_f32(&[0.5, 0.1, f32::NEG_INFINITY, 0.0], &mut ws),
+        Err(rtconv_simd::ConvError::NonFiniteCoefficient { index: 2 })
+    ));
+    assert!(matches!(
+        AutoConvolver::prepare_f32(&[], &mut ws),
+        Err(rtconv_simd::ConvError::EmptyIr)
+    ));
 }

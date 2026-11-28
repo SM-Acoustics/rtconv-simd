@@ -8,6 +8,11 @@ publish = false
 [dependencies]
 rtconv-simd = { path = "../..", default-features = false, features = ["auto"] }
 
+[features]
+# Adds the deliberate soft-float `DirectConvolver` (`f32`) comparison workload. Off by default:
+# the default build must link no soft-float routine (CI guard in `embedded.yml`).
+soft-float-baseline = []
+
 [profile.release]
 opt-level = "s"
 lto = "thin"

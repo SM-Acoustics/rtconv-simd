@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Planned work is tracked in `docs/ROADMAP.md` and issue #13 (sub-issues #14–#24).
 
+### FPU-less Code Size: no `f32` auto path, no soft-float, no `dec2flt` — Issue #32 (PR 1)
+
+#### Breaking (FPU-less builds only: `cfg(rtconv_no_fpu)`, i.e. RV32 without `F`, soft-float ARM, and any build with `native-q15`, including `--all-features`)
+- **`AutoConvolver` links only the Q1.15 family.** `Engine::{Direct, Hybrid, NonUniform}` and their `prepare`/`process`/`reset` arms are compiled out; `AutoElem` is implemented for `i16` only (passing an `&mut [f32]` workspace is a compile-time error instead of silently running soft-float `f32` engines).
+- **`AutoConvolver::prepare_f32(ir: &[f32], workspace: &mut [i16])`** on FPU-less builds: taps are decomposed from `f32::to_bits()` (IEEE Std 754-1985 §3.2.1), the headroom shift is found by exact integer comparison and the taps are rounded to Q1.31 with round-to-nearest-even (§4.1, §5.4) before `prepare_q31_with`. Needs `engine_len_q15(taps)` `i16` words; bit-identical to `from_artifact` on a raw `f32` artifact with the same taps (`tests/auto_convolver.rs::no_fpu_prepare_f32_matches_from_artifact_bit_exactly`). Hardware-FPU builds keep the `f32` signature and behaviour unchanged.
+- The explicit engines (`DirectConvolver`, `HybridConvolver`, `NonUniformConvolver`, `SimdFixedFftBackend`) remain public on every target for deliberate soft-float use.
+
+#### Changed
+- **Integer-only artifact decoding (`src/artifact.rs`, new `src/numconv.rs`).** Parsing, `q15_headroom_shift`, `decode_q15`, `decode_q31` and the auto-layer Q1.31 load execute no floating-point operation for any container. `f32`/`f64` samples are decoded from their bit patterns; raw-float auto-detection compares bit patterns (identical decisions). Only `decode_f32` and `peak` produce floats and are linked only when called.
+- **Text decoder without `str::parse::<f64>` on the fixed-point path.** Grammar `[+-]? (D+ ([.,] D*)? | [.,] D+) ([eE] [+-]? D+)?` plus `inf`/`infinity`/`nan` (same accepted set as `core`'s parser over `.`-tokens, verified exhaustively up to 5 characters). Values are scaled exactly in `u128` and rounded to nearest even with a sticky bit, for **any** number of digits. Note on the 19-digit design: a `u64` mantissa of 19 significant digits plus a sticky flag cannot round Q1.31 ties exactly, because ties `(2q+1)·2^-32` have up to 32 significant digits — `3·2^-32 = 6.9849193096160888671875e-10` would come out `1` instead of `2`; the decoder therefore truncates at the `10^(s-32)` decimal place, where every rounding boundary lies, which is exact (proof in `src/numconv.rs`, counterexample pinned in `numconv::tests::nineteen_digit_truncation_counterexample`).
+- **Rounding of IEEE and text sources into Q1.15 / Q1.31 is now round-half-to-even** (IEEE Std 754-1985 §4.1; ABNT NBR 5891:2014 §2.2–§2.4) instead of half-away-from-zero through `f64`. Results differ only on exact ties (±1 LSB). Integer PCM keeps its half-away-from-zero rule (pinned by `pcm_to_q15_is_integer_exact`).
+- **Q1.15-domain `AutoConvolver::process_f32`** converts with integer arithmetic on every target (bit-identical host/MCU): input `RNE(x·2^15)` with saturation, output exactly `q/2^15`. This also removes a double-rounding artefact of the former `x * 32768 + 0.5` (e.g. the largest `f32` below half an LSB rounded up).
+- **Integer Q1.15 NUPC planner (`src/nonuniform/optimizer.rs`).** The auto layer's in-workspace Viterbi DP for `FixedQ15NonUniformConvolver` now runs on `IntegerCostModel`, an exact compile-time image of `CostModel::esp32_c6_q15_estimate()` (costs × 8192, all integers), with saturating `u32` costs in the same `i16` scratch layout. Unit tests show identical plans to the former `f32` DP for every length `1..=6000`, a sweep to `300,000` taps, `2,000,000` taps, and other stage limits, caps and policies.
+- **`hardware/esp32c6`**: the `f32` `DirectConvolver` soft-float comparison moved behind the harness feature `soft-float-baseline` (off by default).
+- **CI (`.github/workflows/embedded.yml`, `scripts/check-no-fpu-binary.sh`)**: after `cargo build --release` of the C6 harness, the job fails if `llvm-nm` finds `TW_COS_Q`, `SimdFixedFftBackend`, `POWER_OF_FIVE_128`, `__mulsf3`, `__muldf3` or any other soft-float routine, or if `.text + .rodata` exceeds 81,196 B (0.2.0); `llvm-size -A` sections are written to the job summary. `ci.yml` now runs the full suite under `native-q15`.
+
+#### Measured (`CROSS_COMPILE_VERIFIED`, `rustc 1.97.0`, `hardware/esp32c6` profile)
+| Tree | `.text` | `.rodata` | `.text + .rodata` |
+| :--- | ---: | ---: | ---: |
+| before (`caa0581`) | 82,076 | 37,528 | 119,604 |
+| after | 43,362 | 6,656 | **50,018** (budget 81,196) |
+
 ### License Transition (`0.3.0+`)
 
 #### Changed

@@ -827,8 +827,7 @@ fn run_sample_dp_pass(
     }
 
     // Level-by-level exact DP across strictly increasing power-of-two FDL block sizes.
-    for k in 0..levels {
-        let b = OPTIMIZER_BLOCK_SIZES[k];
+    for (k, &b) in OPTIMIZER_BLOCK_SIZES.iter().enumerate().take(levels) {
         let step = b / UNIT_SAMPLES;
         let open_c = (cost_model.t_fft[k]
             + cost_model.t_cmul[k]
@@ -1179,8 +1178,8 @@ pub(crate) const fn optimizer_scratch_len_i16(
 }
 
 /// Runs the exact same Viterbi DP inside an `&mut [f32]` caller buffer (`AutoConvolver` zero-alloc
-/// integration, `#![forbid(unsafe_code)]`, zero stack arrays).
-#[cfg(feature = "auto")]
+/// integration, `#![forbid(unsafe_code)]`, zero stack arrays). Hardware-FPU builds only.
+#[cfg(all(feature = "auto", not(rtconv_no_fpu)))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn optimize_in_f32_scratch(
     ir_len: usize,
@@ -1249,8 +1248,7 @@ pub(crate) fn optimize_in_f32_scratch(
             }
         }
 
-        for k in 0..active_levels {
-            let b = OPTIMIZER_BLOCK_SIZES[k];
+        for (k, &b) in OPTIMIZER_BLOCK_SIZES.iter().enumerate().take(active_levels) {
             let step = b / UNIT_SAMPLES;
             let open_c = ((cost_model.t_fft[k]
                 + cost_model.t_cmul[k]
@@ -1373,12 +1371,312 @@ pub(crate) fn optimize_in_f32_scratch(
     Ok((plan, exact_cost))
 }
 
-/// Runs the exact same Viterbi DP inside an `&mut [i16]` caller buffer (`AutoConvolver` Q1.15
-/// integration, `#![forbid(unsafe_code)]`, zero stack arrays, IEEE `f32` bits packed as 2 `i16`
-/// words).
+/// Exact integer image of a [`CostModel`] whose entries are non-negative integers (cycle
+/// counts), used by the FPU-less Q1.15 planner so the Viterbi DP runs without floating point.
+///
+/// Per-sample costs are scaled by [`IntegerCostModel::SCALE`] `= 8192` (the largest optimizer
+/// block), so `open(B) = (t_fft + t_cmul + t_ifft + t_add) * 8192 / B`,
+/// `repeat(B) = t_cmac * 8192 / B` and `direct(L) = L * t_direct_mac * 8192` are exact
+/// integers. Construction is `const` and rejects (at compile time when used in a `const`)
+/// models with fractional, negative or oversized entries.
+#[cfg(feature = "auto")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IntegerCostModel {
+    open: [u32; 9],
+    repeat: [u32; 9],
+    direct_mac: u32,
+}
+
+#[cfg(feature = "auto")]
+impl IntegerCostModel {
+    /// Fixed-point scale of every per-sample cost.
+    pub(crate) const SCALE: u64 = 8192;
+
+    const fn exact_u32(v: f64) -> u32 {
+        assert!(v >= 0.0 && v < 4_294_967_296.0, "cost out of integer range");
+        let i = v as u64;
+        assert!(i as f64 == v, "cost model entry is not an integer");
+        i as u32
+    }
+
+    /// Converts `model` exactly; panics (a compile error in `const` context) if any entry is
+    /// not a non-negative integer or a scaled cost does not fit `u32`.
+    pub(crate) const fn from_integral(model: &CostModel) -> Self {
+        let mut open = [0u32; 9];
+        let mut repeat = [0u32; 9];
+        let mut k = 0;
+        while k < 9 {
+            let mul = Self::SCALE / OPTIMIZER_BLOCK_SIZES[k] as u64;
+            let o = Self::exact_u32(model.t_fft[k]) as u64
+                + Self::exact_u32(model.t_cmul[k]) as u64
+                + Self::exact_u32(model.t_ifft[k]) as u64
+                + Self::exact_u32(model.t_add[k]) as u64;
+            assert!(o > 0, "transform cost must be positive");
+            let o = o * mul;
+            let r = Self::exact_u32(model.t_cmac[k]) as u64 * mul;
+            assert!(
+                o <= u32::MAX as u64 && r <= u32::MAX as u64,
+                "scaled cost overflow"
+            );
+            open[k] = o as u32;
+            repeat[k] = r as u32;
+            k += 1;
+        }
+        let d = Self::exact_u32(model.t_direct_mac) as u64 * Self::SCALE;
+        assert!(
+            d > 0 && d <= u32::MAX as u64,
+            "direct MAC cost out of range"
+        );
+        Self {
+            open,
+            repeat,
+            direct_mac: d as u32,
+        }
+    }
+
+    /// Scaled direct-FIR cost of `taps` taps (exact, `u64`).
+    #[inline]
+    const fn direct(&self, taps: usize) -> u64 {
+        taps as u64 * self.direct_mac as u64
+    }
+}
+
+/// [`CostModel::esp32_c6_q15_estimate`] as an exact [`IntegerCostModel`] (evaluated at compile
+/// time; the planner never touches `f64` at run time).
+#[cfg(feature = "auto")]
+pub(crate) const ESP32_C6_Q15_INTEGER_MODEL: IntegerCostModel =
+    IntegerCostModel::from_integral(&CostModel::esp32_c6_q15_estimate());
+
+/// Runs the Q1.15 auto planner's Viterbi DP inside an `&mut [i16]` caller buffer with **integer
+/// arithmetic only** (`AutoConvolver` Q1.15 integration, `#![forbid(unsafe_code)]`, zero stack
+/// arrays, `u32` costs packed as 2 `i16` words).
+///
+/// Costs are exact multiples of `1 / IntegerCostModel::SCALE` cycles per sample, added with
+/// saturation (`u32::MAX` = unreachable). Saturation cannot affect the optimum: every partial
+/// cost on an optimal path is bounded by the optimal total, which for any accepted `ir_len`
+/// (`u_max < 2^16`) stays far below `2^32 / 8192 = 524,288` cycles per sample (a plan of
+/// `B <= 1024` partitions costs about `28` cycles per partition, `< 60,000` for the largest
+/// accepted IR). Equal costs keep the first candidate found, in the same loop order as the
+/// floating-point DP it replaces, which is verified to choose identical plans in the unit tests.
 #[cfg(feature = "auto")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn optimize_in_i16_scratch(
+    ir_len: usize,
+    host_block_max: usize,
+    max_block_size: usize,
+    max_fdl_stages: usize,
+    cost_model: &IntegerCostModel,
+    policy: ClearancePolicy,
+    scratch: &mut [i16],
+) -> Result<NonUniformPlan, ConvError> {
+    if ir_len == 0 || host_block_max == 0 || max_fdl_stages == 0 {
+        return Err(ConvError::InvalidNonUniformConfig);
+    }
+
+    let max_fdl = max_fdl_stages.min(MAX_OPTIMIZER_FDL_STAGES);
+    let mut best_stages = [NonUniformStageConfig {
+        ir_offset: 0,
+        ir_len: 0,
+        block_size: 1,
+    }; MAX_NONUNIFORM_STAGES];
+    best_stages[0] = NonUniformStageConfig {
+        ir_offset: 0,
+        ir_len,
+        block_size: 1,
+    };
+    let mut best_count = 1usize;
+    let best_cost = cost_model.direct(ir_len);
+
+    let levels = num_levels_for_max_block(max_block_size);
+    let mut active_levels = 0usize;
+    while active_levels < levels
+        && policy.min_offset_samples(OPTIMIZER_BLOCK_SIZES[active_levels], host_block_max) < ir_len
+    {
+        active_levels += 1;
+    }
+
+    if ir_len >= UNIT_SAMPLES && active_levels > 0 {
+        let u_target = ir_len.div_ceil(UNIT_SAMPLES);
+        let max_b = OPTIMIZER_BLOCK_SIZES[active_levels - 1];
+        let u_max = u_target + max_b / UNIT_SAMPLES;
+        let cols = u_max + 1;
+        // Require `u_max < u16::MAX` (true for ir_len up to ~2M taps).
+        if u_max >= u16::MAX as usize {
+            return Err(ConvError::ArithmeticOverflow);
+        }
+        // dp: (max_fdl + 1) * cols * 2 i16 (u32), f_val: cols * 2 i16 (u32),
+        // f_start: cols i16 (u16), bp: active_levels * max_fdl * cols i16 (u16)
+        let dp_words = (max_fdl + 1) * cols * 2;
+        let f_val_words = cols * 2;
+        let f_start_words = cols;
+        let bp_words = active_levels * max_fdl * cols;
+        let needed = dp_words + f_val_words + f_start_words + bp_words;
+        if scratch.len() < needed {
+            return Err(ConvError::WorkspaceTooSmall {
+                required: needed,
+                provided: scratch.len(),
+            });
+        }
+
+        const INF: u32 = u32::MAX;
+        #[inline(always)]
+        fn load_u32(buf: &[i16], idx: usize) -> u32 {
+            ((buf[2 * idx] as u16 as u32) << 16) | (buf[2 * idx + 1] as u16 as u32)
+        }
+        #[inline(always)]
+        fn store_u32(buf: &mut [i16], idx: usize, v: u32) {
+            buf[2 * idx] = (v >> 16) as u16 as i16;
+            buf[2 * idx + 1] = v as u16 as i16;
+        }
+
+        let (dp, rest) = scratch.split_at_mut(dp_words);
+        let (f_val, rest) = rest.split_at_mut(f_val_words);
+        let (f_start, rest) = rest.split_at_mut(f_start_words);
+        let bp = &mut rest[..bp_words];
+
+        const U16_SKIP: i16 = -1; // u16::MAX
+        let max_l0_fdl = policy.max_direct_head_with_fdl(host_block_max);
+
+        for i in 0..((max_fdl + 1) * cols) {
+            store_u32(dp, i, INF);
+        }
+        for u in 0..cols {
+            let l0 = u * UNIT_SAMPLES;
+            if l0 > 0 && l0 <= max_l0_fdl {
+                let c = cost_model.direct(l0);
+                store_u32(dp, u, if c >= INF as u64 { INF } else { c as u32 });
+            }
+        }
+
+        for (k, &b) in OPTIMIZER_BLOCK_SIZES.iter().enumerate().take(active_levels) {
+            let step = b / UNIT_SAMPLES;
+            let open_c = cost_model.open[k];
+            let rep_c = cost_model.repeat[k];
+            let min_off = policy.min_offset_samples(b, host_block_max);
+            let u0_min = min_off.div_ceil(UNIT_SAMPLES);
+
+            for s in (1..=max_fdl).rev() {
+                let bp_base = (k * max_fdl + (s - 1)) * cols;
+                for u in 0..cols {
+                    store_u32(f_val, u, INF);
+                }
+                f_start.fill(U16_SKIP);
+                bp[bp_base..bp_base + cols].fill(U16_SKIP);
+
+                let prev_row = (s - 1) * cols;
+                let cur_row = s * cols;
+                for u in step..=u_max {
+                    let u_prev = u - step;
+                    let mut best_c = INF;
+                    let mut best_st = U16_SKIP;
+                    if u_prev >= u0_min {
+                        let pv = load_u32(dp, prev_row + u_prev);
+                        if pv != INF {
+                            let cand = pv.saturating_add(open_c);
+                            if cand < best_c {
+                                best_c = cand;
+                                best_st = (u_prev as u16) as i16;
+                            }
+                        }
+                    }
+                    let fv = load_u32(f_val, u_prev);
+                    if fv != INF {
+                        let cand = fv.saturating_add(rep_c);
+                        if cand < best_c {
+                            best_c = cand;
+                            best_st = f_start[u_prev];
+                        }
+                    }
+                    store_u32(f_val, u, best_c);
+                    f_start[u] = best_st;
+                    if best_c < load_u32(dp, cur_row + u) {
+                        store_u32(dp, cur_row + u, best_c);
+                        bp[bp_base + u] = best_st;
+                    }
+                }
+            }
+        }
+
+        let mut best_c = INF;
+        let mut best_s = 0usize;
+        let mut best_u = 0usize;
+        for s in 1..=max_fdl {
+            let row = s * cols;
+            for u in u_target..=u_max {
+                let c = load_u32(dp, row + u);
+                if c < best_c {
+                    best_c = c;
+                    best_s = s;
+                    best_u = u;
+                }
+            }
+        }
+
+        if best_c != INF && (best_c as u64) < best_cost {
+            let mut fdl_rev = [(0usize, 0usize, 0usize); MAX_OPTIMIZER_FDL_STAGES];
+            let mut fdl_count = 0usize;
+            let mut u = best_u;
+            let mut s = best_s;
+            for k in (0..active_levels).rev() {
+                if s == 0 {
+                    break;
+                }
+                let bp_base = (k * max_fdl + (s - 1)) * cols;
+                let st = bp[bp_base + u];
+                if st != U16_SKIP {
+                    let u0 = (st as u16) as usize;
+                    fdl_rev[fdl_count] = (
+                        u0 * UNIT_SAMPLES,
+                        u * UNIT_SAMPLES,
+                        OPTIMIZER_BLOCK_SIZES[k],
+                    );
+                    fdl_count += 1;
+                    u = u0;
+                    s -= 1;
+                }
+            }
+            let l0 = u * UNIT_SAMPLES;
+            if l0 > 0 && l0 < ir_len && fdl_count > 0 {
+                let mut stages = [NonUniformStageConfig {
+                    ir_offset: 0,
+                    ir_len: 0,
+                    block_size: 1,
+                }; MAX_NONUNIFORM_STAGES];
+                stages[0] = NonUniformStageConfig {
+                    ir_offset: 0,
+                    ir_len: l0,
+                    block_size: 1,
+                };
+                let mut count = 1usize;
+                for i in (0..fdl_count).rev() {
+                    let (off, end_u, b) = fdl_rev[i];
+                    if off < ir_len {
+                        stages[count] = NonUniformStageConfig {
+                            ir_offset: off,
+                            ir_len: end_u.min(ir_len) - off,
+                            block_size: b,
+                        };
+                        count += 1;
+                    }
+                }
+                best_stages = stages;
+                best_count = count;
+            }
+        }
+    }
+
+    NonUniformPlan::validate(NonUniformConfig {
+        max_ir_len: ir_len,
+        host_block_max,
+        stages: &best_stages[..best_count],
+    })
+}
+
+/// Test oracle: the `f32` Viterbi DP that [`optimize_in_i16_scratch`] replaced (IEEE `f32` bits
+/// packed as 2 `i16` words). Kept only to prove that the integer DP selects identical plans.
+#[cfg(all(test, feature = "auto"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn optimize_in_i16_scratch_f32_reference(
     ir_len: usize,
     host_block_max: usize,
     max_block_size: usize,
@@ -1472,8 +1770,7 @@ pub(crate) fn optimize_in_i16_scratch(
             }
         }
 
-        for k in 0..active_levels {
-            let b = OPTIMIZER_BLOCK_SIZES[k];
+        for (k, &b) in OPTIMIZER_BLOCK_SIZES.iter().enumerate().take(active_levels) {
             let step = b / UNIT_SAMPLES;
             let open_c = ((cost_model.t_fft[k]
                 + cost_model.t_cmul[k]
@@ -1994,4 +2291,98 @@ pub fn preset_esp32_c6_q15(
             (1_216, usize::MAX, 1024),
         ],
     )
+}
+
+#[cfg(all(test, feature = "auto"))]
+mod integer_planner_tests {
+    use super::*;
+    use std::vec;
+
+    /// Same block cap as `auto::auto_max_block`.
+    fn auto_cap(taps: usize, ceiling: usize) -> usize {
+        let cap = ceiling.min(32usize.max(taps / 4));
+        let mut best = 0;
+        for b in OPTIMIZER_BLOCK_SIZES {
+            if b <= cap && ClearancePolicy::Strategy2.min_offset_samples(b, 64) < taps {
+                best = b;
+            }
+        }
+        best
+    }
+
+    fn both(
+        taps: usize,
+        max_b: usize,
+        fdl: usize,
+        policy: ClearancePolicy,
+    ) -> (NonUniformPlan, NonUniformPlan) {
+        let len = optimizer_scratch_len_i16(taps, max_b, fdl).max(1);
+        let mut a = vec![0i16; len];
+        let mut b = vec![0i16; len];
+        let int = optimize_in_i16_scratch(
+            taps,
+            64,
+            max_b,
+            fdl,
+            &ESP32_C6_Q15_INTEGER_MODEL,
+            policy,
+            &mut a,
+        )
+        .unwrap();
+        let (flt, _) = optimize_in_i16_scratch_f32_reference(
+            taps,
+            64,
+            max_b,
+            fdl,
+            &CostModel::esp32_c6_q15_estimate(),
+            policy,
+            &mut b,
+        )
+        .unwrap();
+        (int, flt)
+    }
+
+    #[test]
+    fn integer_model_is_exact_image_of_esp32_c6_estimate() {
+        let m = CostModel::esp32_c6_q15_estimate();
+        for (k, &b) in OPTIMIZER_BLOCK_SIZES.iter().enumerate() {
+            let b = b as f64;
+            let open = (m.t_fft[k] + m.t_cmul[k] + m.t_ifft[k] + m.t_add[k]) / b;
+            let rep = m.t_cmac[k] / b;
+            assert_eq!(ESP32_C6_Q15_INTEGER_MODEL.open[k] as f64, open * 8192.0);
+            assert_eq!(ESP32_C6_Q15_INTEGER_MODEL.repeat[k] as f64, rep * 8192.0);
+        }
+        assert_eq!(
+            ESP32_C6_Q15_INTEGER_MODEL.direct(1) as f64,
+            m.t_direct_mac * 8192.0
+        );
+    }
+
+    #[test]
+    fn integer_q15_planner_selects_the_same_plans_as_the_f32_dp() {
+        // Every auto-planned length up to 6,000 taps, then a sweep to 300k and the extremes.
+        let lengths = (1..=6_000)
+            .chain((6_001..=300_000).step_by(131))
+            .chain([524_288, 1_000_000, 2_000_000]);
+        let mut fdl_plans = 0usize;
+        for taps in lengths {
+            let max_b = auto_cap(taps, 1024);
+            if max_b == 0 {
+                continue;
+            }
+            let (int, flt) = both(taps, max_b, 3, ClearancePolicy::Strategy2);
+            assert_eq!(int, flt, "taps={taps}");
+            fdl_plans += usize::from(int.stage_count() > 1);
+        }
+        assert!(fdl_plans > 2_000);
+        // Other stage limits, caps and policies.
+        for taps in (64..=20_000).step_by(37) {
+            for (max_b, fdl) in [(32, 1), (128, 2), (1024, 7), (8192, 4)] {
+                for policy in [ClearancePolicy::Strategy1, ClearancePolicy::Strategy2] {
+                    let (int, flt) = both(taps, max_b, fdl, policy);
+                    assert_eq!(int, flt, "taps={taps} max_b={max_b} fdl={fdl} {policy:?}");
+                }
+            }
+        }
+    }
 }

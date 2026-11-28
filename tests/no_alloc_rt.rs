@@ -416,9 +416,9 @@ fn verify_fixed_q15_nonuniform() {
 
 #[cfg(feature = "auto")]
 fn verify_auto() {
-    use rtconv_simd::auto::{
-        AutoConvolver, AutoStereoConvolver, workspace_len_f32, workspace_len_q15,
-    };
+    #[cfg(not(feature = "native-q15"))]
+    use rtconv_simd::auto::workspace_len_f32;
+    use rtconv_simd::auto::{AutoConvolver, AutoStereoConvolver, workspace_len_q15};
 
     // 2,000-tap stereo IEEE-float WAV (rePhase "32 bits IEEE stereo" layout), built before arming.
     let taps = 2000usize;
@@ -450,7 +450,12 @@ fn verify_auto() {
     wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
     wav.extend_from_slice(&data);
 
-    let mut wsf = vec![0.0f32; 2 * workspace_len_f32(taps)];
+    // Hardware-FPU builds: f32-domain stereo pair. FPU-less builds (`native-q15`) have no f32
+    // auto engines, so the same stereo artifact runs in the Q1.15 domain.
+    #[cfg(not(feature = "native-q15"))]
+    let mut wss = vec![0.0f32; 2 * workspace_len_f32(taps)];
+    #[cfg(feature = "native-q15")]
+    let mut wss = vec![0i16; 2 * workspace_len_q15(taps)];
     let mut wsq = vec![0i16; workspace_len_q15(taps)];
     let in_f = [0.25f32; 37];
     let mut out_f = [0.0f32; 37];
@@ -461,7 +466,7 @@ fn verify_auto() {
 
     let mut stereo = None;
     assert_zero_alloc("auto::stereo_f32::from_bytes", || {
-        stereo = Some(AutoStereoConvolver::from_bytes(&wav, &mut wsf).unwrap());
+        stereo = Some(AutoStereoConvolver::from_bytes(&wav, &mut wss).unwrap());
     });
     let stereo = stereo.as_mut().unwrap();
     assert_zero_alloc("auto::stereo_f32::process", || {
@@ -858,7 +863,7 @@ fn verify_nupc_optimizer(backend: SimdBackend) {
     assert_zero_alloc("nupc_optimizer::convolver_reset", || nu.reset());
 
     // AutoConvolver selecting cost-optimized AutoEngine::NonUniform (16,384 taps, in-place DP)
-    #[cfg(feature = "auto")]
+    #[cfg(all(feature = "auto", not(feature = "native-q15")))]
     {
         use rtconv_simd::auto::{AutoConvolver, AutoEngine, engine_len_f32};
         let mut auto_ws = vec![0.0f32; engine_len_f32(ir_len)];
@@ -874,6 +879,26 @@ fn verify_nupc_optimizer(backend: SimdBackend) {
             }
         });
         assert_zero_alloc("auto::nonuniform_16k::reset", || aconv.reset());
+    }
+
+    // FPU-less builds: `prepare_f32` quantizes from the IEEE bits (integer-only) and runs the
+    // integer Viterbi planner in the caller's i16 workspace -> FixedNonUniform, zero-alloc.
+    #[cfg(feature = "native-q15")]
+    {
+        use rtconv_simd::auto::{AutoConvolver, AutoEngine, engine_len_q15};
+        let mut auto_ws = vec![0i16; engine_len_q15(ir_len)];
+        let mut aconv = None;
+        assert_zero_alloc("auto::q15_nonuniform_16k::prepare_f32", || {
+            aconv = Some(AutoConvolver::prepare_f32(&ir, &mut auto_ws).unwrap());
+        });
+        let aconv = aconv.as_mut().unwrap();
+        assert_eq!(aconv.info().engine, AutoEngine::FixedNonUniform);
+        assert_zero_alloc("auto::q15_nonuniform_16k::process_f32", || {
+            for _ in 0..32 {
+                aconv.process_f32(&inp, &mut out).unwrap();
+            }
+        });
+        assert_zero_alloc("auto::q15_nonuniform_16k::reset", || aconv.reset());
     }
 }
 
