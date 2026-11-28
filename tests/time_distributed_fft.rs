@@ -898,8 +898,10 @@ mod fixed_nonuniform_pr_c {
         assert_eq!(req_defer.delay_i16, expected_delay_i16);
         // Legacy delay_i16 was 2 * ((64+32) + (1024+256) + (8192+1024)) = 21,184 words!
         assert_eq!(req_defer.delay_i16, 4 * (32 + 256 + 1024));
-        // Shared scratch no longer duplicates 4*max_fft (saves 16 KiB at N2048!).
-        assert_eq!(req_defer.scratch_i16, 2 * 1025 + 2048);
+        // Shared scratch no longer duplicates 4*max_fft (saves 16 KiB at N2048!), and since the
+        // 32-bit-mantissa IFFT normalizes the i64 accumulators in place (issue #23) only the
+        // shared overlap-save window of the largest stage remains (was 2 * 1025 + 2048).
+        assert_eq!(req_defer.scratch_i16, 2048);
 
         // 2. End-to-end oracle + fragmented blocks + reset on default_profile & ESP32-C6 preset.
         let plan_c6 = preset_esp32_c6_q15(4096, 64).unwrap();

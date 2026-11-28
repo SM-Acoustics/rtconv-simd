@@ -10,11 +10,17 @@ pub mod direct;
 pub mod fft_q15;
 #[cfg(feature = "fixed-fft")]
 mod fft_q15_tables;
+#[cfg(feature = "fixed-fft")]
+pub(crate) mod fft_q31;
+#[cfg(feature = "fixed-fft")]
+mod fft_q31_tables;
 #[cfg(feature = "fixed-nonuniform")]
 pub mod nonuniform;
 #[cfg(feature = "fixed-fft")]
 pub mod partitioned;
 pub mod q15;
+#[cfg(feature = "fixed-fft")]
+pub(crate) mod spectral;
 
 pub use direct::{
     FixedQ15DirectCapabilities, FixedQ15DirectConfig, FixedQ15DirectConvolver,

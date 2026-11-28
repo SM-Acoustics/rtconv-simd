@@ -198,7 +198,7 @@ Measured with `tests/fft_backends_suite.rs`, `tests/adversarial_reference.rs`, `
 - **`f32` engines** (all backends, IR lengths `1..=131,072`, random host fragmentation `1..3·B`): SNR **`> 100 dB`** against an independent `f64` oracle (`131.77 dB` on 131,072-tap NUPC up to `N16384`).
 - **AES17 (`997 Hz` @ `48 kHz`)**:
   - `f32` (`N512..=N16384`): SNR/THD+N **`127.9–135.9 dB`** across `−60 / −1 / 0 dBFS`, DR **`193.4–201.8 dB`** at `−60 dBFS`, zero overshoot.
-  - `Q1.15` (`N64..=N2048`): at `−60 dBFS`, input-block BFP preserves **`97.87–98.65 dB` DR** (`0.00 dB` loss vs Q1.15 ceiling); at `−1 dBFS`, 16-bit BFP radix-2 stages lose `~2.7 dB/stage` on unity impulse (`76.72 dB` at `N=64` → `63.21 dB` at `N=2048`; `81.56 dB` on Q1.15 NUPC up to `N2048`).
+  - `Q1.15` (`N64..=N2048`): at `−60 dBFS`, input-block BFP preserves **`97.87–98.65 dB` DR** (`0.00 dB` loss vs Q1.15 ceiling). Since issue #23 the engines transform with 32-bit mantissas (`fft_q31` core, ≥ `155 dB` oracle SNR); at `−1 dBFS` a pure tone is now limited by the 16-bit BFP storage of the partition spectra (`81.89 dB` unity impulse at `N=64`, previously `76.72 dB`), and a 4,096-tap rePhase-style FIR on noise reaches `82.36 dB` against an `85.18 dB` output-rounding ceiling (previously `72.00 dB`).
 - **`FixedQ15Partitioned` / `FixedQ15NonUniform`** (decaying 1,500-tap IR):
 
   | Input level | Partitioned | NonUniform | Q1.15 output-rounding ceiling |

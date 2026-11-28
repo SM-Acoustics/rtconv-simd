@@ -108,35 +108,6 @@ pub fn bfp_downscale_i32_stage(re: &mut [i32], im: &mut [i32]) -> i8 {
     shift as i8
 }
 
-/// Workspace-packed (`i16`-backed `i32` pairs) equivalent of [`bfp_downscale_i32_stage`].
-/// `re_ws` and `im_ws` each hold `2 * n` `i16` words (`n` packed `i32` values).
-#[inline]
-pub(crate) fn bfp_downscale_i32_stage_ws(re_ws: &mut [i16], im_ws: &mut [i16], n: usize) -> i8 {
-    let mut peak = 0u32;
-    for idx in 0..n {
-        let off = idx * 2;
-        let ar = load_i32_from_i16(re_ws, off).unsigned_abs();
-        let ai = load_i32_from_i16(im_ws, off).unsigned_abs();
-        if ar > peak {
-            peak = ar;
-        }
-        if ai > peak {
-            peak = ai;
-        }
-    }
-    let shift = excess_shift_i32(peak);
-    if shift > 0 {
-        for idx in 0..n {
-            let off = idx * 2;
-            let r = round_shift_even_i32(load_i32_from_i16(re_ws, off), shift);
-            let i = round_shift_even_i32(load_i32_from_i16(im_ws, off), shift);
-            store_i32_to_i16(re_ws, off, r);
-            store_i32_to_i16(im_ws, off, i);
-        }
-    }
-    shift as i8
-}
-
 /// Normalizes an `i64` Q2.30 spectral accumulator `(acc_re[..bins], acc_im[..bins])` with
 /// base exponent `base_exp` into Q1.15 BFP `(out_re[..bins], out_im[..bins])`, returning
 /// the resulting block exponent `out_exp`.
@@ -199,106 +170,6 @@ pub fn bfp_normalize_acc_i64_to_q15(
     out_exp.clamp(i8::MIN as i32, i8::MAX as i32) as i8
 }
 
-/// Workspace-packed (`i16`-backed `i64` quads) equivalent of [`bfp_normalize_acc_i64_to_q15`].
-/// `acc_re_ws` and `acc_im_ws` each hold `4 * bins` `i16` words (`bins` packed `i64` values).
-pub(crate) fn bfp_normalize_acc_i16ws_to_q15(
-    acc_re_ws: &[i16],
-    acc_im_ws: &[i16],
-    bins: usize,
-    base_exp: i8,
-    out_re: &mut [i16],
-    out_im: &mut [i16],
-) -> i8 {
-    let mut peak = 0u64;
-    for k in 0..bins {
-        let off = k * 4;
-        let ar = load_i64_from_i16(acc_re_ws, off).unsigned_abs();
-        let ai = load_i64_from_i16(acc_im_ws, off).unsigned_abs();
-        if ar > peak {
-            peak = ar;
-        }
-        if ai > peak {
-            peak = ai;
-        }
-    }
-    if peak == 0 {
-        out_re[..bins].fill(0);
-        out_im[..bins].fill(0);
-        return 0;
-    }
-
-    let bits = 64 - peak.leading_zeros();
-    let shift: i32 = (bits as i32) - 15;
-    let out_exp = (base_exp as i32) + shift - 15;
-
-    if shift > 0 {
-        let s = (shift as u32).min(62);
-        for k in 0..bins {
-            let off = k * 4;
-            let r = round_shift_even_i64(load_i64_from_i16(acc_re_ws, off), s)
-                .clamp(i16::MIN as i64, i16::MAX as i64);
-            let i = round_shift_even_i64(load_i64_from_i16(acc_im_ws, off), s)
-                .clamp(i16::MIN as i64, i16::MAX as i64);
-            out_re[k] = r as i16;
-            out_im[k] = i as i16;
-        }
-    } else if shift < 0 {
-        let s = (-shift as u32).min(62);
-        for k in 0..bins {
-            let off = k * 4;
-            let r =
-                (load_i64_from_i16(acc_re_ws, off) << s).clamp(i16::MIN as i64, i16::MAX as i64);
-            let i =
-                (load_i64_from_i16(acc_im_ws, off) << s).clamp(i16::MIN as i64, i16::MAX as i64);
-            out_re[k] = r as i16;
-            out_im[k] = i as i16;
-        }
-    } else {
-        for k in 0..bins {
-            let off = k * 4;
-            out_re[k] = sat_i16_from_i32(load_i64_from_i16(acc_re_ws, off) as i32);
-            out_im[k] = sat_i16_from_i32(load_i64_from_i16(acc_im_ws, off) as i32);
-        }
-    }
-
-    out_exp.clamp(i8::MIN as i32, i8::MAX as i32) as i8
-}
-
-/// Quantizes `len` Q1.31 taps `tap(start..start + len)` into a Q1.15 block normalized to the
-/// full 15-bit mantissa and returns the exponent offset `e` such that
-/// `tap / 2^31 ≈ dst / 32768 * 2^e`.
-///
-/// This is block-floating-point *coefficient* storage: each FFT partition keeps 15 significant
-/// bits relative to its own peak, so the low-level tail of a decaying or linear-phase FIR is not
-/// rounded to a few LSBs of an absolute Q1.15 grid. Unused `dst` entries are zeroed.
-pub(crate) fn quantize_block_q31<F: Fn(usize) -> i32>(
-    tap: &F,
-    start: usize,
-    len: usize,
-    dst: &mut [i16],
-) -> i32 {
-    dst.fill(0);
-    let mut peak = 0u32;
-    for i in 0..len {
-        peak = peak.max(tap(start + i).unsigned_abs());
-    }
-    if peak == 0 {
-        return 0;
-    }
-    let bits = 32 - peak.leading_zeros();
-    let r = bits.saturating_sub(15);
-    for (i, d) in dst[..len].iter_mut().enumerate() {
-        let v = tap(start + i) as i64;
-        let q = if r == 0 {
-            v
-        } else {
-            round_shift_even_i64(v, r)
-        };
-        *d = q.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
-    }
-    r as i32 - 16
-}
-
 /// Rounds a Q1.31 tap to Q1.15 (nearest-even) with saturation.
 #[inline]
 pub(crate) fn q31_to_q15(v: i32) -> i16 {
@@ -312,9 +183,8 @@ pub(crate) trait TapSource {
     fn len(&self) -> usize;
     /// Tap `i` rounded to absolute Q1.15 (direct-form stages).
     fn q15(&self, i: usize) -> i16;
-    /// Writes taps `start..start + len` into `dst` (zero-padded) for a forward FFT and returns
-    /// the exponent offset to add to the FFT block exponent.
-    fn fill_block(&self, start: usize, len: usize, dst: &mut [i16]) -> i32;
+    /// Tap `i` as exact Q1.31 (`value = tap / 2^31`), the input of the partition transforms.
+    fn tap_q31(&self, i: usize) -> i32;
 }
 
 /// Q1.15 taps used verbatim (bit-exact legacy path).
@@ -327,15 +197,14 @@ impl TapSource for &[i16] {
     fn q15(&self, i: usize) -> i16 {
         self[i]
     }
-    fn fill_block(&self, start: usize, len: usize, dst: &mut [i16]) -> i32 {
-        dst.fill(0);
-        dst[..len].copy_from_slice(&self[start..start + len]);
-        0
+    #[inline]
+    fn tap_q31(&self, i: usize) -> i32 {
+        (self[i] as i32) << 16
     }
 }
 
-/// Q1.31 taps accessed by index, stored per FFT partition with block-floating-point
-/// normalization ([`quantize_block_q31`]).
+/// Q1.31 taps accessed by index. FFT partitions are transformed from the exact Q1.31 values
+/// and stored with their own block exponent (`crate::fixed::spectral::prepare_partition`).
 pub(crate) struct Q31Taps<F: Fn(usize) -> i32> {
     pub len: usize,
     pub tap: F,
@@ -350,7 +219,8 @@ impl<F: Fn(usize) -> i32> TapSource for Q31Taps<F> {
     fn q15(&self, i: usize) -> i16 {
         q31_to_q15((self.tap)(i))
     }
-    fn fill_block(&self, start: usize, len: usize, dst: &mut [i16]) -> i32 {
-        quantize_block_q31(&self.tap, start, len, dst)
+    #[inline]
+    fn tap_q31(&self, i: usize) -> i32 {
+        (self.tap)(i)
     }
 }

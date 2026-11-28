@@ -649,10 +649,16 @@ mod fixed {
         std::println!(
             "rePhase-style 4096 taps: ceiling={ceiling:.2} dB  q15-taps={sa:.2} dB  q31-partition-bfp={sb:.2} dB"
         );
-        // Per-partition coefficient exponents recover ~6 dB here; the remaining gap to the
-        // output ceiling is the 16-bit-mantissa BFP FFT path itself (~70 dB), a documented limit.
+        // Per-partition coefficient exponents recover the low-level tails; with the
+        // 32-bit-mantissa real-packed FFT core (issue #23) the FFT path no longer caps the SNR
+        // (~70 dB with 16-bit butterflies): it must reach the Q1.15 output-rounding ceiling
+        // minus at most 3 dB.
         assert!(sb > sa + 3.0, "q31={sb:.2} q15={sa:.2}");
         assert!(sb > 66.0, "q31={sb:.2}");
+        assert!(
+            sb >= ceiling - 3.0,
+            "FFT-path SNR {sb:.2} dB below output ceiling {ceiling:.2} dB - 3 dB"
+        );
     }
 
     /// Reports SNR at several input levels. The level sweep exposes whether the BFP path keeps
