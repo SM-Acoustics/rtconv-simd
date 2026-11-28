@@ -1,5 +1,5 @@
-//! Pure Rust `#![no_std]` fixed-point Q1.15 DSP engines for FPU-less microcontrollers
-//! (such as ESP32-C6 / `riscv32imac-unknown-none-elf`).
+//! Pure Rust `#![no_std]` fixed-point Q1.15 and (feature `fixed-q31`) Q1.31 DSP engines for
+//! FPU-less microcontrollers (such as ESP32-C6 / `riscv32imac-unknown-none-elf`).
 //!
 //! Zero heap allocation, `#![forbid(unsafe_code)]`, zero C/FFI dependencies.
 
@@ -19,6 +19,12 @@ pub mod nonuniform;
 #[cfg(feature = "fixed-fft")]
 pub mod partitioned;
 pub mod q15;
+#[cfg(feature = "fixed-q31")]
+pub mod q31_direct;
+#[cfg(feature = "fixed-q31")]
+pub mod q31_nonuniform;
+#[cfg(feature = "fixed-q31")]
+pub mod q31_partitioned;
 #[cfg(feature = "fixed-fft")]
 pub(crate) mod spectral;
 
@@ -46,4 +52,19 @@ pub use partitioned::{
 pub use q15::{
     Q15_HALF, Q15_SCALE_F32, Q15_SCALE_F64, Q15_SHIFT, f32_to_q15, f64_to_q15, mul_q15, q15_to_f32,
     q15_to_f64, round_even_sat_q15_from_i64, round_sat_q15_from_i64, sat_i16_from_i32,
+};
+#[cfg(feature = "fixed-q31")]
+pub use q31_direct::{
+    FixedQ31DirectCapabilities, FixedQ31DirectConfig, FixedQ31DirectConvolver,
+    FixedQ31DirectMemoryRequirements, FixedQ31Symmetry,
+};
+#[cfg(feature = "fixed-q31")]
+pub use q31_nonuniform::{
+    FixedQ31NonUniformCapabilities, FixedQ31NonUniformConvolver,
+    FixedQ31NonUniformMemoryRequirements,
+};
+#[cfg(feature = "fixed-q31")]
+pub use q31_partitioned::{
+    FixedQ31PartitionedCapabilities, FixedQ31PartitionedConfig, FixedQ31PartitionedConvolver,
+    FixedQ31PartitionedMemoryRequirements,
 };

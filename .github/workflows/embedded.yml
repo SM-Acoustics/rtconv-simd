@@ -36,6 +36,10 @@ jobs:
         run: cargo build --release --lib --target ${{ matrix.target }}
       - name: Fixed-point stack without auto
         run: cargo build --release --lib --no-default-features --features fixed-nonuniform --target ${{ matrix.target }}
+      - name: Q1.31 engines and native Q1.31 auto domain
+        run: |
+          cargo build --release --lib --no-default-features --features fixed-q31 --target ${{ matrix.target }}
+          cargo build --release --lib --features native-q31 --target ${{ matrix.target }}
 
   esp32c6-harness:
     name: ESP32-C6 bare-metal harness (compile-only)
@@ -65,3 +69,13 @@ jobs:
       - name: Build opt-in soft-float baseline (compile check only)
         working-directory: hardware/esp32c6
         run: cargo build --release --features soft-float-baseline
+      # Q1.31 mcycle benchmarks (issue PR 3): must also link no soft-float routine; sizes are
+      # reported without the Q1.15-path budget.
+      - name: Build Q1.31 benchmark variant and guard it (no soft-float, size report)
+        run: |
+          (cd hardware/esp32c6 && cargo build --release --features q31-bench)
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          bin="$(rustc --print sysroot)/lib/rustlib/$host/bin"
+          GUARD_LABEL="q31-bench" LLVM_NM="$bin/llvm-nm" LLVM_SIZE="$bin/llvm-size" \
+            scripts/check-no-fpu-binary.sh \
+            hardware/esp32c6/target/riscv32imac-unknown-none-elf/release/rtconv-esp32c6-harness none

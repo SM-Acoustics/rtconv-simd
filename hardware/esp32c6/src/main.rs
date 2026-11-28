@@ -7,20 +7,26 @@
 //! (guarded in CI); the `soft-float-baseline` feature adds the deliberate `f32`
 //! `DirectConvolver` comparison workload.
 //!
+//! The `q31-bench` feature adds the `bench` module with the Q1.31 `mcycle` cases (255-tap
+//! Type I direct FIR; 1,024 / 2,048-tap Q1.31 vs Q1.15 non-uniform convolution).
+//!
 //! Flashing and physical cycle measurement (`DEVICE_VERIFIED`) require explicit owner
 //! authorization and a connected ESP32-C6 board; do not flash automatically.
 
 #![no_std]
 #![no_main]
 
+#[cfg(feature = "q31-bench")]
+pub mod bench;
+
 use core::panic::PanicInfo;
 use rtconv_simd::auto::{AutoConvolver, AutoEngine, AutoWorkspace, workspace_len};
+#[cfg(feature = "soft-float-baseline")]
+use rtconv_simd::{DirectConfig, DirectConvolver, SimdBackend};
 use rtconv_simd::{
     FixedQ15DirectConfig, FixedQ15DirectConvolver, FixedQ15PartitionedConfig,
     FixedQ15PartitionedConvolver, HAS_HARDWARE_FPU,
 };
-#[cfg(feature = "soft-float-baseline")]
-use rtconv_simd::{DirectConfig, DirectConvolver, SimdBackend};
 
 /// Taps of the embedded synthetic FIR artifact (`> Q15_DIRECT_MAX_TAPS`, so NUPC is selected).
 const FIR_TAPS: usize = 300;
@@ -184,6 +190,8 @@ fn soft_float_baseline(impulse_ok: &mut bool) {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     let _report = core::hint::black_box(run_synthetic_suite());
+    #[cfg(feature = "q31-bench")]
+    let _bench = core::hint::black_box(bench::run_benchmarks());
     loop {
         core::hint::spin_loop();
     }

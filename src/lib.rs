@@ -20,7 +20,9 @@
 //! - [`PartitionedConvolver`]: uniform frequency-domain delay line with 50 % overlap-save.
 //! - [`HybridConvolver`]: zero-latency direct head + partitioned FFT tail (BURST / SPREAD).
 //! - `NonUniformConvolver` (feature `nonuniform`): multi-stage zero-latency NUPC.
-//! - `fixed::*` (features `fixed-q15`, `fixed-fft`, `fixed-nonuniform`): Q1.15 / BFP engines.
+//! - `fixed::*` (features `fixed-q15`, `fixed-fft`, `fixed-nonuniform`): Q1.15 / BFP engines;
+//!   feature `fixed-q31`: Q1.31 engines (`FixedQ31DirectConvolver` with FIR Type I folding,
+//!   `FixedQ31PartitionedConvolver`, `FixedQ31NonUniformConvolver`) for 24/32-bit audio.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -77,6 +79,14 @@ pub use fixed::{
 pub use fixed::{
     FixedQ15PartitionedCapabilities, FixedQ15PartitionedConfig, FixedQ15PartitionedConvolver,
     FixedQ15PartitionedMemoryRequirements,
+};
+#[cfg(feature = "fixed-q31")]
+pub use fixed::{
+    FixedQ31DirectCapabilities, FixedQ31DirectConfig, FixedQ31DirectConvolver,
+    FixedQ31DirectMemoryRequirements, FixedQ31NonUniformCapabilities, FixedQ31NonUniformConvolver,
+    FixedQ31NonUniformMemoryRequirements, FixedQ31PartitionedCapabilities,
+    FixedQ31PartitionedConfig, FixedQ31PartitionedConvolver, FixedQ31PartitionedMemoryRequirements,
+    FixedQ31Symmetry,
 };
 pub use hybrid::{HybridConfig, HybridConvolver, HybridMemoryRequirements};
 #[cfg(feature = "nonuniform")]

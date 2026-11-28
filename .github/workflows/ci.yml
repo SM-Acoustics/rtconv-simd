@@ -63,5 +63,7 @@ jobs:
       - run: cargo test --release --all-features
       - name: FPU-less auto domain on the host (native-q15, full suite incl. doctests)
         run: cargo test --release --features native-q15
+      - name: Q1.31 auto domain on the host (native-q31, full suite incl. doctests)
+        run: cargo test --release --features native-q31
       - name: Standalone Zero-Allocation RT Suite
         run: cargo test --release --all-features --test no_alloc_rt

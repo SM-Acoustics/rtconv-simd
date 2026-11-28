@@ -61,7 +61,7 @@ Stereo artifacts use `AutoStereoConvolver` (planar `process_f32` / `process_i16`
 | `thumbv7em-none-eabihf` | Cortex-M4F/M7 | `f32` | as ESP32-P4 |
 | x86-64 / AArch64 / WASM | desktop, mobile, web | `f32` + SIMD | as ESP32-P4 |
 
-The FPU is detected by `build.rs` from the target ISA string. Stable Rust does not expose the RISC-V `F` extension as a `cfg`. The `native-q15` feature forces the fixed-point domain on any target.
+The FPU is detected by `build.rs` from the target ISA string. Stable Rust does not expose the RISC-V `F` extension as a `cfg`. The `native-q15` feature forces the fixed-point domain on any target; `native-q31` forces the Q1.31 domain (`NativeElem = i32`, about twice the workspace bytes of Q1.15, so Cortex-M0-class parts keep the Q1.15 default). FPU-less builds link no `f32` engine, no soft-float routine and no decimal-to-float table in the automatic layer (CI-guarded on the ESP32-C6 harness).
 
 ---
 
@@ -106,10 +106,12 @@ Typed errors (`ArtifactError`) cover truncation, unsupported formats, non-finite
 | :--- | :--- | :---: |
 | `auto` *(default)* | `AutoConvolver`, `AutoStereoConvolver`, `AutoWorkspace`; implies `fixed-nonuniform` | No |
 | `native-q15` | Forces the Q1.15 auto domain on FPU targets (RAM savings, host testing) | No |
+| `native-q31` | Forces the Q1.31 auto domain on any target (24/32-bit audio without an FPU; takes precedence over `native-q15`) | No |
 | `nonuniform` | `NonUniformConvolver`, `NonUniformPlan`, `NonUniformBudget`, `NonUniformScheduler` | No |
 | `fixed-q15` | `FixedQ15DirectConvolver` and Q1.15 helpers | No |
 | `fixed-fft` | BFP `rfft_q15_bfp_with_scratch` / `irfft_q15_bfp_with_scratch` (`N64..=N2048`, `1,026 B` ROM) and `FixedQ15PartitionedConvolver` | No |
 | `fixed-nonuniform` | `FixedQ15NonUniformConvolver` | No |
+| `fixed-q31` | `FixedQ31DirectConvolver` (FIR Type I folding), `FixedQ31PartitionedConvolver`, `FixedQ31NonUniformConvolver` on the 32-bit-mantissa BFP FFT core; `AutoElem for i32`, `AutoConvolver::process_i32` | No |
 | `std` | Runtime CPU detection (`SimdBackend::detect()`) | Yes |
 | `phastft` | Optional desktop `PhastFftBackend` (`phastft 0.4.1`, `N64..=N16384`) | Yes |
 

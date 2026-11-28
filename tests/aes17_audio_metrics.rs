@@ -428,3 +428,85 @@ fn aes17_q15_nonuniform_with_n512_n1024_n2048_stages() {
         }
     }
 }
+
+/// AES17-style 997 Hz @ 48 kHz stimuli at −60 / −1 / 0 dBFS through every Q1.31 engine
+/// (`fixed-q31`): oracle-null DR and THD+N must be compatible with 24-bit audio (> 115 dB).
+#[cfg(feature = "fixed-q31")]
+#[test]
+fn aes17_q31_engines_dr_and_thdn_above_115_db() {
+    use rtconv_simd::{
+        FixedQ31DirectConfig, FixedQ31DirectConvolver, FixedQ31NonUniformConvolver,
+        FixedQ31PartitionedConfig, FixedQ31PartitionedConvolver, NonUniformPlan,
+    };
+    const Q31: f64 = 2_147_483_648.0;
+    let to_q31 = |v: f64| (v * Q31).round().clamp(-(i32::MAX as f64), i32::MAX as f64) as i32;
+
+    for (engine, ir_len) in [
+        ("direct", 255usize),
+        ("partitioned", 1024),
+        ("nonuniform", 2048),
+    ] {
+        let ir_f64 = make_l1_bounded_ir_f64(ir_len, 0.85);
+        let ir: Vec<i32> = ir_f64.iter().map(|&v| to_q31(v)).collect();
+        let ir_exact: Vec<f64> = ir.iter().map(|&v| v as f64 / Q31).collect();
+        let total = 8192usize;
+        let skip = ir_len;
+        for &level in &[-60.0f64, -1.0, 0.0] {
+            let x: Vec<i32> = sine_997hz_f64(total, level)
+                .iter()
+                .map(|&v| to_q31(v))
+                .collect();
+            let x_exact: Vec<f64> = x.iter().map(|&v| v as f64 / Q31).collect();
+            let reference = oracle_convolve_f64(&ir_exact, &x_exact);
+            let mut y = vec![0i32; total];
+            let sats = match engine {
+                "direct" => {
+                    let cfg = FixedQ31DirectConfig { max_ir_len: ir_len };
+                    let mut ws = vec![0i32; 3 * ir_len];
+                    let mut c = FixedQ31DirectConvolver::prepare(&ir, cfg, &mut ws).unwrap();
+                    for (xi, yo) in x.chunks(64).zip(y.chunks_mut(64)) {
+                        c.process_block(xi, yo).unwrap();
+                    }
+                    c.saturation_count()
+                }
+                "partitioned" => {
+                    let cfg = FixedQ31PartitionedConfig {
+                        block_size: 64,
+                        max_ir_len: ir_len,
+                    };
+                    let req = FixedQ31PartitionedConvolver::memory_requirements(cfg).unwrap();
+                    let mut ws = vec![0i32; req.total_i32];
+                    let mut c = FixedQ31PartitionedConvolver::prepare(&ir, cfg, &mut ws).unwrap();
+                    for (xi, yo) in x.chunks(64).zip(y.chunks_mut(64)) {
+                        c.process_block(xi, yo).unwrap();
+                    }
+                    c.saturation_count()
+                }
+                _ => {
+                    let plan = NonUniformPlan::default_profile(ir_len, 64).unwrap();
+                    let req = FixedQ31NonUniformConvolver::memory_requirements(&plan).unwrap();
+                    let mut ws = vec![0i32; req.total_i32];
+                    let mut c = FixedQ31NonUniformConvolver::prepare(&ir, plan, &mut ws).unwrap();
+                    for (xi, yo) in x.chunks(64).zip(y.chunks_mut(64)) {
+                        c.process_block(xi, yo).unwrap();
+                    }
+                    assert_eq!(c.deadline_misses(), 0);
+                    c.saturation_count()
+                }
+            };
+            assert_eq!(sats, 0, "{engine} level={level}: clipped");
+            let out: Vec<f64> = y.iter().map(|&v| v as f64 / Q31).collect();
+            let (snr_db, thd_n_db, dr_db, max_abs) = aes17_metrics(&reference, &out, skip);
+            println!(
+                "AES17 Q31 {engine:<11} L={ir_len:<5} level={level:>5.1} dBFS | SNR={snr_db:6.2} dB | THD+N={thd_n_db:7.2} dB | DR={dr_db:6.2} dB | max_err={max_abs:.2e}"
+            );
+            assert!(dr_db > 115.0, "{engine} {level} dBFS DR={dr_db:.2} dB");
+            if level > -60.0 {
+                assert!(
+                    thd_n_db < -115.0,
+                    "{engine} {level} dBFS THD+N={thd_n_db:.2} dB"
+                );
+            }
+        }
+    }
+}

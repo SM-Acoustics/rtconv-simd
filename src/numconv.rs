@@ -204,7 +204,7 @@ pub(crate) const fn ieee_to_fixed_rne(v: Ieee, k: i32, min: i64, max: i64) -> Op
 
 /// `f32` → Q1.31 `RNE(x * 2^(31 - shift))` with symmetric-bound saturation, integer-only via
 /// [`f32::to_bits`]. NaN maps to `None`.
-#[cfg(any(test, all(feature = "auto", rtconv_no_fpu)))]
+#[cfg(any(test, feature = "auto"))]
 #[inline]
 pub(crate) const fn f32_to_q31_rne(x: f32, shift: u32) -> Option<(i32, bool)> {
     let k = 31 - (if shift > 31 { 31 } else { shift }) as i32;
@@ -248,6 +248,43 @@ pub(crate) const fn q15_to_f32_exact(q: i16) -> f32 {
     let biased = (p as i32 - 15 + 127) as u32;
     let frac = (m << (23 - p)) & 0x007F_FFFF;
     f32::from_bits(sign | (biased << 23) | frac)
+}
+
+/// `RNE(q / 2^31)` as `f32` (24-bit significand), assembled from IEEE 754 single fields
+/// without an FPU; bit-identical to `q as f32 / 2^31` (whose `as` conversion rounds to nearest
+/// even).
+#[cfg(any(
+    test,
+    all(feature = "auto", any(not(rtconv_no_fpu), feature = "fixed-q31"))
+))]
+#[inline]
+pub(crate) const fn q31_to_f32_rne(q: i32) -> f32 {
+    if q == 0 {
+        return f32::from_bits(0);
+    }
+    let sign = if q < 0 { 1u32 << 31 } else { 0 };
+    let m = (q as i64).unsigned_abs(); // 1..=2^31
+    let p = 63 - m.leading_zeros(); // MSB position 0..=31
+    let (mant, exp) = if p <= 23 {
+        (m << (23 - p), p as i32 - 31)
+    } else {
+        let sh = p - 23;
+        let q = m >> sh;
+        let r = m & ((1u64 << sh) - 1);
+        let half = 1u64 << (sh - 1);
+        let q = if r > half || (r == half && (q & 1) == 1) {
+            q + 1
+        } else {
+            q
+        };
+        if q == 1 << 24 {
+            (1 << 23, p as i32 - 30)
+        } else {
+            (q, p as i32 - 31)
+        }
+    };
+    let biased = (exp + 127) as u32;
+    f32::from_bits(sign | (biased << 23) | (mant as u32 & 0x007F_FFFF))
 }
 
 /// `true` when `|v| > (32767 / 32768) * 2^shift`, i.e. `v * 2^-shift` does not fit Q1.15
@@ -553,6 +590,36 @@ mod tests {
                         .unwrap();
                 assert_eq!((q as i32, s), q31_ref_f64(x, shift), "x={x:e}");
             }
+        }
+    }
+
+    #[test]
+    fn q31_to_f32_matches_core_conversion() {
+        let mut q = i32::MIN;
+        loop {
+            assert_eq!(
+                q31_to_f32_rne(q).to_bits(),
+                (q as f32 / 2_147_483_648.0).to_bits(),
+                "q={q}"
+            );
+            match q.checked_add(0x0000_2B67) {
+                Some(n) => q = n,
+                None => break,
+            }
+        }
+        for q in [
+            i32::MIN,
+            i32::MAX,
+            -1,
+            1,
+            (1 << 24) + 1,
+            (1 << 25) - 1,
+            0x00FF_FFFF,
+        ] {
+            assert_eq!(
+                q31_to_f32_rne(q).to_bits(),
+                (q as f32 / 2_147_483_648.0).to_bits()
+            );
         }
     }
 

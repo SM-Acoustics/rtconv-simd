@@ -52,6 +52,13 @@ fixed-q15 = []
 fixed-fft = ["fixed-q15"]
 # Integrated fixed-point Q1.15/BFP Non-Uniform Partitioned Convolver (reuses NUPC scheduler).
 fixed-nonuniform = ["nonuniform", "fixed-fft"]
+# Q1.31 engines for 24/32-bit audio without an FPU (`FixedQ31DirectConvolver`,
+# `FixedQ31PartitionedConvolver`, `FixedQ31NonUniformConvolver`) on the 32-bit-mantissa BFP
+# FFT core. `no_std`, zero-alloc, no `std`.
+fixed-q31 = ["fixed-nonuniform"]
+# Force the Q1.31 domain as `auto::NativeElem` on any target (analogous to `native-q15`; takes
+# precedence over `native-q15` when both are enabled, e.g. with `--all-features`).
+native-q31 = ["auto", "fixed-q31"]
 
 [dependencies]
 fearless_simd = { version = "1.2.0", default-features = false, features = ["force_support_fallback", "libm"] }

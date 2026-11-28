@@ -12,6 +12,10 @@ rtconv-simd = { path = "../..", default-features = false, features = ["auto"] }
 # Adds the deliberate soft-float `DirectConvolver` (`f32`) comparison workload. Off by default:
 # the default build must link no soft-float routine (CI guard in `embedded.yml`).
 soft-float-baseline = []
+# Q1.31 `mcycle` benchmarks (`src/bench.rs`): 255-tap Type I direct FIR and 1,024 / 2,048-tap
+# Q1.31 vs Q1.15 non-uniform convolution. Kept out of the default build so the default binary
+# stays the issue #32 footprint measurement of the Q1.15 auto path.
+q31-bench = ["rtconv-simd/fixed-q31"]
 
 [profile.release]
 opt-level = "s"

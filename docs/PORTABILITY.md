@@ -17,7 +17,7 @@ Compilation, MSRV, cross-compilation, host testing, and hardware execution are t
 
 ## Automatic Numeric Domain (`auto::NativeElem`)
 
-`build.rs` emits `cfg(rtconv_no_fpu)` when `f32` would be software-emulated. On stable Rust, `cfg(target_feature = "f")` is **not** exposed for RISC-V, so `riscv32imac` and `riscv32imafc` have identical cfgs. The ISA letters of the target triple are therefore parsed (`f`, `d` or `g` ⇒ FPU). For ARM the rule is the `eabihf` ABI or VFP features; ESP32-S2, AVR and MSP430 are treated as FPU-less. Classification was probed with `cargo build -vv` for `riscv32imac` (Q1.15), `riscv32imafc` (`f32`), `thumbv6m` (Q1.15), `thumbv7em-none-eabihf` (`f32`) and `x86_64` (`f32`). The `native-q15` feature forces Q1.15.
+`build.rs` emits `cfg(rtconv_no_fpu)` when `f32` would be software-emulated. On stable Rust, `cfg(target_feature = "f")` is **not** exposed for RISC-V, so `riscv32imac` and `riscv32imafc` have identical cfgs. The ISA letters of the target triple are therefore parsed (`f`, `d` or `g` ⇒ FPU). For ARM the rule is the `eabihf` ABI or VFP features; ESP32-S2, AVR and MSP430 are treated as FPU-less. Classification was probed with `cargo build -vv` for `riscv32imac` (Q1.15), `riscv32imafc` (`f32`), `thumbv6m` (Q1.15), `thumbv7em-none-eabihf` (`f32`) and `x86_64` (`f32`). The `native-q15` feature forces Q1.15; `native-q31` forces the Q1.31 domain (and the no-FPU code path) on any target.
 
 ## RISC-V / ESP32-C6 / ESP32-P4 Note
 

@@ -494,6 +494,7 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
     }
 
     /// Processes an arbitrary-length block of Q1.15 samples (`input.len() == output.len()`).
+    #[inline]
     pub fn process_block(&mut self, input: &[i16], output: &mut [i16]) -> Result<(), ConvError> {
         if input.len() != output.len() {
             return Err(ConvError::MismatchedBufferLength {
@@ -570,7 +571,7 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
                             step_start,
                             step_end,
                             finish_rfft,
-                        )?;
+                        );
                     }
                     StageWorkItem::ContinueCmac {
                         part_start,
@@ -579,7 +580,7 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
                     } => {
                         self.fdl_run_cmac(idx, part_start, part_end);
                         if finish_ifft {
-                            self.fdl_run_ifft_steps(idx, 0, steps, true)?;
+                            self.fdl_run_ifft_steps(idx, 0, steps, true);
                         }
                     }
                     StageWorkItem::IfftSteps {
@@ -587,7 +588,7 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
                         step_end,
                         commit_output,
                     } => {
-                        self.fdl_run_ifft_steps(idx, step_start, step_end, commit_output)?;
+                        self.fdl_run_ifft_steps(idx, step_start, step_end, commit_output);
                     }
                     StageWorkItem::CombinedSlice {
                         rfft_start,
@@ -606,13 +607,13 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
                                 rfft_start,
                                 rfft_end,
                                 finish_rfft,
-                            )?;
+                            );
                         }
                         if cmac_start < cmac_end {
                             self.fdl_run_cmac(idx, cmac_start, cmac_end);
                         }
                         if ifft_start < ifft_end {
-                            self.fdl_run_ifft_steps(idx, ifft_start, ifft_end, commit_output)?;
+                            self.fdl_run_ifft_steps(idx, ifft_start, ifft_end, commit_output);
                         }
                     }
                 }
@@ -657,10 +658,10 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
         step_start: usize,
         step_end: usize,
         finish_rfft: bool,
-    ) -> Result<(), ConvError> {
+    ) {
         let active_p = self.stages[idx].active_partitions;
         if active_p == 0 || step_start >= step_end {
-            return Ok(());
+            return;
         }
 
         let n = self.stages[idx].fft_size;
@@ -719,8 +720,6 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
             self.acc_max_exp[idx] = max_exp;
             self.workspace[acc_off..acc_off + 8 * bins].fill(0);
         }
-
-        Ok(())
     }
 
     fn fdl_run_cmac(&mut self, idx: usize, part_start: usize, part_end: usize) {
@@ -762,9 +761,9 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
         step_start: usize,
         step_end: usize,
         commit_output: bool,
-    ) -> Result<(), ConvError> {
+    ) {
         if step_start >= step_end {
-            return Ok(());
+            return;
         }
 
         let st = self.stages[idx];
@@ -783,7 +782,7 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
                 }
                 self.scheduler.stage_state_mut(idx).delay_write_pos = wp + b;
             }
-            return Ok(());
+            return;
         }
 
         // Disjoint borrows: acc (in-place inverse buffer) < delay ring.
@@ -822,8 +821,6 @@ impl<'a> FixedQ15NonUniformConvolver<'a> {
         if commit_output {
             self.scheduler.stage_state_mut(idx).delay_write_pos = wp + b;
         }
-
-        Ok(())
     }
 
     /// Deterministically resets all delay lines, FDL rings, shared input history, scheduler

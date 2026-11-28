@@ -85,6 +85,27 @@ impl Words32 for [i16] {
     }
 }
 
+/// `i64` accumulators stored in the same buffer (`[i16]`: four big-endian words, `[i32]`: two
+/// big-endian words per value).
+pub(crate) trait Words64: Words32 {
+    /// Loads `i64` slot `i`.
+    fn ld64(&self, i: usize) -> i64;
+}
+
+impl Words64 for [i16] {
+    #[inline(always)]
+    fn ld64(&self, i: usize) -> i64 {
+        crate::fixed::block_float::load_i64_from_i16(self, 4 * i)
+    }
+}
+
+impl Words64 for [i32] {
+    #[inline(always)]
+    fn ld64(&self, i: usize) -> i64 {
+        ((self[2 * i] as i64) << 32) | (self[2 * i + 1] as u32 as i64)
+    }
+}
+
 /// `true` if `n` is a supported real FFT length (power of two in `64..=2048`).
 #[inline]
 pub(crate) const fn q31_fft_supports(n: usize) -> bool {
@@ -288,6 +309,10 @@ fn cfft_stage<B: Words32 + ?Sized>(
 /// (`ZERO_SPECTRUM_EXP` for an all-zero input, whose mantissas are zero). Steps:
 /// `0` = normalize + bit-reversed packing + first stage, `1..log2(n)-1` = stages,
 /// `log2(n)-1` = untangling.
+///
+/// Inlined into its callers so the per-sample call chain of the engines carries one frame
+/// less on RV32 (the stage and (un)tangling passes stay out of line).
+#[inline(always)]
 pub(crate) fn q31_rfft_step<B: Words32 + ?Sized, F: Fn(usize) -> i32>(
     n: usize,
     step: usize,
@@ -404,6 +429,7 @@ fn untangle<B: Words32 + ?Sized>(buf: &mut B, m: usize, st: &mut Q31FftState) {
 /// through [`q31_irfft_sample`] with value `sample·2^e` for the returned `Some(e)`; `1/N` is
 /// included. Steps: `0` = normalize + tangling into bit-reversed order, `1..=log2(n/2)` =
 /// inverse stages.
+#[inline(always)]
 pub(crate) fn q31_irfft_step<B: Words32 + ?Sized>(
     n: usize,
     step: usize,
@@ -556,20 +582,21 @@ pub(crate) fn q31_spectrum_to_q15<B: Words32 + ?Sized>(
     e - sh + 15
 }
 
-/// Converts the per-bin `i64` accumulators stored in an `[i16]` region (`acc_re` at words
-/// `0..4·bins`, `acc_im` at `4·bins..8·bins`, four big-endian words each) **in place** into the
-/// spectrum layout of [`q31_irfft_step`], normalized to `|mant| <= 2^28` with one
-/// round-to-nearest-even shift. `acc` values are `acc·2^acc_exp`; returns the spectrum exponent,
-/// or `None` if all accumulators are zero.
-pub(crate) fn acc_i64_to_q31_spectrum_in_place(
-    ws: &mut [i16],
+/// Converts the per-bin `i64` accumulators of a region (`acc_re` in `i64` slots `0..bins`,
+/// `acc_im` in slots `bins..2·bins`) **in place** into the spectrum layout of
+/// [`q31_irfft_step`] (`i32` word `k` / `bins + k`), normalized to `|mant| <= 2^28` with one
+/// round-to-nearest-even shift. Every `i32` word written lies at or before the `i64` slot it
+/// comes from, so no unread accumulator is overwritten. `acc` values are `acc·2^acc_exp`;
+/// returns the spectrum exponent, or `None` if all accumulators are zero (the region then reads
+/// as a zero spectrum).
+pub(crate) fn acc_i64_to_q31_spectrum_in_place<B: Words64 + ?Sized>(
+    ws: &mut B,
     bins: usize,
     acc_exp: i32,
 ) -> Option<i32> {
-    use crate::fixed::block_float::load_i64_from_i16;
     let mut or_abs = 0u64;
     for k in 0..2 * bins {
-        or_abs |= load_i64_from_i16(ws, 4 * k).unsigned_abs();
+        or_abs |= ws.ld64(k).unsigned_abs();
     }
     if or_abs == 0 {
         return None;
@@ -582,17 +609,43 @@ pub(crate) fn acc_i64_to_q31_spectrum_in_place(
             round_shift_even_i64(v, sh.unsigned_abs()) as i32
         }
     };
-    // re: i64 word 4k -> i32 slot k (words 2k): writes stay behind unread reads.
-    for k in 0..bins {
-        let v = conv(load_i64_from_i16(ws, 4 * k));
-        store_i32_to_i16(ws, 2 * k, v);
-    }
-    // im: i64 word 4(bins + k) -> i32 slot bins + k (words 2bins + 2k).
-    for k in 0..bins {
-        let v = conv(load_i64_from_i16(ws, 4 * (bins + k)));
-        store_i32_to_i16(ws, 2 * (bins + k), v);
+    for k in 0..2 * bins {
+        let v = conv(ws.ld64(k));
+        ws.st(k, v);
     }
     Some(acc_exp - sh)
+}
+
+/// Quantizes a finished forward spectrum (`X(k) = mant·2^e`) to `i32` block-floating-point
+/// storage with `|out| <= 2^bits` (one round-to-nearest-even shift, `bits <= 30`). Returns `s`
+/// with `X(k) ≈ out·2^s`, or `ZERO_SPECTRUM_EXP` for an all-zero spectrum.
+#[cfg(feature = "fixed-q31")]
+#[inline(never)]
+pub(crate) fn q31_spectrum_to_i32<B: Words32 + ?Sized>(
+    buf: &B,
+    n: usize,
+    e: i32,
+    bits: u32,
+    out_re: &mut [i32],
+    out_im: &mut [i32],
+) -> i32 {
+    let m = n / 2;
+    let im0 = m + 1;
+    let mut or_abs = 0u32;
+    for k in 0..=m {
+        or_abs |= buf.ld(k).unsigned_abs() | buf.ld(im0 + k).unsigned_abs();
+    }
+    if or_abs == 0 {
+        out_re[..=m].fill(0);
+        out_im[..=m].fill(0);
+        return ZERO_SPECTRUM_EXP;
+    }
+    let sh = bits as i32 - bitlen(or_abs) as i32;
+    for k in 0..=m {
+        out_re[k] = scale_to_fit(buf.ld(k), sh);
+        out_im[k] = scale_to_fit(buf.ld(im0 + k), sh);
+    }
+    e - sh
 }
 
 /// `RNE(v·2^sh)` saturated to `[min, max]` (`sh` of either sign), reporting saturation.
@@ -855,7 +908,7 @@ mod tests {
             crate::fixed::block_float::store_i64_to_i16(&mut ws, 4 * k, (k as i64 - 20) << 33);
             crate::fixed::block_float::store_i64_to_i16(&mut ws, 4 * (bins + k), -(k as i64) << 30);
         }
-        let ex = acc_i64_to_q31_spectrum_in_place(&mut ws, bins, -10).unwrap();
+        let ex = acc_i64_to_q31_spectrum_in_place(&mut ws[..], bins, -10).unwrap();
         for k in 0..bins {
             let r = ws[..].ld(k) as f64 * (2.0f64).powi(ex);
             let i = ws[..].ld(bins + k) as f64 * (2.0f64).powi(ex);

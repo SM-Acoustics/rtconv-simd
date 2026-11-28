@@ -139,7 +139,7 @@ fn const_sizing_matches_engine_requirements_exactly() {
     for taps in [1usize, 64, 128, 129, 300, 700, 2048, 5121, 8192, 16384] {
         let ir_f = vec![0.001f32; taps];
         // Hardware FPU: f32 engines in an f32 workspace.
-        #[cfg(not(feature = "native-q15"))]
+        #[cfg(not(any(feature = "native-q15", feature = "native-q31")))]
         {
             let mut ws_f = vec![0.0f32; engine_len_f32(taps)];
             let conv_f = AutoConvolver::prepare_f32(&ir_f, &mut ws_f).unwrap();
@@ -147,12 +147,21 @@ fn const_sizing_matches_engine_requirements_exactly() {
         }
         // FPU-less build: f32 taps are quantized from their bits into the Q1.15 engines,
         // which need exactly `engine_len_q15` i16 words.
-        #[cfg(feature = "native-q15")]
+        #[cfg(all(feature = "native-q15", not(feature = "native-q31")))]
         {
             let mut ws_f = vec![0i16; engine_len_q15(taps)];
             let conv_f = AutoConvolver::prepare_f32(&ir_f, &mut ws_f).unwrap();
             assert_eq!(conv_f.info().engine, select_q15(taps));
             assert_eq!(conv_f.info().domain, NumericDomain::FixedQ15);
+        }
+        // native-q31: the Q1.31 engines in exactly `engine_len_q31` i32 words.
+        #[cfg(feature = "native-q31")]
+        {
+            use rtconv_simd::auto::{engine_len_q31, select_q31};
+            let mut ws_f = vec![0i32; engine_len_q31(taps)];
+            let conv_f = AutoConvolver::prepare_f32(&ir_f, &mut ws_f).unwrap();
+            assert_eq!(conv_f.info().engine, select_q31(taps));
+            assert_eq!(conv_f.info().domain, NumericDomain::FixedQ31);
         }
 
         let ir_q = vec![16i16; taps];
@@ -282,7 +291,7 @@ fn fir(len: usize, seed: u64, peak: f64) -> Vec<f64> {
 }
 
 /// `f32` auto engines exist only with a hardware FPU (not under `native-q15`).
-#[cfg(not(feature = "native-q15"))]
+#[cfg(not(any(feature = "native-q15", feature = "native-q31")))]
 #[test]
 fn f32_domain_stereo_wav_end_to_end_with_fragmented_blocks() {
     for taps in [48usize, 700, 3000] {
@@ -378,7 +387,7 @@ fn q15_domain_end_to_end_with_gain_above_unity() {
     }
 }
 
-#[cfg(not(feature = "native-q15"))]
+#[cfg(not(any(feature = "native-q15", feature = "native-q31")))]
 #[test]
 fn i16_io_on_f32_engine_and_interleaved_stereo() {
     let taps = 400;
@@ -463,7 +472,7 @@ fn esp32c6_harness_scenario_on_host() {
     }
 }
 
-#[cfg(not(feature = "native-q15"))]
+#[cfg(not(any(feature = "native-q15", feature = "native-q31")))]
 #[test]
 fn f32_auto_selects_optimized_nonuniform_on_long_ir_oracle_snr() {
     let taps = 16_384usize;
@@ -535,7 +544,7 @@ fn q15_auto_optimized_nonuniform_long_ir() {
 }
 
 /// Raw little-endian `f32` mono artifact (rePhase `.bin`).
-#[cfg(feature = "native-q15")]
+#[cfg(all(feature = "native-q15", not(feature = "native-q31")))]
 fn raw_f32(h: &[f64]) -> Vec<u8> {
     h.iter().flat_map(|&v| (v as f32).to_le_bytes()).collect()
 }
@@ -543,7 +552,7 @@ fn raw_f32(h: &[f64]) -> Vec<u8> {
 /// FPU-less build: `prepare_f32` (taps quantized from their IEEE bits, integer-only) prepares
 /// exactly the same engine as loading the same taps from a raw `f32` artifact, and both
 /// produce bit-identical output, including filters above 0 dBFS (headroom shift).
-#[cfg(feature = "native-q15")]
+#[cfg(all(feature = "native-q15", not(feature = "native-q31")))]
 #[test]
 fn no_fpu_prepare_f32_matches_from_artifact_bit_exactly() {
     for (taps, peak) in [
@@ -601,7 +610,7 @@ fn no_fpu_prepare_f32_matches_from_artifact_bit_exactly() {
     }
 }
 
-#[cfg(feature = "native-q15")]
+#[cfg(all(feature = "native-q15", not(feature = "native-q31")))]
 #[test]
 fn no_fpu_prepare_f32_rejects_non_finite_and_empty() {
     let mut ws = vec![0i16; engine_len_q15(4)];
@@ -617,4 +626,133 @@ fn no_fpu_prepare_f32_rejects_non_finite_and_empty() {
         AutoConvolver::prepare_f32(&[], &mut ws),
         Err(rtconv_simd::ConvError::EmptyIr)
     ));
+}
+
+// ------------------------------------------------------------------------------------------
+// Q1.31 domain (`fixed-q31`, native with `native-q31`)
+// ------------------------------------------------------------------------------------------
+
+#[cfg(feature = "fixed-q31")]
+mod q31_domain {
+    use super::*;
+    use rtconv_simd::auto::{engine_len_q31, select_q31, workspace_len_q31};
+    use rtconv_simd::{FixedQ31NonUniformConvolver, NonUniformPlan};
+
+    const Q31: f64 = 2_147_483_648.0;
+
+    #[test]
+    fn q31_const_sizing_covers_engines_and_shorter_irs() {
+        for taps in (1..=700).chain([1024, 2048, 4096, 9000, 16384]) {
+            let len = engine_len_q31(taps);
+            match select_q31(taps) {
+                AutoEngine::FixedQ31Direct => assert_eq!(len, 3 * taps, "taps={taps}"),
+                _ => {
+                    let max_b = auto_max_block_test(taps, 1024);
+                    let mut sc =
+                        vec![OptimizerScratchCell::ZERO; optimizer_scratch_len(taps, max_b)];
+                    let (plan, _) = NonUniformPlan::optimize_with_max_block_size(
+                        taps,
+                        64,
+                        max_b,
+                        &CostModel::esp32_c6_q15_estimate(),
+                        ClearancePolicy::Strategy2,
+                        &mut sc,
+                    )
+                    .unwrap();
+                    let actual = FixedQ31NonUniformConvolver::memory_requirements(&plan)
+                        .unwrap()
+                        .total_i32;
+                    assert!(len >= actual, "taps={taps}: bound {len} < actual {actual}");
+                }
+            }
+        }
+        for max in [1usize, 255, 256, 257, 900, 5000] {
+            let w = workspace_len_q31(max);
+            for taps in 1..=max {
+                assert!(engine_len_q31(taps) + taps <= w, "max={max} taps={taps}");
+            }
+        }
+        assert_eq!(select_q31(255), AutoEngine::FixedQ31Direct);
+        assert_eq!(select_q31(256), AutoEngine::FixedQ31Direct);
+        assert_eq!(select_q31(257), AutoEngine::FixedQ31NonUniform);
+    }
+
+    /// 24-bit-class end-to-end: f32 stereo WAV (gain above unity) loaded into an `i32`
+    /// workspace, `process_i32` with fragmented host blocks, against the exact oracle.
+    #[test]
+    fn q31_domain_artifact_end_to_end_with_gain_above_unity() {
+        for taps in [255usize, 2000] {
+            let h = fir(taps, 77 + taps as u64, 1.6);
+            let bytes = wav_f32_stereo(&h, &h);
+            let mut ws = vec![0i32; workspace_len_q31(taps)];
+            let mut conv = AutoConvolver::from_bytes(&bytes, 1, &mut ws).unwrap();
+            let info = conv.info();
+            assert_eq!(info.domain, NumericDomain::FixedQ31);
+            assert_eq!(info.engine, select_q31(taps));
+            assert_eq!((info.gain_shift, info.latency_samples), (1, 0));
+            let l1: f64 = h.iter().map(|v| v.abs()).sum();
+            let x = signal(5000, 3, 0.9 / l1);
+            let xq: Vec<i32> = x.iter().map(|&v| (v * Q31).round() as i32).collect();
+            let mut y = vec![0i32; x.len()];
+            let mut pos = 0;
+            for &n in [1usize, 31, 64, 100, 7, 256].iter().cycle() {
+                if pos >= x.len() {
+                    break;
+                }
+                let end = (pos + n).min(x.len());
+                conv.process_i32(&xq[pos..end], &mut y[pos..end]).unwrap();
+                pos = end;
+            }
+            let xr: Vec<f64> = xq.iter().map(|&v| v as f64 / Q31).collect();
+            let reference = oracle(&h, &xr);
+            let s = snr(&reference, y.iter().map(|&v| v as f64 / Q31));
+            println!(
+                "q31 auto taps={taps} engine={:?} snr={s:.2} dB",
+                info.engine
+            );
+            assert!(s > 120.0, "taps={taps} snr={s:.2}");
+            assert_eq!(conv.saturation_count(), 0);
+
+            // i16 and f32 I/O on the Q1.31 engine.
+            conv.reset();
+            let x16: Vec<i16> = xq.iter().map(|&v| (v >> 16) as i16).collect();
+            let mut y16 = vec![0i16; x16.len()];
+            conv.process_i16(&x16, &mut y16).unwrap();
+            conv.reset();
+            let xf: Vec<f32> = x16.iter().map(|&v| v as f32 / 32768.0).collect();
+            let mut yf = vec![0.0f32; xf.len()];
+            conv.process_f32(&xf, &mut yf).unwrap();
+            for (a, b) in y16.iter().zip(&yf) {
+                assert!((*a as f32 / 32768.0 - b).abs() <= 1.0 / 32768.0);
+            }
+        }
+    }
+
+    /// With `native-q31`, `prepare_f32` (taps from their IEEE bits, integer-only) prepares the
+    /// same Q1.31 engine as a raw `f32` artifact and both are bit-identical.
+    #[cfg(feature = "native-q31")]
+    #[test]
+    fn native_q31_prepare_f32_matches_from_artifact_bit_exactly() {
+        use rtconv_simd::auto::{NATIVE_DOMAIN, workspace_len};
+        assert_eq!(NATIVE_DOMAIN, NumericDomain::FixedQ31);
+        for (taps, peak) in [(3usize, 0.5), (255, 0.9), (256, 2.2), (1500, 0.8)] {
+            let h = fir(taps, 9 + taps as u64, peak);
+            let hf: Vec<f32> = h.iter().map(|&v| v as f32).collect();
+            let bytes: Vec<u8> = hf.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let mut wa = vec![0i32; engine_len_q31(taps)];
+            let mut a = AutoConvolver::prepare_f32(&hf, &mut wa).unwrap();
+            let mut wb = vec![0i32; workspace_len(taps)];
+            let mut b = AutoConvolver::from_bytes(&bytes, 0, &mut wb).unwrap();
+            assert_eq!(a.info().engine, b.info().engine);
+            assert_eq!(a.info().gain_shift, b.info().gain_shift);
+            let x = signal(2000, 4, 0.3);
+            let xq: Vec<i32> = x.iter().map(|&v| (v * Q31) as i32).collect();
+            let (mut ya, mut yb) = (vec![0i32; x.len()], vec![0i32; x.len()]);
+            for (xi, (p, q)) in xq.chunks(37).zip(ya.chunks_mut(37).zip(yb.chunks_mut(37))) {
+                a.process_i32(xi, p).unwrap();
+                b.process_i32(xi, q).unwrap();
+            }
+            assert_eq!(ya, yb, "taps={taps}");
+        }
+    }
 }

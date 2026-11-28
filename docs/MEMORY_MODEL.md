@@ -32,7 +32,7 @@ All core convolvers operate exclusively inside a single caller-owned workspace s
 | **`MicroFftBackend`** (`f32`) | `64..=16384` | **`16,380 B`** (`microfft 0.6.0` `size-16384` sine table) | `N` `f32` (`256 B`–`64.00 KiB`) | `< 256 B` |
 | **`PhastFftBackend`** (`f32`, `std`) | `64..=16384` | Precomputed `PlannerR2c32` (allocated once in `new()`) | `N` `f32` (`256 B`–`64.00 KiB`) | `< 256 B` |
 | **`fft_q15` (`*_with_scratch`, public stand-alone API)** | `64..=2048` | **`1,026 B`** (`[i16; 513]` quarter-wave, `0 B` bitrev ROM) | `2 * N` `i32` (`512 B`–`16.00 KiB`) | `< 256 B` |
-| **`fft_q31` core (`FixedQ15*` engines, issue #23)** | `64..=2048` | **`2,052 B`** (`[i32; 513]` Q1.31 quarter-wave) | forward `N + 2`, inverse `2 * N + 2` `i32` words (in the engine workspace) | `336 B` partitioned / `496 B` NUPC callback chain (static, RV32IMAC) |
+| **`fft_q31` core (`FixedQ15*` engines, issue #23)** | `64..=2048` | **`2,052 B`** (`[i32; 513]` Q1.31 quarter-wave) | forward `N + 2`, inverse `2 * N + 2` `i32` words (in the engine workspace) | `288 B` partitioned / `464 B` NUPC callback chain (static, RV32IMAC) |
 | **`fft_q15` (legacy `rfft_q15_bfp`)** | `64..=256` only | shares the `1,026 B` ROM (`N > 256` → `UnsupportedFftSize`) | `0 B` | `~2 KiB` (`[i32; 256] × 2`) |
 
 - **`SimdFixedFftBackend` twiddles**: generated in `f64` and rounded to `f32` under IEEE 754 round-to-nearest-even in `build.rs`, stored as a single `static` quarter-wave cosine table (`TW_COS_Q: [f32; 4097]`) strided by power of two. Bit-reversal indices are computed with `usize::reverse_bits()`.
@@ -85,3 +85,15 @@ The Viterbi partition optimizer runs strictly at setup time (Class B, never insi
 - `worst_engine_len_f32` evaluates in `O(1)` so `AutoWorkspace::<{ workspace_len(131_072) }>` compiles cleanly in `const` generics without hitting Rust's `const`-eval step limit (`tests/auto_convolver.rs::const_generic_workspace_len_evaluates_at_131072_taps`).
 - `auto::engine_len_f32` / `engine_len_q15` are **exact** for `Direct`, `Hybrid`, and `FixedDirect`, and return a **mathematically proven tight upper bound** for cost-optimized `NonUniform` / `FixedNonUniform` (covering both in-place Viterbi DP scratch and the resulting convolver workspace, verified in `tests/auto_convolver.rs::const_sizing_matches_engine_requirements_exactly`).
 - `stereo_workspace_len` doubles `workspace_len`. The IR scratch tail of the workspace is used only during preparation.
+
+## Q1.31 engines (`fixed-q31`)
+
+All three engines take one caller-owned `&mut [i32]` workspace (`*_i32` words, `4` bytes each):
+
+| Engine | Workspace (`i32` words) | Instance (`riscv32imac`) |
+| :--- | :--- | ---: |
+| `FixedQ31DirectConvolver` | `3 * max_ir_len` (coefficients + linear double-buffered history, `const fn memory_requirements`) | `48 B` |
+| `FixedQ31PartitionedConvolver` | `N + 4·P·bins + 2·P + 4·bins + (N + 2)` (overlap, IR/FDL `i32` spectra, exponents, `i64` accumulators hosting the in-place inverse, forward buffer) | `88 B` |
+| `FixedQ31NonUniformConvolver` | shared input ring + `2·L_0` head + per FDL stage `4·P·bins + 2·P + 4·bins` + `4·B_s` (`i64` Q16.47 rings) + `max N_s` | `1,776 B` |
+
+A Q1.31 non-uniform workspace has slightly fewer words than the Q1.15 one for the same plan (its accumulators take `4·bins` instead of `8·bins` words) but about twice the bytes: `preset_esp32_c6_q15(1024, 64)` needs `18,148 B` (Q1.15: `9,338 B`), `preset_esp32_c6_q15(2048, 64)` `48,056 B` (Q1.15: `26,348 B`). `auto::workspace_len_q31` sizes the automatic layer (engine bound + `max_taps` decode words). Static call-graph stack bound on `riscv32imac` (panic paths excluded): direct `process_block` `160 B`, non-uniform `process_sample` + worst step runner `368 B` (`process_block` is inlined into the caller).

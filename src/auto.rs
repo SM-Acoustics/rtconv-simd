@@ -23,6 +23,15 @@
 //!    on load and the output is scaled back by `2^s` with saturation (telemetry in
 //!    [`AutoConvolver::saturation_count`]).
 //!
+//! ## Q1.31 domain (feature `fixed-q31`; native with `native-q31`)
+//! An `i32` workspace (or `NativeElem = i32` under `native-q31`) selects the Q1.31 engines for
+//! 24/32-bit audio: `FixedQ31DirectConvolver` up to [`Q31_DIRECT_MAX_TAPS`] taps (FIR Type I
+//! folding for symmetric linear-phase filters), otherwise `FixedQ31NonUniformConvolver`
+//! planned by the same integer planner. Same zero latency, gain headroom and single-workspace
+//! model; [`AutoConvolver::process_i32`] is the native I/O. A Q1.31 workspace needs about twice
+//! the bytes of a Q1.15 one ([`workspace_len_q31`]), so RAM-constrained Cortex-M0 targets keep
+//! Q1.15 unless they opt in.
+//!
 //! ## FPU-less builds (`cfg(rtconv_no_fpu)`, or the `native-q15` feature)
 //! The `f32` engines are **not part of** [`AutoConvolver`] there: the engine enum only holds
 //! the Q1.15 family, `f32` workspaces are not accepted ([`AutoElem`] is implemented for `i16`
@@ -64,9 +73,11 @@ use crate::nonuniform::optimizer::{
     optimizer_scratch_len_i16,
 };
 use crate::nonuniform::{ClearancePolicy, CostModel, OPTIMIZER_BLOCK_SIZES};
-#[cfg(rtconv_no_fpu)]
-use crate::numconv::{Ieee, f32_to_q31_rne, ieee_exceeds_q15_headroom};
-use crate::numconv::{f32_to_q15_rne_sat, q15_to_f32_exact};
+#[cfg(any(not(rtconv_no_fpu), feature = "fixed-q31"))]
+use crate::numconv::q31_to_f32_rne;
+use crate::numconv::{
+    Ieee, f32_to_q15_rne_sat, f32_to_q31_rne, ieee_exceeds_q15_headroom, q15_to_f32_exact,
+};
 #[cfg(not(rtconv_no_fpu))]
 use crate::{
     DirectConfig, DirectConvolver, HybridConfig, HybridConvolver, SimdBackend, SimdFixedFftBackend,
@@ -95,8 +106,13 @@ pub type NativeElem = f32;
 
 /// Workspace element of the native numeric domain: `f32` with a hardware FPU, `i16` (Q1.15)
 /// without one. See [`HAS_HARDWARE_FPU`].
-#[cfg(rtconv_no_fpu)]
+#[cfg(all(rtconv_no_fpu, not(feature = "native-q31")))]
 pub type NativeElem = i16;
+
+/// Workspace element of the native numeric domain: `i32` (Q1.31) with the `native-q31`
+/// feature, on any target.
+#[cfg(feature = "native-q31")]
+pub type NativeElem = i32;
 
 /// Numeric domain an [`AutoConvolver`] runs in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,10 +121,15 @@ pub enum NumericDomain {
     Float32,
     /// Q1.15 fixed-point engines with block-floating-point FFTs (no FPU required).
     FixedQ15,
+    /// Q1.31 fixed-point engines for 24/32-bit audio (feature `fixed-q31`; native with
+    /// `native-q31`).
+    FixedQ31,
 }
 
 /// Native numeric domain for the compilation target.
-pub const NATIVE_DOMAIN: NumericDomain = if HAS_HARDWARE_FPU {
+pub const NATIVE_DOMAIN: NumericDomain = if cfg!(feature = "native-q31") {
+    NumericDomain::FixedQ31
+} else if HAS_HARDWARE_FPU {
     NumericDomain::Float32
 } else {
     NumericDomain::FixedQ15
@@ -137,6 +158,10 @@ pub enum AutoEngine {
     /// Q1.15/BFP zero-latency cost-optimized non-uniform convolver
     /// ([`FixedQ15NonUniformConvolver`]).
     FixedNonUniform,
+    /// Q1.31 direct FIR (`FixedQ31DirectConvolver`, FIR Type I folding when symmetric).
+    FixedQ31Direct,
+    /// Q1.31 zero-latency cost-optimized non-uniform convolver (`FixedQ31NonUniformConvolver`).
+    FixedQ31NonUniform,
 }
 
 /// Longest IR handled by the Q1.15 direct engine before switching to the non-uniform engine.
@@ -312,6 +337,14 @@ const fn nupc_upper_bound_q15(taps: usize) -> usize {
     if taps <= Q15_DIRECT_MAX_TAPS {
         return 2 * taps;
     }
+    nupc_upper_bound_fixed(taps)
+}
+
+/// Words (`i16` for Q1.15, `i32` for Q1.31) of the fixed-point NUPC engine plus the in-place
+/// integer planner scratch for `taps > 32`. The Q1.31 engine needs no more words than the Q1.15
+/// one (its accumulators take `4 * bins` instead of `8 * bins` words, everything else counts
+/// alike), and the `i32` planner scratch no more than the `i16` one.
+const fn nupc_upper_bound_fixed(taps: usize) -> usize {
     let b_max = auto_max_block(taps, AUTO_Q15_MAX_BLOCK);
     if b_max == 0 {
         return 2 * taps;
@@ -413,10 +446,50 @@ pub const fn workspace_len_q15(max_taps: usize) -> usize {
     max(engine_len_q15(max_taps), 2 * direct) + 2 * max_taps
 }
 
+/// Longest IR handled by the Q1.31 direct engine before switching to the non-uniform engine.
+///
+/// Covers the 255-tap linear-phase crossover case (128 MACs/sample with FIR Type I folding);
+/// heuristic, not yet calibrated by on-device cycle measurements (#24).
+pub const Q31_DIRECT_MAX_TAPS: usize = 256;
+
+/// Selects the Q1.31 engine for `taps` coefficients.
+pub const fn select_q31(taps: usize) -> AutoEngine {
+    if taps <= Q31_DIRECT_MAX_TAPS {
+        AutoEngine::FixedQ31Direct
+    } else {
+        AutoEngine::FixedQ31NonUniform
+    }
+}
+
+/// Engine workspace (`i32` words) required by [`select_q31`]`(taps)`: exact (`3 * taps`) for the
+/// direct engine, upper bound (engine + in-place planner scratch) for the non-uniform engine.
+pub const fn engine_len_q31(taps: usize) -> usize {
+    if taps <= Q31_DIRECT_MAX_TAPS {
+        3 * taps
+    } else {
+        nupc_upper_bound_fixed(taps)
+    }
+}
+
+/// Total `i32` workspace for any IR of up to `max_taps` taps in the Q1.31 domain (worst engine
+/// choice + `max_taps` words of Q1.31 IR decode scratch). Memory criterion: a Q1.31 workspace
+/// has about as many words as the Q1.15 one but twice the bytes, so Cortex-M0-class parts with
+/// little RAM keep the Q1.15 default and opt into Q1.31 with `native-q31` or an `i32` workspace.
+pub const fn workspace_len_q31(max_taps: usize) -> usize {
+    let direct = if max_taps < Q31_DIRECT_MAX_TAPS {
+        max_taps
+    } else {
+        Q31_DIRECT_MAX_TAPS
+    };
+    max(engine_len_q31(max_taps), 3 * direct) + max_taps
+}
+
 /// Workspace elements ([`NativeElem`]) for one channel of up to `max_taps` taps on the
 /// compilation target.
 pub const fn workspace_len(max_taps: usize) -> usize {
-    if HAS_HARDWARE_FPU {
+    if cfg!(feature = "native-q31") {
+        workspace_len_q31(max_taps)
+    } else if HAS_HARDWARE_FPU {
         workspace_len_f32(max_taps)
     } else {
         workspace_len_q15(max_taps)
@@ -460,12 +533,15 @@ mod sealed {
     #[cfg(not(rtconv_no_fpu))]
     impl Sealed for f32 {}
     impl Sealed for i16 {}
+    #[cfg(feature = "fixed-q31")]
+    impl Sealed for i32 {}
 }
 
-/// Workspace element type selecting the numeric domain (`f32` or `i16`). Sealed.
+/// Workspace element type selecting the numeric domain (`f32`, `i16` = Q1.15 or, with
+/// `fixed-q31`, `i32` = Q1.31). Sealed.
 ///
 /// Implemented for `f32` only on targets with a hardware FPU; FPU-less builds accept `i16`
-/// workspaces only (see the module documentation).
+/// (and `i32`) workspaces only (see the module documentation).
 pub trait AutoElem: sealed::Sealed + Copy + 'static {
     /// Domain selected by this element type.
     const DOMAIN: NumericDomain;
@@ -476,6 +552,28 @@ pub trait AutoElem: sealed::Sealed + Copy + 'static {
         channel: usize,
         workspace: &'a mut [Self],
     ) -> Result<AutoConvolver<'a>, ConvError>;
+
+    #[doc(hidden)]
+    fn prepare_f32_taps<'a>(
+        ir: &[f32],
+        workspace: &'a mut [Self],
+    ) -> Result<AutoConvolver<'a>, ConvError>;
+}
+
+/// Exact integer headroom shift for `f32` taps (smallest `s <= 31` with
+/// `max|h|·2^-s <= 32767/32768`), rejecting non-finite taps.
+fn f32_taps_headroom(ir: &[f32]) -> Result<u32, ConvError> {
+    let mut shift = 0u32;
+    for (index, &h) in ir.iter().enumerate() {
+        let v = Ieee::from_f32_bits(h.to_bits());
+        if matches!(v, Ieee::NonFinite { .. }) {
+            return Err(ConvError::NonFiniteCoefficient { index });
+        }
+        while shift < 31 && ieee_exceeds_q15_headroom(v, shift) {
+            shift += 1;
+        }
+    }
+    Ok(shift)
 }
 
 #[cfg(not(rtconv_no_fpu))]
@@ -499,7 +597,14 @@ impl AutoElem for f32 {
         let (engine_ws, scratch) = workspace.split_at_mut(engine_len);
         let ir = &mut scratch[..taps];
         artifact.decode_f32(channel, ir)?;
-        AutoConvolver::prepare_f32(ir, engine_ws).map(|c| c.with_rate(artifact.sample_rate()))
+        Self::prepare_f32_taps(ir, engine_ws).map(|c| c.with_rate(artifact.sample_rate()))
+    }
+
+    fn prepare_f32_taps<'a>(
+        ir: &[f32],
+        workspace: &'a mut [f32],
+    ) -> Result<AutoConvolver<'a>, ConvError> {
+        AutoConvolver::prepare_f32_engines(ir, workspace)
     }
 }
 
@@ -534,6 +639,59 @@ impl AutoElem for i16 {
         AutoConvolver::prepare_q31_with(taps, tap, shift, engine_ws)
             .map(|c| c.with_rate(artifact.sample_rate()))
     }
+
+    fn prepare_f32_taps<'a>(
+        ir: &[f32],
+        workspace: &'a mut [i16],
+    ) -> Result<AutoConvolver<'a>, ConvError> {
+        if ir.is_empty() {
+            return Err(ConvError::EmptyIr);
+        }
+        let shift = f32_taps_headroom(ir)?;
+        // Finite taps always convert (`None` is NaN only, rejected above).
+        let tap = |i: usize| f32_to_q31_rne(ir[i], shift).map_or(0, |(v, _)| v);
+        AutoConvolver::prepare_q31_with(ir.len(), tap, shift, workspace)
+    }
+}
+
+#[cfg(feature = "fixed-q31")]
+impl AutoElem for i32 {
+    const DOMAIN: NumericDomain = NumericDomain::FixedQ31;
+
+    fn prepare<'a>(
+        artifact: &FirArtifact<'_>,
+        channel: usize,
+        workspace: &'a mut [i32],
+    ) -> Result<AutoConvolver<'a>, ConvError> {
+        let taps = artifact.frames();
+        let engine_len = engine_len_q31(taps);
+        let need = engine_len + taps;
+        if workspace.len() < need {
+            return Err(ConvError::WorkspaceTooSmall {
+                required: need,
+                provided: workspace.len(),
+            });
+        }
+        let shift = artifact.q15_headroom_shift(channel)?;
+        let (engine_ws, scratch) = workspace.split_at_mut(engine_len);
+        let ir = &mut scratch[..taps];
+        artifact.decode_q31(channel, shift, ir)?;
+        let ir = &*ir;
+        AutoConvolver::prepare_q31_domain(taps, |i| ir[i], shift, engine_ws)
+            .map(|c| c.with_rate(artifact.sample_rate()))
+    }
+
+    fn prepare_f32_taps<'a>(
+        ir: &[f32],
+        workspace: &'a mut [i32],
+    ) -> Result<AutoConvolver<'a>, ConvError> {
+        if ir.is_empty() {
+            return Err(ConvError::EmptyIr);
+        }
+        let shift = f32_taps_headroom(ir)?;
+        let tap = |i: usize| f32_to_q31_rne(ir[i], shift).map_or(0, |(v, _)| v);
+        AutoConvolver::prepare_q31_domain(ir.len(), tap, shift, workspace)
+    }
 }
 
 // ------------------------------------------------------------------------------------------
@@ -551,7 +709,8 @@ pub struct AutoInfo {
     pub taps: usize,
     /// Algorithmic latency in samples (always `0`).
     pub latency_samples: usize,
-    /// Q1.15 load-time attenuation `2^-gain_shift` compensated at the output (`0` for `f32`).
+    /// Fixed-point load-time attenuation `2^-gain_shift` compensated at the output (`0` for
+    /// `f32`).
     pub gain_shift: u32,
     /// Sample rate declared by the artifact (WAV only).
     pub sample_rate: Option<u32>,
@@ -569,6 +728,10 @@ enum Engine<'a> {
     NonUniform(NonUniformConvolver<'a, SimdFixedFftBackend>),
     FixedDirect(FixedQ15DirectConvolver<'a>),
     FixedNonUniform(FixedQ15NonUniformConvolver<'a>),
+    #[cfg(feature = "fixed-q31")]
+    Q31Direct(crate::fixed::FixedQ31DirectConvolver<'a>),
+    #[cfg(feature = "fixed-q31")]
+    Q31NonUniform(crate::fixed::FixedQ31NonUniformConvolver<'a>),
 }
 
 /// Zero-latency, zero-allocation convolver that configures itself from the FIR it is given.
@@ -583,6 +746,9 @@ pub struct AutoConvolver<'a> {
 }
 
 const IO_CHUNK: usize = 64;
+/// Conversion chunk of the `i32`/`f32` paths (two 128-byte stack buffers).
+#[cfg(any(not(rtconv_no_fpu), feature = "fixed-q31"))]
+const IO_CHUNK_Q31: usize = 32;
 
 impl<'a> AutoConvolver<'a> {
     /// Parses `bytes` with [`FirArtifact::parse`] and prepares `channel` (see
@@ -608,9 +774,26 @@ impl<'a> AutoConvolver<'a> {
         E::prepare(artifact, channel, workspace)
     }
 
-    /// Prepares the `f32` domain from IR taps (`workspace.len() >= engine_len_f32(ir.len())`).
+    /// Prepares the native domain ([`NativeElem`]) from `f32` taps.
+    ///
+    /// - Hardware FPU: the `f32` engines (`workspace.len() >= engine_len_f32(ir.len())`).
+    /// - FPU-less build (`i16`): the **Q1.15** engines (`>= engine_len_q15(ir.len())` words).
+    /// - `native-q31` (`i32`): the **Q1.31** engines (`>= engine_len_q31(ir.len())` words).
+    ///
+    /// In the fixed-point domains no floating-point operation is executed: each tap is
+    /// decomposed from [`f32::to_bits`] (sign, exponent, significand per IEEE Std 754-1985
+    /// §3.2.1), the headroom shift `s` is the smallest with `max|h| * 2^-s <= 32767/32768`
+    /// (exact integer comparison, as [`FirArtifact::q15_headroom_shift`]), and the taps are
+    /// converted to Q1.31 as `RNE(h * 2^(31 - s))` (round to nearest, ties to even, §4.1). The
+    /// result is identical to [`Self::from_artifact`] on a raw `f32` artifact holding the same
+    /// taps.
+    pub fn prepare_f32(ir: &[f32], workspace: &'a mut [NativeElem]) -> Result<Self, ConvError> {
+        NativeElem::prepare_f32_taps(ir, workspace)
+    }
+
+    /// `f32` engines from `f32` taps (hardware-FPU builds).
     #[cfg(not(rtconv_no_fpu))]
-    pub fn prepare_f32(ir: &[f32], workspace: &'a mut [f32]) -> Result<Self, ConvError> {
+    fn prepare_f32_engines(ir: &[f32], workspace: &'a mut [f32]) -> Result<Self, ConvError> {
         if ir.is_empty() {
             return Err(ConvError::EmptyIr);
         }
@@ -666,36 +849,6 @@ impl<'a> AutoConvolver<'a> {
         })
     }
 
-    /// FPU-less build: prepares the **Q1.15** engines from `f32` taps
-    /// (`workspace.len() >= engine_len_q15(ir.len())`, `i16` elements).
-    ///
-    /// No floating-point operation is executed: each tap is decomposed from
-    /// [`f32::to_bits`] (sign, exponent, significand per IEEE Std 754-1985 §3.2.1), the
-    /// headroom shift `s` is the smallest with `max|h| * 2^-s <= 32767/32768` (exact integer
-    /// comparison, as [`FirArtifact::q15_headroom_shift`]), and the taps are converted to
-    /// Q1.31 as `RNE(h * 2^(31 - s))` (round to nearest, ties to even, §4.1) before
-    /// [`Self::prepare_q31_with`]. The result is identical to [`Self::from_artifact`] on a raw
-    /// `f32` artifact holding the same taps.
-    #[cfg(rtconv_no_fpu)]
-    pub fn prepare_f32(ir: &[f32], workspace: &'a mut [i16]) -> Result<Self, ConvError> {
-        if ir.is_empty() {
-            return Err(ConvError::EmptyIr);
-        }
-        let mut shift = 0u32;
-        for (index, &h) in ir.iter().enumerate() {
-            let v = Ieee::from_f32_bits(h.to_bits());
-            if matches!(v, Ieee::NonFinite { .. }) {
-                return Err(ConvError::NonFiniteCoefficient { index });
-            }
-            while shift < 31 && ieee_exceeds_q15_headroom(v, shift) {
-                shift += 1;
-            }
-        }
-        // Finite taps always convert (`None` is NaN only, rejected above).
-        let tap = |i: usize| f32_to_q31_rne(ir[i], shift).map_or(0, |(v, _)| v);
-        Self::prepare_q31_with(ir.len(), tap, shift, workspace)
-    }
-
     /// Prepares the Q1.15 domain from Q1.15 taps already scaled by `2^-gain_shift`; the output
     /// is multiplied back by `2^gain_shift` with saturation
     /// (`workspace.len() >= engine_len_q15(ir.len())`).
@@ -728,7 +881,13 @@ impl<'a> AutoConvolver<'a> {
                 Engine::FixedNonUniform(FixedQ15NonUniformConvolver::prepare(ir, plan, workspace)?)
             }
         };
-        Ok(Self::fixed(engine, engine_kind, taps, gain_shift))
+        Ok(Self::fixed(
+            engine,
+            engine_kind,
+            taps,
+            gain_shift,
+            NumericDomain::FixedQ15,
+        ))
     }
 
     /// Prepares the Q1.15 domain from Q1.31 taps (`tap(i) / 2^31`, already scaled by
@@ -771,18 +930,84 @@ impl<'a> AutoConvolver<'a> {
                 )?)
             }
         };
-        Ok(Self::fixed(engine, engine_kind, taps, gain_shift))
+        Ok(Self::fixed(
+            engine,
+            engine_kind,
+            taps,
+            gain_shift,
+            NumericDomain::FixedQ15,
+        ))
     }
 
-    fn fixed(engine: Engine<'a>, engine_kind: AutoEngine, taps: usize, gain_shift: u32) -> Self {
+    /// Prepares the **Q1.31** domain from `taps` Q1.31 taps (`tap(i) / 2^31`, already scaled
+    /// by `2^-gain_shift`; the output is multiplied back by `2^gain_shift` with saturation).
+    /// Direct FIR (with FIR Type I folding when symmetric) up to [`Q31_DIRECT_MAX_TAPS`],
+    /// otherwise the integer-planned `FixedQ31NonUniformConvolver`
+    /// (`workspace.len() >= engine_len_q31(taps)`).
+    #[cfg(feature = "fixed-q31")]
+    pub fn prepare_q31_domain<F: Fn(usize) -> i32>(
+        taps: usize,
+        tap: F,
+        gain_shift: u32,
+        workspace: &'a mut [i32],
+    ) -> Result<Self, ConvError> {
+        use crate::fixed::{
+            FixedQ31DirectConfig, FixedQ31DirectConvolver, FixedQ31NonUniformConvolver,
+        };
+        if taps == 0 {
+            return Err(ConvError::EmptyIr);
+        }
+        let engine_kind = select_q31(taps);
+        let engine = match engine_kind {
+            AutoEngine::FixedQ31Direct => Engine::Q31Direct(FixedQ31DirectConvolver::prepare_with(
+                taps,
+                tap,
+                FixedQ31DirectConfig { max_ir_len: taps },
+                workspace,
+            )?),
+            _ => {
+                let plan = optimize_in_i16_scratch(
+                    taps,
+                    IO_CHUNK,
+                    auto_max_block(taps, AUTO_Q15_MAX_BLOCK),
+                    AUTO_Q15_MAX_FDL_STAGES,
+                    &ESP32_C6_Q15_INTEGER_MODEL,
+                    ClearancePolicy::Strategy2,
+                    workspace,
+                )?;
+                Engine::Q31NonUniform(FixedQ31NonUniformConvolver::prepare_with(
+                    taps, tap, plan, None, workspace,
+                )?)
+            }
+        };
+        Ok(Self::fixed(
+            engine,
+            engine_kind,
+            taps,
+            gain_shift,
+            NumericDomain::FixedQ31,
+        ))
+    }
+
+    fn fixed(
+        engine: Engine<'a>,
+        engine_kind: AutoEngine,
+        taps: usize,
+        gain_shift: u32,
+        domain: NumericDomain,
+    ) -> Self {
         Self {
             engine,
             info: AutoInfo {
-                domain: NumericDomain::FixedQ15,
+                domain,
                 engine: engine_kind,
                 taps,
                 latency_samples: 0,
-                gain_shift: gain_shift.min(15),
+                gain_shift: gain_shift.min(if domain == NumericDomain::FixedQ31 {
+                    31
+                } else {
+                    15
+                }),
                 sample_rate: None,
             },
             conversion_saturations: 0,
@@ -806,6 +1031,10 @@ impl<'a> AutoConvolver<'a> {
         let engine = match &self.engine {
             Engine::FixedDirect(c) => c.saturation_count(),
             Engine::FixedNonUniform(c) => c.saturation_count(),
+            #[cfg(feature = "fixed-q31")]
+            Engine::Q31Direct(c) => c.saturation_count(),
+            #[cfg(feature = "fixed-q31")]
+            Engine::Q31NonUniform(c) => c.saturation_count(),
             #[cfg(not(rtconv_no_fpu))]
             _ => 0,
         };
@@ -823,6 +1052,10 @@ impl<'a> AutoConvolver<'a> {
             Engine::NonUniform(c) => c.reset(),
             Engine::FixedDirect(c) => c.reset(),
             Engine::FixedNonUniform(c) => c.reset(),
+            #[cfg(feature = "fixed-q31")]
+            Engine::Q31Direct(c) => c.reset(),
+            #[cfg(feature = "fixed-q31")]
+            Engine::Q31NonUniform(c) => c.reset(),
         }
         self.conversion_saturations = 0;
     }
@@ -835,6 +1068,13 @@ impl<'a> AutoConvolver<'a> {
             });
         }
         Ok(())
+    }
+
+    #[inline]
+    fn count_conversion(&mut self, sat: bool) {
+        if sat {
+            self.conversion_saturations = self.conversion_saturations.saturating_add(1);
+        }
     }
 
     #[inline]
@@ -853,11 +1093,19 @@ impl<'a> AutoConvolver<'a> {
         }
     }
 
+    /// `true` when the prepared engine is a Q1.31 engine.
+    #[cfg(feature = "fixed-q31")]
+    #[inline]
+    fn is_q31(&self) -> bool {
+        matches!(self.engine, Engine::Q31Direct(_) | Engine::Q31NonUniform(_))
+    }
+
     /// Processes `f32` samples (full scale `±1.0`), any block length.
     ///
-    /// In the Q1.15 domain samples are converted in chunks of 64 on the stack with integer
-    /// arithmetic only (bit-identical on every target): input `RNE(x * 2^15)` with saturation
-    /// (NaN → `0`, counted clips in [`Self::saturation_count`]), output exactly `q / 2^15`.
+    /// In the fixed-point domains samples are converted in short chunks on the stack with
+    /// integer arithmetic only (bit-identical on every target): input `RNE(x * 2^15)` or
+    /// `RNE(x * 2^31)` with saturation (NaN → `0`, clips counted in
+    /// [`Self::saturation_count`]), output exactly `q / 2^15` or `RNE(q / 2^31)` to `f32`.
     pub fn process_f32(&mut self, input: &[f32], output: &mut [f32]) -> Result<(), ConvError> {
         Self::check_len(input.len(), output.len())?;
         #[cfg(not(rtconv_no_fpu))]
@@ -867,15 +1115,34 @@ impl<'a> AutoConvolver<'a> {
             Engine::NonUniform(c) => return c.process_block(input, output),
             _ => {}
         }
+        #[cfg(feature = "fixed-q31")]
+        if self.is_q31() {
+            let mut qi = [0i32; IO_CHUNK_Q31];
+            let mut qo = [0i32; IO_CHUNK_Q31];
+            for (xi, yo) in input
+                .chunks(IO_CHUNK_Q31)
+                .zip(output.chunks_mut(IO_CHUNK_Q31))
+            {
+                let n = xi.len();
+                for (d, &x) in qi[..n].iter_mut().zip(xi) {
+                    let (q, sat) = f32_to_q31_rne(x, 0).unwrap_or((0, false));
+                    self.count_conversion(sat);
+                    *d = q;
+                }
+                self.process_q31_engine(&qi[..n], &mut qo[..n])?;
+                for (d, &q) in yo.iter_mut().zip(&qo[..n]) {
+                    *d = q31_to_f32_rne(q);
+                }
+            }
+            return Ok(());
+        }
         let mut qi = [0i16; IO_CHUNK];
         let mut qo = [0i16; IO_CHUNK];
         for (xi, yo) in input.chunks(IO_CHUNK).zip(output.chunks_mut(IO_CHUNK)) {
             let n = xi.len();
             for (d, &s) in qi[..n].iter_mut().zip(xi) {
                 let (q, sat) = f32_to_q15_rne_sat(s);
-                if sat {
-                    self.conversion_saturations = self.conversion_saturations.saturating_add(1);
-                }
+                self.count_conversion(sat);
                 *d = q;
             }
             self.process_q15_engine(&qi[..n], &mut qo[..n])?;
@@ -889,9 +1156,31 @@ impl<'a> AutoConvolver<'a> {
     /// Processes Q1.15 / 16-bit PCM samples (e.g. straight from I2S), any block length.
     ///
     /// In the `f32` domain samples are converted in chunks of 64 on the stack and the output is
-    /// rounded to nearest with saturation.
+    /// rounded to nearest with saturation; in the Q1.31 domain input is widened exactly
+    /// (`x << 16`) and the output rounded to nearest even with saturation.
     pub fn process_i16(&mut self, input: &[i16], output: &mut [i16]) -> Result<(), ConvError> {
         Self::check_len(input.len(), output.len())?;
+        #[cfg(feature = "fixed-q31")]
+        if self.is_q31() {
+            let mut qi = [0i32; IO_CHUNK_Q31];
+            let mut qo = [0i32; IO_CHUNK_Q31];
+            for (xi, yo) in input
+                .chunks(IO_CHUNK_Q31)
+                .zip(output.chunks_mut(IO_CHUNK_Q31))
+            {
+                let n = xi.len();
+                for (d, &x) in qi[..n].iter_mut().zip(xi) {
+                    *d = (x as i32) << 16;
+                }
+                self.process_q31_engine(&qi[..n], &mut qo[..n])?;
+                for (d, &q) in yo.iter_mut().zip(&qo[..n]) {
+                    let (v, sat) = q31_to_q15_rne_sat(q);
+                    self.count_conversion(sat);
+                    *d = v;
+                }
+            }
+            return Ok(());
+        }
         #[cfg(rtconv_no_fpu)]
         {
             self.process_q15_engine(input, output)
@@ -900,6 +1189,59 @@ impl<'a> AutoConvolver<'a> {
         {
             self.process_i16_any(input, output)
         }
+    }
+
+    /// Processes Q1.31 / 24- or 32-bit PCM samples (e.g. a 24-bit ADC MSB-aligned in a 32-bit
+    /// I2S slot), any block length.
+    ///
+    /// Native for the Q1.31 engines. In the Q1.15 domain the input is rounded to nearest even
+    /// with saturation and the output widened exactly; in the `f32` domain the conversions are
+    /// the integer ones of [`Self::process_f32`].
+    pub fn process_i32(&mut self, input: &[i32], output: &mut [i32]) -> Result<(), ConvError> {
+        Self::check_len(input.len(), output.len())?;
+        #[cfg(feature = "fixed-q31")]
+        if self.is_q31() {
+            return self.process_q31_engine(input, output);
+        }
+        #[cfg(not(rtconv_no_fpu))]
+        if !matches!(
+            self.engine,
+            Engine::FixedDirect(_) | Engine::FixedNonUniform(_)
+        ) {
+            let mut fi = [0.0f32; IO_CHUNK_Q31];
+            let mut fo = [0.0f32; IO_CHUNK_Q31];
+            for (xi, yo) in input
+                .chunks(IO_CHUNK_Q31)
+                .zip(output.chunks_mut(IO_CHUNK_Q31))
+            {
+                let n = xi.len();
+                for (d, &x) in fi[..n].iter_mut().zip(xi) {
+                    *d = q31_to_f32_rne(x);
+                }
+                self.process_f32(&fi[..n], &mut fo[..n])?;
+                for (d, &y) in yo.iter_mut().zip(&fo[..n]) {
+                    let (q, sat) = f32_to_q31_rne(y, 0).unwrap_or((0, false));
+                    self.count_conversion(sat);
+                    *d = q;
+                }
+            }
+            return Ok(());
+        }
+        let mut qi = [0i16; IO_CHUNK];
+        let mut qo = [0i16; IO_CHUNK];
+        for (xi, yo) in input.chunks(IO_CHUNK).zip(output.chunks_mut(IO_CHUNK)) {
+            let n = xi.len();
+            for (d, &x) in qi[..n].iter_mut().zip(xi) {
+                let (v, sat) = q31_to_q15_rne_sat(x);
+                self.count_conversion(sat);
+                *d = v;
+            }
+            self.process_q15_engine(&qi[..n], &mut qo[..n])?;
+            for (d, &q) in yo.iter_mut().zip(&qo[..n]) {
+                *d = (q as i32) << 16;
+            }
+        }
+        Ok(())
     }
 
     #[cfg(not(rtconv_no_fpu))]
@@ -925,9 +1267,7 @@ impl<'a> AutoConvolver<'a> {
             }
             for (d, &y) in yo.iter_mut().zip(&fo[..n]) {
                 let (q, sat) = f32_to_q15_sat(y);
-                if sat {
-                    self.conversion_saturations = self.conversion_saturations.saturating_add(1);
-                }
+                self.count_conversion(sat);
                 *d = q;
             }
         }
@@ -938,11 +1278,43 @@ impl<'a> AutoConvolver<'a> {
         match &mut self.engine {
             Engine::FixedDirect(c) => c.process_block(input, output)?,
             Engine::FixedNonUniform(c) => c.process_block(input, output)?,
-            #[cfg(not(rtconv_no_fpu))]
-            _ => unreachable_engine()?,
+            #[cfg(any(not(rtconv_no_fpu), feature = "fixed-q31"))]
+            _ => return Err(ConvError::InvalidStateTransition),
         }
         self.apply_gain_q15(output);
         Ok(())
+    }
+
+    #[cfg(feature = "fixed-q31")]
+    fn process_q31_engine(&mut self, input: &[i32], output: &mut [i32]) -> Result<(), ConvError> {
+        match &mut self.engine {
+            Engine::Q31Direct(c) => c.process_block(input, output)?,
+            Engine::Q31NonUniform(c) => c.process_block(input, output)?,
+            _ => return Err(ConvError::InvalidStateTransition),
+        }
+        let s = self.info.gain_shift;
+        if s > 0 {
+            for y in output.iter_mut() {
+                let v = (*y as i64) << s;
+                let c = v.clamp(-(i32::MAX as i64), i32::MAX as i64);
+                self.count_conversion(c != v);
+                *y = c as i32;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `RNE(q / 2^16)` saturated to `i16` (Q1.31 → Q1.15).
+#[inline]
+fn q31_to_q15_rne_sat(q: i32) -> (i16, bool) {
+    let r = crate::fixed::block_float::round_shift_even_i64(q as i64, 16);
+    if r > i16::MAX as i64 {
+        (i16::MAX, true)
+    } else if r < i16::MIN as i64 {
+        (i16::MIN, true)
+    } else {
+        (r as i16, false)
     }
 }
 

@@ -6,11 +6,13 @@
 #     (TW_COS_Q, SimdFixedFftBackend, POWER_OF_FIVE_128),
 #   - any RISC-V soft-float routine (__mulsf3, __muldf3 and the rest of the
 #     libgcc/compiler-builtins float ABI: add/sub/mul/div, comparisons, conversions),
-#   - or more than BUDGET bytes of .text + .rodata (default 81,196 B = rtconv-simd 0.2.0).
+#   - or more than BUDGET bytes of .text + .rodata (default 81,196 B = rtconv-simd 0.2.0;
+#     `none` reports the sizes without a budget, e.g. for the opt-in benchmark build).
 # Writes the section sizes (llvm-size -A) to $GITHUB_STEP_SUMMARY when set.
 #
 # Usage: scripts/check-no-fpu-binary.sh <elf> [budget_bytes]
-# Tools: $LLVM_NM / $LLVM_SIZE (default: llvm-nm / llvm-size on PATH).
+# Tools: $LLVM_NM / $LLVM_SIZE (default: llvm-nm / llvm-size on PATH); $GUARD_LABEL names the
+# build variant in the job summary.
 set -euo pipefail
 
 elf="${1:?usage: $0 <elf> [budget_bytes]}"
@@ -45,10 +47,10 @@ total="$(section Total)"
 code=$((text + rodata))
 
 echo "$sizes"
-echo ".text + .rodata = $code B (budget $budget B)"
+echo ".text + .rodata = $code B (budget $budget)"
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
   {
-    echo "### ESP32-C6 harness size (\`llvm-size -A\`, riscv32imac, compile-only)"
+    echo "### ESP32-C6 harness${GUARD_LABEL:+ ($GUARD_LABEL)} size (\`llvm-size -A\`, riscv32imac, compile-only)"
     echo
     echo "| Section | Bytes |"
     echo "| :--- | ---: |"
@@ -66,7 +68,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
   } >>"$GITHUB_STEP_SUMMARY"
 fi
 
-if ((code > budget)); then
+if [[ "$budget" != "none" ]] && ((code > budget)); then
   echo "::error::.text + .rodata = $code B exceeds the $budget B budget"
   fail=1
 fi

@@ -1447,9 +1447,69 @@ impl IntegerCostModel {
 pub(crate) const ESP32_C6_Q15_INTEGER_MODEL: IntegerCostModel =
     IntegerCostModel::from_integral(&CostModel::esp32_c6_q15_estimate());
 
-/// Runs the Q1.15 auto planner's Viterbi DP inside an `&mut [i16]` caller buffer with **integer
-/// arithmetic only** (`AutoConvolver` Q1.15 integration, `#![forbid(unsafe_code)]`, zero stack
-/// arrays, `u32` costs packed as 2 `i16` words).
+/// Word type of the planner scratch: `i16` (`u32` costs in two words, used by the Q1.15
+/// domain) or `i32` (one word per cost, Q1.31 domain). Back-pointers take one word either way.
+#[cfg(feature = "auto")]
+pub(crate) trait DpWord: Copy {
+    /// Words per `u32` cost cell.
+    const COST_WORDS: usize;
+    /// Loads cost cell `idx`.
+    fn load_cost(buf: &[Self], idx: usize) -> u32;
+    /// Stores cost cell `idx`.
+    fn store_cost(buf: &mut [Self], idx: usize, v: u32);
+    /// Back-pointer word for a `u16` value (`u16::MAX` = skip).
+    fn from_u16(v: u16) -> Self;
+    /// `u16` value of a back-pointer word.
+    fn to_u16(self) -> u16;
+}
+
+#[cfg(feature = "auto")]
+impl DpWord for i16 {
+    const COST_WORDS: usize = 2;
+    #[inline(always)]
+    fn load_cost(buf: &[i16], idx: usize) -> u32 {
+        ((buf[2 * idx] as u16 as u32) << 16) | (buf[2 * idx + 1] as u16 as u32)
+    }
+    #[inline(always)]
+    fn store_cost(buf: &mut [i16], idx: usize, v: u32) {
+        buf[2 * idx] = (v >> 16) as u16 as i16;
+        buf[2 * idx + 1] = v as u16 as i16;
+    }
+    #[inline(always)]
+    fn from_u16(v: u16) -> i16 {
+        v as i16
+    }
+    #[inline(always)]
+    fn to_u16(self) -> u16 {
+        self as u16
+    }
+}
+
+#[cfg(feature = "auto")]
+impl DpWord for i32 {
+    const COST_WORDS: usize = 1;
+    #[inline(always)]
+    fn load_cost(buf: &[i32], idx: usize) -> u32 {
+        buf[idx] as u32
+    }
+    #[inline(always)]
+    fn store_cost(buf: &mut [i32], idx: usize, v: u32) {
+        buf[idx] = v as i32;
+    }
+    #[inline(always)]
+    fn from_u16(v: u16) -> i32 {
+        v as i32
+    }
+    #[inline(always)]
+    fn to_u16(self) -> u16 {
+        self as u16
+    }
+}
+
+/// Runs the fixed-point auto planner's Viterbi DP inside a caller buffer with **integer
+/// arithmetic only** (`AutoConvolver` Q1.15 / Q1.31 integration, `#![forbid(unsafe_code)]`, zero
+/// stack arrays, `u32` costs in [`DpWord::COST_WORDS`] words). The `i32` scratch needs no more
+/// words than the `i16` one ([`optimizer_scratch_len_i16`]).
 ///
 /// Costs are exact multiples of `1 / IntegerCostModel::SCALE` cycles per sample, added with
 /// saturation (`u32::MAX` = unreachable). Saturation cannot affect the optimum: every partial
@@ -1460,14 +1520,14 @@ pub(crate) const ESP32_C6_Q15_INTEGER_MODEL: IntegerCostModel =
 /// floating-point DP it replaces, which is verified to choose identical plans in the unit tests.
 #[cfg(feature = "auto")]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn optimize_in_i16_scratch(
+pub(crate) fn optimize_in_i16_scratch<W: DpWord>(
     ir_len: usize,
     host_block_max: usize,
     max_block_size: usize,
     max_fdl_stages: usize,
     cost_model: &IntegerCostModel,
     policy: ClearancePolicy,
-    scratch: &mut [i16],
+    scratch: &mut [W],
 ) -> Result<NonUniformPlan, ConvError> {
     if ir_len == 0 || host_block_max == 0 || max_fdl_stages == 0 {
         return Err(ConvError::InvalidNonUniformConfig);
@@ -1504,10 +1564,10 @@ pub(crate) fn optimize_in_i16_scratch(
         if u_max >= u16::MAX as usize {
             return Err(ConvError::ArithmeticOverflow);
         }
-        // dp: (max_fdl + 1) * cols * 2 i16 (u32), f_val: cols * 2 i16 (u32),
-        // f_start: cols i16 (u16), bp: active_levels * max_fdl * cols i16 (u16)
-        let dp_words = (max_fdl + 1) * cols * 2;
-        let f_val_words = cols * 2;
+        // dp: (max_fdl + 1) * cols cost cells, f_val: cols cost cells,
+        // f_start: cols words (u16), bp: active_levels * max_fdl * cols words (u16)
+        let dp_words = (max_fdl + 1) * cols * W::COST_WORDS;
+        let f_val_words = cols * W::COST_WORDS;
         let f_start_words = cols;
         let bp_words = active_levels * max_fdl * cols;
         let needed = dp_words + f_val_words + f_start_words + bp_words;
@@ -1519,22 +1579,15 @@ pub(crate) fn optimize_in_i16_scratch(
         }
 
         const INF: u32 = u32::MAX;
-        #[inline(always)]
-        fn load_u32(buf: &[i16], idx: usize) -> u32 {
-            ((buf[2 * idx] as u16 as u32) << 16) | (buf[2 * idx + 1] as u16 as u32)
-        }
-        #[inline(always)]
-        fn store_u32(buf: &mut [i16], idx: usize, v: u32) {
-            buf[2 * idx] = (v >> 16) as u16 as i16;
-            buf[2 * idx + 1] = v as u16 as i16;
-        }
+        let load_u32 = W::load_cost;
+        let store_u32 = W::store_cost;
 
         let (dp, rest) = scratch.split_at_mut(dp_words);
         let (f_val, rest) = rest.split_at_mut(f_val_words);
         let (f_start, rest) = rest.split_at_mut(f_start_words);
         let bp = &mut rest[..bp_words];
 
-        const U16_SKIP: i16 = -1; // u16::MAX
+        let skip = W::from_u16(u16::MAX);
         let max_l0_fdl = policy.max_direct_head_with_fdl(host_block_max);
 
         for i in 0..((max_fdl + 1) * cols) {
@@ -1560,22 +1613,22 @@ pub(crate) fn optimize_in_i16_scratch(
                 for u in 0..cols {
                     store_u32(f_val, u, INF);
                 }
-                f_start.fill(U16_SKIP);
-                bp[bp_base..bp_base + cols].fill(U16_SKIP);
+                f_start.fill(skip);
+                bp[bp_base..bp_base + cols].fill(skip);
 
                 let prev_row = (s - 1) * cols;
                 let cur_row = s * cols;
                 for u in step..=u_max {
                     let u_prev = u - step;
                     let mut best_c = INF;
-                    let mut best_st = U16_SKIP;
+                    let mut best_st = skip;
                     if u_prev >= u0_min {
                         let pv = load_u32(dp, prev_row + u_prev);
                         if pv != INF {
                             let cand = pv.saturating_add(open_c);
                             if cand < best_c {
                                 best_c = cand;
-                                best_st = (u_prev as u16) as i16;
+                                best_st = W::from_u16(u_prev as u16);
                             }
                         }
                     }
@@ -1622,9 +1675,9 @@ pub(crate) fn optimize_in_i16_scratch(
                     break;
                 }
                 let bp_base = (k * max_fdl + (s - 1)) * cols;
-                let st = bp[bp_base + u];
-                if st != U16_SKIP {
-                    let u0 = (st as u16) as usize;
+                let st = bp[bp_base + u].to_u16();
+                if st != u16::MAX {
+                    let u0 = st as usize;
                     fdl_rev[fdl_count] = (
                         u0 * UNIT_SAMPLES,
                         u * UNIT_SAMPLES,
@@ -2340,6 +2393,37 @@ mod integer_planner_tests {
         )
         .unwrap();
         (int, flt)
+    }
+
+    #[test]
+    fn i32_scratch_planner_matches_i16_scratch() {
+        for taps in (129..=9000).step_by(7) {
+            let max_b = auto_cap(taps, 1024);
+            let len = optimizer_scratch_len_i16(taps, max_b, 3).max(1);
+            let mut a = vec![0i16; len];
+            let mut b = vec![0i32; len];
+            let p16 = optimize_in_i16_scratch(
+                taps,
+                64,
+                max_b,
+                3,
+                &ESP32_C6_Q15_INTEGER_MODEL,
+                ClearancePolicy::Strategy2,
+                &mut a,
+            )
+            .unwrap();
+            let p32 = optimize_in_i16_scratch(
+                taps,
+                64,
+                max_b,
+                3,
+                &ESP32_C6_Q15_INTEGER_MODEL,
+                ClearancePolicy::Strategy2,
+                &mut b,
+            )
+            .unwrap();
+            assert_eq!(p16, p32, "taps={taps}");
+        }
     }
 
     #[test]

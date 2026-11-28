@@ -1,7 +1,8 @@
 //! Classifies the compilation target as having a hardware FPU or not.
 //!
 //! Emits `cfg(rtconv_no_fpu)` for targets whose `f32` arithmetic would be software-emulated, so
-//! `rtconv_simd::auto` can pick the Q1.15 / block-floating-point engines there.
+//! `rtconv_simd::auto` can pick the Q1.15 / block-floating-point engines there. The features
+//! `native-q15` and `native-q31` force it on any target.
 //!
 //! On stable Rust the RISC-V `F`/`D` extensions are not exposed as `cfg(target_feature)`
 //! (`riscv32imafc-unknown-none-elf`, used by ESP32-P4, and `riscv32imac-unknown-none-elf`, used
@@ -28,7 +29,8 @@ fn emit_fpu_cfg() {
     let abi = env::var("CARGO_CFG_TARGET_ABI").unwrap_or_default();
     let features = env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
     let has_feature = |name: &str| features.split(',').any(|f| f == name);
-    let force_q15 = env::var_os("CARGO_FEATURE_NATIVE_Q15").is_some();
+    let force_q15 = env::var_os("CARGO_FEATURE_NATIVE_Q15").is_some()
+        || env::var_os("CARGO_FEATURE_NATIVE_Q31").is_some();
 
     let has_fpu = match arch.as_str() {
         "riscv32" | "riscv64" => {

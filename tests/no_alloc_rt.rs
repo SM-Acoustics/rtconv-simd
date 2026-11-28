@@ -416,9 +416,9 @@ fn verify_fixed_q15_nonuniform() {
 
 #[cfg(feature = "auto")]
 fn verify_auto() {
-    #[cfg(not(feature = "native-q15"))]
-    use rtconv_simd::auto::workspace_len_f32;
-    use rtconv_simd::auto::{AutoConvolver, AutoStereoConvolver, workspace_len_q15};
+    use rtconv_simd::auto::{
+        AutoConvolver, AutoStereoConvolver, NativeElem, workspace_len, workspace_len_q15,
+    };
 
     // 2,000-tap stereo IEEE-float WAV (rePhase "32 bits IEEE stereo" layout), built before arming.
     let taps = 2000usize;
@@ -450,12 +450,9 @@ fn verify_auto() {
     wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
     wav.extend_from_slice(&data);
 
-    // Hardware-FPU builds: f32-domain stereo pair. FPU-less builds (`native-q15`) have no f32
-    // auto engines, so the same stereo artifact runs in the Q1.15 domain.
-    #[cfg(not(feature = "native-q15"))]
-    let mut wss = vec![0.0f32; 2 * workspace_len_f32(taps)];
-    #[cfg(feature = "native-q15")]
-    let mut wss = vec![0i16; 2 * workspace_len_q15(taps)];
+    // Native domain of the build: f32-domain stereo pair with an FPU, Q1.15 under `native-q15`,
+    // Q1.31 under `native-q31` (FPU-less builds have no f32 auto engines).
+    let mut wss = vec![NativeElem::default(); 2 * workspace_len(taps)];
     let mut wsq = vec![0i16; workspace_len_q15(taps)];
     let in_f = [0.25f32; 37];
     let mut out_f = [0.0f32; 37];
@@ -493,6 +490,112 @@ fn verify_auto() {
         black_box(q.saturation_count());
     });
     assert_zero_alloc("auto::q15::reset", || q.reset());
+}
+
+#[cfg(feature = "fixed-q31")]
+fn verify_fixed_q31() {
+    use rtconv_simd::{
+        FixedQ31DirectConfig, FixedQ31DirectConvolver, FixedQ31NonUniformConvolver,
+        FixedQ31PartitionedConfig, FixedQ31PartitionedConvolver, NonUniformPlan,
+    };
+
+    // 255-tap Type I symmetric crossover-like FIR (folded path) + plain direct.
+    let mut sym = [0i32; 255];
+    for k in 0..128 {
+        let v = (k as i32 + 1) * 65_536;
+        sym[k] = v;
+        sym[254 - k] = v;
+    }
+    let input = [1 << 28; 64];
+    let mut output = [0i32; 64];
+    let cfg = FixedQ31DirectConfig { max_ir_len: 255 };
+    let mut ws = vec![0i32; 3 * 255];
+    let mut conv = None;
+    assert_zero_alloc("fixed_q31_direct::prepare", || {
+        conv = Some(FixedQ31DirectConvolver::prepare(&sym, cfg, &mut ws).unwrap());
+    });
+    let conv = conv.as_mut().unwrap();
+    assert_zero_alloc("fixed_q31_direct::process_block", || {
+        for _ in 0..16 {
+            conv.process_block(&input, &mut output).unwrap();
+        }
+        black_box(conv.capabilities());
+        black_box(conv.saturation_count());
+    });
+    assert_zero_alloc("fixed_q31_direct::reset", || conv.reset());
+
+    let ir = [1i32 << 20; 1024];
+    let pcfg = FixedQ31PartitionedConfig {
+        block_size: 64,
+        max_ir_len: 1024,
+    };
+    let preq = FixedQ31PartitionedConvolver::memory_requirements(pcfg).unwrap();
+    let mut pws = vec![0i32; preq.total_i32];
+    let mut pconv = None;
+    assert_zero_alloc("fixed_q31_partitioned::prepare", || {
+        pconv = Some(FixedQ31PartitionedConvolver::prepare(&ir, pcfg, &mut pws).unwrap());
+    });
+    let pconv = pconv.as_mut().unwrap();
+    assert_zero_alloc("fixed_q31_partitioned::process_block", || {
+        for _ in 0..32 {
+            pconv.process_block(&input, &mut output).unwrap();
+        }
+        black_box(pconv.capabilities());
+    });
+    assert_zero_alloc("fixed_q31_partitioned::reset", || pconv.reset());
+
+    let plan = NonUniformPlan::default_profile(2048, 64).unwrap();
+    let req = FixedQ31NonUniformConvolver::memory_requirements(&plan).unwrap();
+    let ir2 = [1i32 << 19; 2048];
+    let mut nws = vec![0i32; req.total_i32];
+    let mut nconv = None;
+    assert_zero_alloc("fixed_q31_nonuniform::prepare", || {
+        nconv = Some(FixedQ31NonUniformConvolver::prepare(&ir2, plan, &mut nws).unwrap());
+    });
+    let nconv = nconv.as_mut().unwrap();
+    assert_zero_alloc("fixed_q31_nonuniform::process_block", || {
+        for _ in 0..64 {
+            nconv.process_block(&input, &mut output).unwrap();
+        }
+        black_box(nconv.capabilities());
+        black_box(nconv.deadline_misses());
+    });
+    assert_zero_alloc("fixed_q31_nonuniform::reset", || nconv.reset());
+
+    // AutoConvolver in the Q1.31 domain: integer planner in the caller's i32 workspace.
+    #[cfg(feature = "auto")]
+    {
+        use rtconv_simd::auto::{AutoConvolver, AutoEngine, workspace_len_q31};
+        let taps = 2048usize;
+        let bytes: Vec<u8> = (0..taps)
+            .flat_map(|k| {
+                (if k == 7 {
+                    0.5f32
+                } else {
+                    1e-4 * (k % 5) as f32
+                })
+                .to_le_bytes()
+            })
+            .collect();
+        let mut ws = vec![0i32; workspace_len_q31(taps)];
+        let mut a = None;
+        assert_zero_alloc("auto::q31::from_bytes", || {
+            a = Some(AutoConvolver::from_bytes(&bytes, 0, &mut ws).unwrap());
+        });
+        let a = a.as_mut().unwrap();
+        assert_eq!(a.info().engine, AutoEngine::FixedQ31NonUniform);
+        let fin = [0.25f32; 37];
+        let mut fout = [0.0f32; 37];
+        let iin = [1i32 << 28; 37];
+        let mut iout = [0i32; 37];
+        assert_zero_alloc("auto::q31::process", || {
+            for _ in 0..32 {
+                a.process_i32(&iin, &mut iout).unwrap();
+                a.process_f32(&fin, &mut fout).unwrap();
+            }
+        });
+        assert_zero_alloc("auto::q31::reset", || a.reset());
+    }
 }
 
 fn verify_large_ffts_f32(backend: SimdBackend) {
@@ -863,7 +966,10 @@ fn verify_nupc_optimizer(backend: SimdBackend) {
     assert_zero_alloc("nupc_optimizer::convolver_reset", || nu.reset());
 
     // AutoConvolver selecting cost-optimized AutoEngine::NonUniform (16,384 taps, in-place DP)
-    #[cfg(all(feature = "auto", not(feature = "native-q15")))]
+    #[cfg(all(
+        feature = "auto",
+        not(any(feature = "native-q15", feature = "native-q31"))
+    ))]
     {
         use rtconv_simd::auto::{AutoConvolver, AutoEngine, engine_len_f32};
         let mut auto_ws = vec![0.0f32; engine_len_f32(ir_len)];
@@ -883,7 +989,7 @@ fn verify_nupc_optimizer(backend: SimdBackend) {
 
     // FPU-less builds: `prepare_f32` quantizes from the IEEE bits (integer-only) and runs the
     // integer Viterbi planner in the caller's i16 workspace -> FixedNonUniform, zero-alloc.
-    #[cfg(feature = "native-q15")]
+    #[cfg(all(feature = "native-q15", not(feature = "native-q31")))]
     {
         use rtconv_simd::auto::{AutoConvolver, AutoEngine, engine_len_q15};
         let mut auto_ws = vec![0i16; engine_len_q15(ir_len)];
@@ -930,6 +1036,8 @@ fn main() {
     verify_fixed_q15_nonuniform();
     #[cfg(feature = "auto")]
     verify_auto();
+    #[cfg(feature = "fixed-q31")]
+    verify_fixed_q31();
 
     println!("no_alloc_rt: ALL ZERO-ALLOCATION AND POSITIVE-CONTROL CHECKS PASSED");
 }
